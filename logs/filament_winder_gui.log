@@ -130,3 +130,34 @@ ValueError: drop link on a compatible input socket
 2026-06-20 21:18:24,616 INFO filament_winder.gui: Action completed: Update Preview
 2026-06-20 21:19:19,070 INFO filament_winder.gui: Button clicked: Apply Node Settings
 2026-06-20 21:19:19,070 INFO filament_winder.gui: Action started: Apply Node Settings
+2026-06-21 02:22:15,619 INFO filament_winder.gui: Application startup
+2026-06-21 02:22:16,066 INFO filament_winder.gui: Workflow tab opened
+2026-06-21 02:22:31,584 INFO filament_winder.gui: Button clicked: Fit Node Graph
+2026-06-21 02:22:31,584 INFO filament_winder.gui: Action started: Fit Node Graph
+2026-06-21 02:22:31,586 INFO filament_winder.gui: Action completed: Fit Node Graph
+2026-06-21 02:22:36,323 INFO filament_winder.gui: Button clicked: Unlink
+2026-06-21 02:22:36,323 INFO filament_winder.gui: Action started: Unlink
+2026-06-21 02:22:36,324 INFO filament_winder.gui: Action completed: Unlink
+2026-06-21 02:22:37,804 INFO filament_winder.gui: Button clicked: Link
+2026-06-21 02:22:37,804 INFO filament_winder.gui: Action started: Link
+2026-06-21 02:22:37,804 INFO filament_winder.gui: Action completed: Link
+2026-06-21 02:22:41,948 INFO filament_winder.gui: Button clicked: Link
+2026-06-21 02:22:41,948 INFO filament_winder.gui: Action started: Link
+2026-06-21 02:22:41,948 INFO filament_winder.gui: Link creation started: machine_backend_ae5ab63be7 -> project_6627b5c027
+2026-06-21 02:22:41,949 INFO filament_winder.gui: Link creation succeeded
+2026-06-21 02:22:41,949 INFO filament_winder.gui: Action completed: Link
+2026-06-21 02:22:42,907 INFO filament_winder.gui: Button clicked: Fit Node Graph
+2026-06-21 02:22:42,907 INFO filament_winder.gui: Action started: Fit Node Graph
+2026-06-21 02:22:42,908 INFO filament_winder.gui: Action completed: Fit Node Graph
+2026-06-21 02:22:47,495 INFO filament_winder.gui: Button clicked: Duplicate Node
+2026-06-21 02:22:47,495 INFO filament_winder.gui: Action started: Duplicate Node
+2026-06-21 02:23:24,542 INFO filament_winder.gui: Application startup
+2026-06-21 02:23:24,924 INFO filament_winder.gui: Workflow tab opened
+2026-06-21 02:25:22,758 INFO filament_winder.gui: Button clicked: Fit Mandrel
+2026-06-21 02:25:22,758 INFO filament_winder.gui: Action started: Fit Mandrel
+2026-06-21 02:25:22,759 INFO filament_winder.gui: Action completed: Fit Mandrel
+2026-06-21 02:25:24,423 INFO filament_winder.gui: Button clicked: Update Preview
+2026-06-21 02:25:24,423 INFO filament_winder.gui: Action started: Update Preview
+2026-06-21 02:25:24,639 INFO filament_winder.gui: Action completed: Update Preview
+2026-06-21 02:25:30,668 INFO filament_winder.gui: Button clicked: Delete Node
+2026-06-21 02:25:30,668 INFO filament_winder.gui: Action started: Delete Node

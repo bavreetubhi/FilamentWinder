@@ -15,6 +15,12 @@ from typing import Any, cast
 
 import numpy as np
 
+from filament_winder.app.backend_service import (
+    BackendCheckResult,
+    BackendService,
+    LoadedPlotSet,
+    LoadedReportSet,
+)
 from filament_winder.app.exporting import (
     export_cylinder_pattern_preview_files,
     export_preview_files,
@@ -29,7 +35,7 @@ from filament_winder.app.node_graph import (
     NodeInstance,
     NodeTypeDefinition,
     addable_node_type_ids,
-    default_filament_winder_graph,
+    default_backend_winding_graph,
     default_node_registry,
 )
 from filament_winder.app.preview import (
@@ -179,6 +185,13 @@ class _PreviewWindow:
         self._quaternion = vispy_quaternion.Quaternion
         self._logger = _gui_logger()
         self._logger.info("Application startup")
+        self._backend_service = BackendService()
+        self._backend_busy = False
+        self._safe_buttons: list[Any] = []
+        self._last_backend_check: BackendCheckResult | None = None
+        self._last_loaded_reports: LoadedReportSet | None = None
+        self._last_loaded_plots: LoadedPlotSet | None = None
+        self._current_plot_path: Path | None = None
         self._config = config
         self._profile_config = profile_config
         self._visuals: list[Any] = []
@@ -186,16 +199,7 @@ class _PreviewWindow:
         self._current_project_path: Path | None = None
         self._default_export_paths = PreviewExportPaths()
         self._node_registry = default_node_registry()
-        self._node_graph = default_filament_winder_graph(
-            length_mm=config.length_mm,
-            radius_mm=config.radius_mm,
-            tow_width_mm=config.tow_width_mm,
-            angle_deg=config.winding_angle_deg,
-            point_count=config.points_per_pass,
-            radial_clearance_mm=config.radial_clearance_mm,
-            profile_path=str(profile_config.profile_path),
-            profile_mode="profile" if initial_mode == "profile-dome" else "cylinder",
-        )
+        self._node_graph = default_backend_winding_graph()
         self._node_items: dict[str, Any] = {}
         self._socket_items: dict[tuple[str, str, str], Any] = {}
         self._node_link_items: list[Any] = []
@@ -208,6 +212,12 @@ class _PreviewWindow:
         self._viewport_node_context: str | None = None
         self._node_thread_pool = qt_core.QThreadPool.globalInstance()
         self._node_workers: list[Any] = []
+        self._node_zoom = 1.0
+        self._node_panning = False
+        self._node_pan_last_pos: Any | None = None
+        self._node_right_press_pos: Any | None = None
+        self._node_suppress_context_menu = False
+        self._node_space_down = False
 
         self.widget = qt_widgets.QMainWindow()
         self.widget.setWindowTitle("FilamentWinder Preview")
@@ -271,6 +281,28 @@ class _PreviewWindow:
         self._connect_safe_button(reset_view, "Reset View", self._reset_camera)
         fit_mandrel = qt_widgets.QPushButton("Fit Mandrel")
         self._connect_safe_button(fit_mandrel, "Fit Mandrel", self._reset_camera)
+        import_config = qt_widgets.QPushButton("Import Config")
+        self._connect_safe_button(
+            import_config,
+            "Import Backend Config",
+            self._import_backend_config_dialog,
+        )
+        export_config = qt_widgets.QPushButton("Export Config")
+        self._connect_safe_button(
+            export_config,
+            "Export Backend Config",
+            self._export_backend_config_dialog,
+        )
+        backend_check = qt_widgets.QPushButton("Backend Check")
+        self._connect_safe_button(backend_check, "Backend Check", self._run_backend_check)
+        backend_csv = qt_widgets.QPushButton("Backend CSV")
+        self._connect_safe_button(backend_csv, "Backend CSV", self._run_backend_csv_export)
+        backend_gcode = qt_widgets.QPushButton("Backend G-code")
+        self._connect_safe_button(
+            backend_gcode,
+            "Backend G-code",
+            self._run_backend_gcode_export,
+        )
         self.show_tow_path = qt_widgets.QCheckBox("Tow Path")
         self.show_tow_path.setChecked(True)
         self.show_tow_path.toggled.connect(
@@ -296,6 +328,11 @@ class _PreviewWindow:
         toolbar.addWidget(refresh)
         toolbar.addWidget(reset_view)
         toolbar.addWidget(fit_mandrel)
+        toolbar.addWidget(import_config)
+        toolbar.addWidget(export_config)
+        toolbar.addWidget(backend_check)
+        toolbar.addWidget(backend_csv)
+        toolbar.addWidget(backend_gcode)
         toolbar.addSpacing(12)
         toolbar.addWidget(self.show_tow_path)
         toolbar.addWidget(self.show_tow_band)
@@ -356,6 +393,19 @@ class _PreviewWindow:
             self.node_status_log.appendPlainText(f"Complete: {action_name}")
         return result
 
+    def _run_button_action(
+        self,
+        button: Any,
+        action_name: str,
+        callback: Callable[[], Any],
+    ) -> Any | None:
+        button.setEnabled(False)
+        try:
+            return self.run_safe_action(action_name, callback)
+        finally:
+            if not self._backend_busy:
+                button.setEnabled(True)
+
     def handle_gui_error(self, action_name: str, exc: BaseException) -> None:
         message = f"{action_name} failed: {exc}"
         self._logger.error("Action failed: %s\n%s", action_name, traceback.format_exc())
@@ -382,12 +432,23 @@ class _PreviewWindow:
         action_name: str,
         callback: Callable[[], Any],
     ) -> None:
+        self._safe_buttons.append(button)
         button.clicked.connect(
-            lambda _checked=False, name=action_name, cb=callback: self.run_safe_action(
+            lambda _checked=False,
+            clicked=button,
+            name=action_name,
+            cb=callback: self._run_button_action(
+                clicked,
                 name,
                 cb,
             )
         )
+
+    def _set_backend_busy(self, busy: bool, message: str) -> None:
+        self._backend_busy = busy
+        for button in getattr(self, "_safe_buttons", []):
+            button.setEnabled(not busy)
+        self._set_gui_status(message)
 
     def _build_controls(self, config: CylinderPreviewConfig) -> Any:
         qt_widgets = self._qt_widgets
@@ -744,6 +805,8 @@ class _PreviewWindow:
 
         toolbar = qt_widgets.QHBoxLayout()
         toolbar.setSpacing(8)
+        add_nodes = qt_widgets.QPushButton("Add Node")
+        self._connect_safe_button(add_nodes, "Add Node", self._add_selected_node_type)
         link_nodes = qt_widgets.QPushButton("Link")
         self._connect_safe_button(link_nodes, "Link", self._link_selected_nodes)
         unlink_nodes = qt_widgets.QPushButton("Unlink")
@@ -766,8 +829,64 @@ class _PreviewWindow:
         )
         group_nodes = qt_widgets.QPushButton("Group")
         self._connect_safe_button(group_nodes, "Group Nodes", self._group_selected_nodes)
+        ungroup_nodes = qt_widgets.QPushButton("Ungroup")
+        self._connect_safe_button(ungroup_nodes, "Ungroup Nodes", self._ungroup_selected_nodes)
+        move_left = qt_widgets.QPushButton("Left")
+        self._connect_safe_button(
+            move_left,
+            "Move Node Left",
+            lambda: self._move_selected_nodes(-40.0, 0.0),
+        )
+        move_right = qt_widgets.QPushButton("Right")
+        self._connect_safe_button(
+            move_right,
+            "Move Node Right",
+            lambda: self._move_selected_nodes(40.0, 0.0),
+        )
+        move_up = qt_widgets.QPushButton("Up")
+        self._connect_safe_button(
+            move_up,
+            "Move Node Up",
+            lambda: self._move_selected_nodes(0.0, -40.0),
+        )
+        move_down = qt_widgets.QPushButton("Down")
+        self._connect_safe_button(
+            move_down,
+            "Move Node Down",
+            lambda: self._move_selected_nodes(0.0, 40.0),
+        )
+        align_h = qt_widgets.QPushButton("Align H")
+        self._connect_safe_button(
+            align_h,
+            "Align Horizontal",
+            self._align_selected_nodes_horizontally,
+        )
+        align_v = qt_widgets.QPushButton("Align V")
+        self._connect_safe_button(align_v, "Align Vertical", self._align_selected_nodes_vertically)
+        distribute_h = qt_widgets.QPushButton("Dist H")
+        self._connect_safe_button(
+            distribute_h,
+            "Distribute Horizontal",
+            self._distribute_selected_nodes_horizontally,
+        )
+        distribute_v = qt_widgets.QPushButton("Dist V")
+        self._connect_safe_button(
+            distribute_v,
+            "Distribute Vertical",
+            self._distribute_selected_nodes_vertically,
+        )
         fit_nodes = qt_widgets.QPushButton("Fit")
         self._connect_safe_button(fit_nodes, "Fit Node Graph", self._fit_node_graph)
+        zoom_out = qt_widgets.QPushButton("Zoom -")
+        self._connect_safe_button(zoom_out, "Zoom Out", lambda: self._zoom_node_graph(0.85))
+        self.node_zoom_label = qt_widgets.QLabel("Zoom: 100%")
+        self.node_zoom_label.setMinimumWidth(86)
+        zoom_in = qt_widgets.QPushButton("Zoom +")
+        self._connect_safe_button(zoom_in, "Zoom In", lambda: self._zoom_node_graph(1.18))
+        reset_zoom = qt_widgets.QPushButton("Reset View")
+        self._connect_safe_button(reset_zoom, "Reset Node View", self._reset_node_graph_view)
+        center_selected = qt_widgets.QPushButton("Center Sel")
+        self._connect_safe_button(center_selected, "Center Selected", self._frame_selected_nodes)
         run_selected = qt_widgets.QPushButton("Run Selected")
         self._connect_safe_button(
             run_selected,
@@ -794,6 +913,7 @@ class _PreviewWindow:
         )
         optimize_pattern = qt_widgets.QPushButton("Optimize Pattern")
         self._connect_safe_button(optimize_pattern, "Optimise Pattern", self._optimize_pattern)
+        toolbar.addWidget(add_nodes)
         toolbar.addWidget(link_nodes)
         toolbar.addWidget(unlink_nodes)
         toolbar.addWidget(duplicate_nodes)
@@ -801,7 +921,21 @@ class _PreviewWindow:
         toolbar.addWidget(collapse_nodes)
         toolbar.addWidget(expand_nodes)
         toolbar.addWidget(group_nodes)
+        toolbar.addWidget(ungroup_nodes)
+        toolbar.addWidget(move_left)
+        toolbar.addWidget(move_right)
+        toolbar.addWidget(move_up)
+        toolbar.addWidget(move_down)
+        toolbar.addWidget(align_h)
+        toolbar.addWidget(align_v)
+        toolbar.addWidget(distribute_h)
+        toolbar.addWidget(distribute_v)
         toolbar.addWidget(fit_nodes)
+        toolbar.addWidget(zoom_out)
+        toolbar.addWidget(self.node_zoom_label)
+        toolbar.addWidget(zoom_in)
+        toolbar.addWidget(reset_zoom)
+        toolbar.addWidget(center_selected)
         toolbar.addStretch(1)
         toolbar.addWidget(run_selected)
         toolbar.addWidget(run_branch)
@@ -822,7 +956,44 @@ class _PreviewWindow:
         self.node_scene.setSceneRect(0.0, 0.0, 2200.0, 900.0)
         self.node_scene.selectionChanged.connect(self._on_node_selection_changed)
         self.node_scene.changed.connect(lambda _regions: self._refresh_node_links())
-        self.node_view = qt_widgets.QGraphicsView(self.node_scene)
+
+        class _NodeGraphicsView(qt_widgets.QGraphicsView):  # type: ignore[name-defined, misc, valid-type]
+            def __init__(self, scene: Any, owner: _PreviewWindow) -> None:
+                super().__init__(scene)
+                self._owner = owner
+
+            def drawBackground(self, painter: Any, rect: Any) -> None:  # noqa: N802
+                super().drawBackground(painter, rect)
+                minor = 24.0
+                major = minor * 5.0
+                left = int(rect.left()) - (int(rect.left()) % int(minor))
+                top = int(rect.top()) - (int(rect.top()) % int(minor))
+                minor_pen = self._owner._qt_gui.QPen(
+                    self._owner._qt_gui.QColor(32, 43, 54),
+                    1.0,
+                )
+                major_pen = self._owner._qt_gui.QPen(
+                    self._owner._qt_gui.QColor(48, 62, 76),
+                    1.0,
+                )
+                x = float(left)
+                while x < rect.right():
+                    painter.setPen(major_pen if abs(x % major) < 1e-6 else minor_pen)
+                    painter.drawLine(
+                        self._owner._qt_core.QPointF(x, rect.top()),
+                        self._owner._qt_core.QPointF(x, rect.bottom()),
+                    )
+                    x += minor
+                y = float(top)
+                while y < rect.bottom():
+                    painter.setPen(major_pen if abs(y % major) < 1e-6 else minor_pen)
+                    painter.drawLine(
+                        self._owner._qt_core.QPointF(rect.left(), y),
+                        self._owner._qt_core.QPointF(rect.right(), y),
+                    )
+                    y += minor
+
+        self.node_view = _NodeGraphicsView(self.node_scene, self)
         self.node_view.setObjectName("nodeView")
         self.node_view.setMinimumHeight(240)
         self.node_view.setMinimumWidth(680)
@@ -918,9 +1089,69 @@ class _PreviewWindow:
         self.node_debug_log.setPlaceholderText(f"Debug log: {GUI_LOG_PATH}")
         debug_layout.addWidget(self.node_debug_log, 1)
 
+        reports_panel = qt_widgets.QWidget()
+        reports_panel.setObjectName("nodeBottomPanel")
+        reports_layout = qt_widgets.QVBoxLayout(reports_panel)
+        reports_layout.setContentsMargins(8, 8, 8, 8)
+        reports_layout.setSpacing(8)
+        report_actions = qt_widgets.QHBoxLayout()
+        refresh_reports = qt_widgets.QPushButton("Refresh Reports")
+        self._connect_safe_button(
+            refresh_reports,
+            "Refresh Reports",
+            self._refresh_backend_artifacts,
+        )
+        report_actions.addWidget(refresh_reports)
+        report_actions.addStretch(1)
+        self.backend_report_summary = qt_widgets.QLabel("Backend check has not run.")
+        self.backend_report_summary.setWordWrap(True)
+        self.report_list = qt_widgets.QListWidget()
+        self.report_list.currentItemChanged.connect(
+            lambda current, _previous: self._show_report_item(current)
+        )
+        self.report_detail = qt_widgets.QPlainTextEdit()
+        self.report_detail.setReadOnly(True)
+        reports_layout.addLayout(report_actions)
+        reports_layout.addWidget(self.backend_report_summary)
+        reports_layout.addWidget(self.report_list, 1)
+        reports_layout.addWidget(self.report_detail, 2)
+
+        plots_panel = qt_widgets.QWidget()
+        plots_panel.setObjectName("nodeBottomPanel")
+        plots_layout = qt_widgets.QVBoxLayout(plots_panel)
+        plots_layout.setContentsMargins(8, 8, 8, 8)
+        plots_layout.setSpacing(8)
+        plot_actions = qt_widgets.QHBoxLayout()
+        refresh_plots = qt_widgets.QPushButton("Refresh Plots")
+        self._connect_safe_button(refresh_plots, "Refresh Plots", self._refresh_backend_artifacts)
+        fit_plot = qt_widgets.QPushButton("Fit Plot")
+        self._connect_safe_button(fit_plot, "Fit Plot", self._fit_current_plot)
+        open_plot = qt_widgets.QPushButton("Open Plot")
+        self._connect_safe_button(open_plot, "Open Plot", self._open_current_plot_external)
+        plot_actions.addWidget(refresh_plots)
+        plot_actions.addWidget(fit_plot)
+        plot_actions.addWidget(open_plot)
+        plot_actions.addStretch(1)
+        self.plot_list = qt_widgets.QListWidget()
+        self.plot_list.currentItemChanged.connect(
+            lambda current, _previous: self._show_plot_item(current)
+        )
+        self.plot_preview = qt_widgets.QLabel("No plot selected")
+        self.plot_preview.setAlignment(self._qt_core.Qt.AlignmentFlag.AlignCenter)
+        self.plot_preview.setMinimumHeight(220)
+        self.plot_preview.setScaledContents(False)
+        plot_scroll = qt_widgets.QScrollArea()
+        plot_scroll.setWidgetResizable(True)
+        plot_scroll.setWidget(self.plot_preview)
+        plots_layout.addLayout(plot_actions)
+        plots_layout.addWidget(self.plot_list, 1)
+        plots_layout.addWidget(plot_scroll, 3)
+
         bottom_tabs.addTab(library_panel, "Node Library")
         bottom_tabs.addTab(inspector_panel, "Inspector")
         bottom_tabs.addTab(status_panel, "Execution / Status")
+        bottom_tabs.addTab(reports_panel, "Reports")
+        bottom_tabs.addTab(plots_panel, "Plots")
         bottom_tabs.addTab(debug_panel, "Debug Log")
 
         workspace_splitter.addWidget(graph_panel)
@@ -938,15 +1169,70 @@ class _PreviewWindow:
     def _fit_node_graph(self) -> None:
         bounds = self.node_scene.itemsBoundingRect().adjusted(-40.0, -40.0, 40.0, 40.0)
         if bounds.isNull() or bounds.isEmpty():
+            self._set_node_status("No nodes to fit")
             return
         self.node_view.fitInView(bounds, self._qt_core.Qt.AspectRatioMode.KeepAspectRatio)
+        fitted_zoom = float(self.node_view.transform().m11())
+        self._node_zoom = self._bounded_node_zoom(fitted_zoom)
+        if abs(fitted_zoom - self._node_zoom) > 1e-9:
+            correction = self._node_zoom / max(fitted_zoom, 1e-9)
+            self.node_view.scale(correction, correction)
+        self._update_node_zoom_label()
+        self._sync_node_view_state()
 
     def _schedule_fit_node_graph(self) -> None:
         if hasattr(self, "node_view"):
-            self._qt_core.QTimer.singleShot(0, self._fit_node_graph)
+            self._qt_core.QTimer.singleShot(0, self._restore_node_view_state)
 
     def _scale_node_graph(self, factor: float) -> None:
-        self.node_view.scale(factor, factor)
+        self._zoom_node_graph(factor)
+
+    def _zoom_node_graph(self, factor: float) -> None:
+        target_zoom = self._bounded_node_zoom(self._node_zoom * factor)
+        if abs(target_zoom - self._node_zoom) < 1e-9:
+            return
+        scale_factor = target_zoom / max(self._node_zoom, 1e-9)
+        self.node_view.scale(scale_factor, scale_factor)
+        self._node_zoom = target_zoom
+        self._update_node_zoom_label()
+        self._sync_node_view_state()
+
+    def _bounded_node_zoom(self, value: float) -> float:
+        return max(0.25, min(3.0, value))
+
+    def _reset_node_graph_view(self) -> None:
+        center = self.node_view.mapToScene(self.node_view.viewport().rect().center())
+        self.node_view.resetTransform()
+        self._node_zoom = 1.0
+        self.node_view.centerOn(center)
+        self._update_node_zoom_label()
+        self._sync_node_view_state()
+
+    def _update_node_zoom_label(self) -> None:
+        if hasattr(self, "node_zoom_label"):
+            self.node_zoom_label.setText(f"Zoom: {self._node_zoom * 100.0:.0f}%")
+
+    def _sync_node_view_state(self) -> None:
+        if not hasattr(self, "node_view"):
+            return
+        center = self.node_view.mapToScene(self.node_view.viewport().rect().center())
+        self._node_graph.view_zoom = self._node_zoom
+        self._node_graph.view_center_x = float(center.x())
+        self._node_graph.view_center_y = float(center.y())
+
+    def _restore_node_view_state(self) -> None:
+        if not hasattr(self, "node_view"):
+            return
+        self.node_view.resetTransform()
+        self._node_zoom = self._bounded_node_zoom(float(self._node_graph.view_zoom))
+        self.node_view.scale(self._node_zoom, self._node_zoom)
+        self.node_view.centerOn(
+            self._qt_core.QPointF(
+                float(self._node_graph.view_center_x),
+                float(self._node_graph.view_center_y),
+            )
+        )
+        self._update_node_zoom_label()
 
     def _graph_controller(self) -> NodeGraphController:
         return NodeGraphController(self._node_graph, self._node_registry)
@@ -1043,29 +1329,88 @@ class _PreviewWindow:
 
     def _install_node_shortcuts(self) -> None:
         shortcuts = (
-            ("Delete", self._delete_selected_graph_items),
-            ("Ctrl+D", self._duplicate_selected_nodes),
-            ("Ctrl+G", self._group_selected_nodes),
-            ("Ctrl+Shift+G", self._ungroup_selected_nodes),
-            ("F", self._frame_selected_nodes),
-            ("Ctrl+F", lambda: self.node_search.setFocus()),
+            ("Delete", "Delete Node", self._delete_selected_graph_items),
+            ("Ctrl+D", "Duplicate Node", self._duplicate_selected_nodes),
+            ("Ctrl+G", "Group Nodes", self._group_selected_nodes),
+            ("Ctrl+Shift+G", "Ungroup Nodes", self._ungroup_selected_nodes),
+            ("F", "Fit Node Graph", self._frame_selected_nodes),
+            ("0", "Reset Node View", self._reset_node_graph_view),
+            ("Ctrl+F", "Focus Node Search", lambda: self.node_search.setFocus()),
         )
         self._node_shortcuts = []
-        for key_sequence, callback in shortcuts:
+        for key_sequence, action_name, callback in shortcuts:
             shortcut = self._qt_gui.QShortcut(
                 self._qt_gui.QKeySequence(key_sequence),
                 self.node_view,
             )
-            shortcut.activated.connect(callback)
+            shortcut.activated.connect(
+                lambda name=action_name, cb=callback: self.run_safe_action(name, cb)
+            )
             self._node_shortcuts.append(shortcut)
 
     def _node_canvas_event_filter(self, _obj: Any, event: Any) -> bool:
         event_type = event.type()
+        if event_type == self._qt_core.QEvent.Type.Wheel:
+            return self._handle_node_wheel(event)
+        if (
+            event_type == self._qt_core.QEvent.Type.KeyPress
+            and event.key() == self._qt_core.Qt.Key.Key_Space
+        ):
+            self._node_space_down = True
+            event.accept()
+            return True
+        if (
+            event_type == self._qt_core.QEvent.Type.KeyRelease
+            and event.key() == self._qt_core.Qt.Key.Key_Space
+        ):
+            self._node_space_down = False
+            event.accept()
+            return True
+        if (
+            event_type == self._qt_core.QEvent.Type.MouseButtonPress
+            and event.button() == self._qt_core.Qt.MouseButton.RightButton
+        ):
+            self._node_right_press_pos = self._event_view_pos(event)
+            self._node_suppress_context_menu = False
+            return False
+        if (
+            event_type == self._qt_core.QEvent.Type.MouseButtonPress
+            and event.button() == self._qt_core.Qt.MouseButton.MiddleButton
+        ):
+            self._begin_node_pan(event)
+            return True
         if (
             event_type == self._qt_core.QEvent.Type.MouseButtonPress
             and event.button() == self._qt_core.Qt.MouseButton.LeftButton
         ):
+            if self._node_space_down:
+                self._begin_node_pan(event)
+                return True
             return self._begin_socket_drag(event)
+        if event_type == self._qt_core.QEvent.Type.MouseMove and self._node_panning:
+            self._update_node_pan(event)
+            return True
+        if (
+            event_type == self._qt_core.QEvent.Type.MouseMove
+            and self._node_right_press_pos is not None
+            and event.buttons() & self._qt_core.Qt.MouseButton.RightButton
+        ):
+            current = self._event_view_pos(event)
+            if (current - self._node_right_press_pos).manhattanLength() > 6:
+                self._node_suppress_context_menu = True
+                self._begin_node_pan(event)
+                return True
+        if event_type == self._qt_core.QEvent.Type.MouseButtonRelease and self._node_panning:
+            self._finish_node_pan(event)
+            self._node_right_press_pos = None
+            return True
+        if (
+            event_type == self._qt_core.QEvent.Type.MouseButtonRelease
+            and event.button() == self._qt_core.Qt.MouseButton.RightButton
+        ):
+            suppressed = self._node_suppress_context_menu
+            self._node_right_press_pos = None
+            return suppressed
         if (
             event_type == self._qt_core.QEvent.Type.MouseMove
             and self._node_socket_drag is not None
@@ -1079,6 +1424,50 @@ class _PreviewWindow:
             self._finish_socket_drag(event)
             return True
         return False
+
+    def _handle_node_wheel(self, event: Any) -> bool:
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return False
+        factor = 1.15 if delta > 0 else 1.0 / 1.15
+        before = self.node_view.mapToScene(self._event_view_pos(event))
+        self._zoom_node_graph(factor)
+        after = self.node_view.mapToScene(self._event_view_pos(event))
+        movement = after - before
+        self.node_view.translate(movement.x(), movement.y())
+        self._sync_node_view_state()
+        event.accept()
+        return True
+
+    def _begin_node_pan(self, event: Any) -> None:
+        self._node_panning = True
+        self._node_pan_last_pos = self._event_view_pos(event)
+        self.node_view.setDragMode(self._qt_widgets.QGraphicsView.DragMode.NoDrag)
+        self.node_view.setCursor(self._qt_core.Qt.CursorShape.ClosedHandCursor)
+        event.accept()
+
+    def _update_node_pan(self, event: Any) -> None:
+        if self._node_pan_last_pos is None:
+            return
+        current = self._event_view_pos(event)
+        delta = current - self._node_pan_last_pos
+        self._node_pan_last_pos = current
+        self.node_view.horizontalScrollBar().setValue(
+            self.node_view.horizontalScrollBar().value() - delta.x()
+        )
+        self.node_view.verticalScrollBar().setValue(
+            self.node_view.verticalScrollBar().value() - delta.y()
+        )
+        self._sync_node_view_state()
+        event.accept()
+
+    def _finish_node_pan(self, event: Any) -> None:
+        self._node_panning = False
+        self._node_pan_last_pos = None
+        self.node_view.setDragMode(self._qt_widgets.QGraphicsView.DragMode.RubberBandDrag)
+        self.node_view.unsetCursor()
+        self._sync_node_view_state()
+        event.accept()
 
     def _event_view_pos(self, event: Any) -> Any:
         if hasattr(event, "position"):
@@ -1256,6 +1645,7 @@ class _PreviewWindow:
     def _add_selected_node_type(self) -> None:
         item = self.node_library.currentItem()
         if item is None:
+            self._set_node_status("No node type selected. Pick a node from the library first.")
             return
         type_id = str(item.data(self._qt_core.Qt.ItemDataRole.UserRole))
         self._log_graph_event(f"Node type selected: {type_id}")
@@ -1527,6 +1917,14 @@ class _PreviewWindow:
                 link_ids.append(str(link_id))
         return tuple(dict.fromkeys(link_ids))
 
+    def _delete_link_by_id(self, link_id: str) -> None:
+        if link_id not in self._node_graph.links:
+            self._set_node_status("No link selected.")
+            return
+        self._node_graph.links.pop(link_id, None)
+        self._refresh_node_links()
+        self._set_node_status("Link deleted")
+
     def _find_graph_item_at_view_pos(self, view_pos: Any, kind: str) -> Any | None:
         item = self.node_view.itemAt(view_pos)
         while item is not None:
@@ -1542,6 +1940,9 @@ class _PreviewWindow:
             item.setSelected(True)
 
     def _show_node_context_menu(self, view_pos: Any) -> None:
+        if self._node_suppress_context_menu:
+            self._node_suppress_context_menu = False
+            return
         scene_pos = self.node_view.mapToScene(view_pos)
         node_item = self._find_graph_item_at_view_pos(view_pos, "node")
         socket_item = self._find_graph_item_at_view_pos(view_pos, "socket")
@@ -1554,8 +1955,10 @@ class _PreviewWindow:
             inspect_type = menu.addAction("Inspect Data Type")
             action = menu.exec(self.node_view.viewport().mapToGlobal(view_pos))
             if action == delete_link:
-                self._node_graph.links.pop(link_id, None)
-                self._refresh_node_links()
+                self.run_safe_action(
+                    "Delete Link",
+                    lambda: self._delete_link_by_id(link_id),
+                )
             elif action == inspect_type and link_id in self._node_graph.links:
                 link = self._node_graph.links[link_id]
                 self.node_status.setText(
@@ -1578,11 +1981,14 @@ class _PreviewWindow:
             delete_group_nodes = menu.addAction("Delete Group and Nodes")
             action = menu.exec(self.node_view.viewport().mapToGlobal(view_pos))
             if action == rename_group:
-                self._rename_group_dialog(group_id)
+                self.run_safe_action("Rename Group", lambda: self._rename_group_dialog(group_id))
             elif action in (ungroup, delete_group):
-                self._delete_group_only(group_id)
+                self.run_safe_action("Ungroup Nodes", lambda: self._delete_group_only(group_id))
             elif action == delete_group_nodes:
-                self._delete_group_and_nodes(group_id)
+                self.run_safe_action(
+                    "Delete Group Nodes",
+                    lambda: self._delete_group_and_nodes(group_id),
+                )
             return
         if node_item is not None:
             node_id = str(node_item.data(0))
@@ -1599,17 +2005,23 @@ class _PreviewWindow:
             group_action = menu.addAction("Create Group From Selection")
             action = menu.exec(self.node_view.viewport().mapToGlobal(view_pos))
             if action == rename_action:
-                self._rename_selected_node_dialog()
+                self.run_safe_action("Rename Node", self._rename_selected_node_dialog)
             elif action == duplicate_action:
-                self._duplicate_selected_nodes()
+                self.run_safe_action("Duplicate Node", self._duplicate_selected_nodes)
             elif action == delete_action:
-                self._delete_selected_graph_items()
+                self.run_safe_action("Delete Node", self._delete_selected_graph_items)
             elif action == collapse_action:
-                self._set_selected_nodes_collapsed(not node.collapsed)
+                self.run_safe_action(
+                    "Toggle Collapse Node",
+                    lambda: self._set_selected_nodes_collapsed(not node.collapsed),
+                )
             elif action in {run_action, downstream_action}:
-                self._execute_node_graph(execute_exports=False)
+                self.run_safe_action(
+                    "Run Node",
+                    lambda: self._execute_node_graph(execute_exports=False),
+                )
             elif action == group_action:
-                self._group_selected_nodes()
+                self.run_safe_action("Group Nodes", self._group_selected_nodes)
             return
         add_menu = menu.addMenu("Add Node")
         actions: dict[Any, str] = {}
@@ -1625,17 +2037,21 @@ class _PreviewWindow:
         group_action = menu.addAction("Create Group")
         action = menu.exec(self.node_view.viewport().mapToGlobal(view_pos))
         if action in actions:
-            self._safe_add_node(actions[action], scene_pos)
+            self.run_safe_action(
+                "Add Node",
+                lambda: self._safe_add_node(actions[action], scene_pos),
+            )
         elif action == frame_all:
-            self._fit_node_graph()
+            self.run_safe_action("Fit Node Graph", self._fit_node_graph)
         elif action == auto_layout:
-            self._auto_layout_node_graph()
+            self.run_safe_action("Auto Layout", self._auto_layout_node_graph)
         elif action == group_action:
-            self._group_selected_nodes()
+            self.run_safe_action("Group Nodes", self._group_selected_nodes)
 
     def _rename_selected_node_dialog(self) -> None:
         selected = self._selected_node_ids()
         if len(selected) != 1:
+            self._set_node_status("Select exactly one node before using Rename.")
             return
         node = self._node_graph.nodes[selected[0]]
         name, accepted = self._qt_widgets.QInputDialog.getText(
@@ -1879,6 +2295,22 @@ class _PreviewWindow:
             "csv_export": "final export path preview",
             "gcode_export": "final machine path preview",
             "controller_run": "controller run preview",
+            "project": "backend project metadata",
+            "machine_backend": "machine limits and kinematics",
+            "mandrel_backend": "domed mandrel geometry",
+            "tow_backend": "tow and material settings",
+            "layer_stack_backend": "backend layer stack",
+            "hoop_layer": "single hoop layer definition",
+            "geodesic_layer": "single geodesic dome layer definition",
+            "non_geodesic_layer": "single controlled non-geodesic layer definition",
+            "coverage_mode": "tow-footprint coverage settings",
+            "pattern_optimisation_backend": "textbook pattern search and selection",
+            "validation_backend": "path and manufacturing validation",
+            "backend_check": "full backend-ready gate",
+            "plot_backend": "backend plot outputs",
+            "csv_backend_export": "backend CSV output",
+            "gcode_backend_export": "backend G-code output",
+            "report_export": "manufacturing reports",
         }
         return descriptions.get(type_id, "workflow preview")
 
@@ -1895,6 +2327,7 @@ class _PreviewWindow:
     def _apply_node_inspector(self) -> None:
         selected = self._selected_node_ids()
         if len(selected) != 1:
+            self._set_node_status("Select exactly one node before applying inspector settings.")
             return
         node_id = selected[0]
         try:
@@ -1957,16 +2390,31 @@ class _PreviewWindow:
 
     def _unlink_selected_nodes(self) -> None:
         selected = self._selected_node_ids()
-        self._node_graph.remove_links_for_nodes(selected)
+        if not selected:
+            self._set_node_status("No node selected. Select nodes before using Unlink.")
+            return
+        result = self._graph_controller().unlink_nodes(selected)
+        if not result.success:
+            self._show_graph_error("Unlink failed", RuntimeError(result.error or "unknown error"))
+            return
         self._refresh_node_links()
         self._set_node_status("Selected node links removed")
 
     def _duplicate_selected_nodes(self) -> None:
         selected = self._selected_node_ids()
-        new_nodes = [
-            self._node_graph.duplicate_node(node_id, self._node_registry)
-            for node_id in selected
-        ]
+        if not selected:
+            self._set_node_status("No node selected. Select a node before using Duplicate.")
+            return
+        new_nodes = []
+        for node_id in selected:
+            result = self._graph_controller().duplicate_node(node_id)
+            if not result.success or result.node_id is None:
+                self._show_graph_error(
+                    "Duplicate node failed",
+                    RuntimeError(result.error or "unknown error"),
+                )
+                return
+            new_nodes.append(self._node_graph.nodes[result.node_id])
         self._redraw_node_graph()
         if new_nodes:
             self._select_node_item(new_nodes[-1].id)
@@ -1974,8 +2422,15 @@ class _PreviewWindow:
     def _delete_selected_nodes(self) -> None:
         selected = self._selected_node_ids()
         if not selected:
+            self._set_node_status("No node selected. Select a node before using Delete.")
             return
-        self._node_graph.delete_nodes(selected)
+        result = self._graph_controller().delete_nodes(selected)
+        if not result.success:
+            self._show_graph_error(
+                "Delete node failed",
+                RuntimeError(result.error or "unknown error"),
+            )
+            return
         self._redraw_node_graph()
 
     def _delete_selected_graph_items(self) -> None:
@@ -1984,12 +2439,24 @@ class _PreviewWindow:
             self._node_graph.links.pop(link_id, None)
         selected = self._selected_node_ids()
         if selected:
-            self._node_graph.delete_nodes(selected)
-        if link_ids or selected:
-            self._redraw_node_graph()
+            result = self._graph_controller().delete_nodes(selected)
+            if not result.success:
+                self._show_graph_error(
+                    "Delete node failed",
+                    RuntimeError(result.error or "unknown error"),
+                )
+                return
+        if not link_ids and not selected:
+            self._set_node_status("No node or link selected. Select an item before using Delete.")
+            return
+        self._redraw_node_graph()
 
     def _set_selected_nodes_collapsed(self, collapsed: bool) -> None:
-        for node_id in self._selected_node_ids():
+        selected = self._selected_node_ids()
+        if not selected:
+            self._set_node_status("No node selected. Select a node before Collapse/Expand.")
+            return
+        for node_id in selected:
             self._node_graph.set_node_collapsed(node_id, collapsed)
         self._redraw_node_graph()
 
@@ -2004,6 +2471,7 @@ class _PreviewWindow:
     def _ungroup_selected_nodes(self) -> None:
         selected = set(self._selected_node_ids())
         if not selected:
+            self._set_node_status("No node selected. Select grouped nodes before using Ungroup.")
             return
         for group_id, group in list(self._node_graph.groups.items()):
             if selected.intersection(group.node_ids):
@@ -2011,6 +2479,83 @@ class _PreviewWindow:
                     if node_id in self._node_graph.nodes:
                         self._node_graph.nodes[node_id].group_id = None
                 self._node_graph.groups.pop(group_id, None)
+        self._redraw_node_graph()
+
+    def _move_selected_nodes(self, dx: float, dy: float) -> None:
+        selected = self._selected_node_ids()
+        if not selected:
+            self._set_node_status("No node selected. Select node(s) before moving.")
+            return
+        for node_id in selected:
+            node = self._node_graph.nodes[node_id]
+            self._node_graph.set_node_position(node_id, node.x + dx, node.y + dy)
+            self._node_graph.mark_downstream_dirty(node_id)
+        self._redraw_node_graph()
+        for node_id in selected:
+            if node_id in self._node_items:
+                self._node_items[node_id].setSelected(True)
+        self._set_node_status(f"Moved {len(selected)} node(s)")
+
+    def _align_selected_nodes_horizontally(self) -> None:
+        selected = self._selected_node_ids()
+        if len(selected) < 2:
+            self._set_node_status("Select at least two nodes before using Align H.")
+            return
+        y_pos = min(self._node_graph.nodes[node_id].y for node_id in selected)
+        for node_id in selected:
+            self._node_graph.set_node_position(node_id, self._node_graph.nodes[node_id].x, y_pos)
+            self._node_graph.mark_downstream_dirty(node_id)
+        self._redraw_node_graph()
+
+    def _align_selected_nodes_vertically(self) -> None:
+        selected = self._selected_node_ids()
+        if len(selected) < 2:
+            self._set_node_status("Select at least two nodes before using Align V.")
+            return
+        x_pos = min(self._node_graph.nodes[node_id].x for node_id in selected)
+        for node_id in selected:
+            self._node_graph.set_node_position(node_id, x_pos, self._node_graph.nodes[node_id].y)
+            self._node_graph.mark_downstream_dirty(node_id)
+        self._redraw_node_graph()
+
+    def _distribute_selected_nodes_horizontally(self) -> None:
+        selected = sorted(
+            self._selected_node_ids(),
+            key=lambda node_id: self._node_graph.nodes[node_id].x,
+        )
+        if len(selected) < 3:
+            self._set_node_status("Select at least three nodes before using Distribute H.")
+            return
+        start = self._node_graph.nodes[selected[0]].x
+        end = self._node_graph.nodes[selected[-1]].x
+        step = (end - start) / max(1, len(selected) - 1)
+        for index, node_id in enumerate(selected):
+            self._node_graph.set_node_position(
+                node_id,
+                start + step * index,
+                self._node_graph.nodes[node_id].y,
+            )
+            self._node_graph.mark_downstream_dirty(node_id)
+        self._redraw_node_graph()
+
+    def _distribute_selected_nodes_vertically(self) -> None:
+        selected = sorted(
+            self._selected_node_ids(),
+            key=lambda node_id: self._node_graph.nodes[node_id].y,
+        )
+        if len(selected) < 3:
+            self._set_node_status("Select at least three nodes before using Distribute V.")
+            return
+        start = self._node_graph.nodes[selected[0]].y
+        end = self._node_graph.nodes[selected[-1]].y
+        step = (end - start) / max(1, len(selected) - 1)
+        for index, node_id in enumerate(selected):
+            self._node_graph.set_node_position(
+                node_id,
+                self._node_graph.nodes[node_id].x,
+                start + step * index,
+            )
+            self._node_graph.mark_downstream_dirty(node_id)
         self._redraw_node_graph()
 
     def _frame_selected_nodes(self) -> None:
@@ -2061,8 +2606,33 @@ class _PreviewWindow:
         for node_id, item in self._node_items.items():
             position = item.pos()
             self._node_graph.set_node_position(node_id, float(position.x()), float(position.y()))
+        self._sync_node_view_state()
+
+    def _uses_backend_service_graph(self) -> bool:
+        backend_types = {
+            "project",
+            "machine_backend",
+            "mandrel_backend",
+            "tow_backend",
+            "layer_stack_backend",
+            "pattern_optimisation_backend",
+            "coverage_mode",
+            "validation_backend",
+            "backend_check",
+            "plot_backend",
+            "csv_backend_export",
+            "gcode_backend_export",
+            "report_export",
+        }
+        return any(node.type_id in backend_types for node in self._node_graph.nodes.values())
 
     def _execute_node_graph(self, *, execute_exports: bool) -> None:
+        if self._uses_backend_service_graph():
+            if execute_exports:
+                self._run_backend_generate()
+            else:
+                self._run_backend_check()
+            return
         self._sync_node_graph_from_scene()
         self._log_graph_event("Graph execution started")
         try:
@@ -2133,6 +2703,293 @@ class _PreviewWindow:
                 node.message = message
         self._redraw_node_graph()
         self._show_graph_error(f"Graph execution failed: {message}")
+
+    def _run_backend_check(self) -> None:
+        self._start_backend_service_worker("backend_check")
+
+    def _run_backend_generate(self) -> None:
+        self._start_backend_service_worker("generate")
+
+    def _run_backend_csv_export(self) -> None:
+        self._start_backend_service_worker("export_csv")
+
+    def _run_backend_gcode_export(self) -> None:
+        self._start_backend_service_worker("export_gcode")
+
+    def _start_backend_service_worker(self, operation: str) -> None:
+        self._sync_node_graph_from_scene()
+        graph_data = self._node_graph.to_dict()
+        registry = self._node_registry
+        qt_core = self._qt_core
+        self._mark_backend_nodes_running(operation)
+        self._set_backend_busy(True, f"Backend {operation.replace('_', ' ')} running...")
+
+        class _WorkerSignals(qt_core.QObject):  # type: ignore[name-defined, misc, valid-type]
+            finished = qt_core.Signal(str, object, object)
+            failed = qt_core.Signal(str, str, str)
+
+        class _BackendWorker(qt_core.QRunnable):  # type: ignore[name-defined, misc, valid-type]
+            def __init__(self) -> None:
+                super().__init__()
+                self.signals = _WorkerSignals()
+
+            def run(self) -> None:
+                try:
+                    graph = NodeGraphState.from_dict(graph_data, registry)
+                    service = BackendService()
+                    if operation in {"backend_check", "generate"}:
+                        payload: object = service.backend_check_safely(graph)
+                    elif operation == "export_csv":
+                        payload = service.export_csv(graph)
+                    elif operation == "export_gcode":
+                        payload = service.export_gcode(graph)
+                    else:
+                        raise ValueError(f"unsupported backend operation: {operation}")
+                except Exception as exc:  # noqa: BLE001 - reported to UI thread
+                    self.signals.failed.emit(operation, str(exc), traceback.format_exc())
+                    return
+                self.signals.finished.emit(operation, payload, graph.to_dict())
+
+        worker = _BackendWorker()
+        worker.signals.finished.connect(self._on_backend_service_worker_finished)
+        worker.signals.failed.connect(self._on_backend_service_worker_failed)
+        self._node_workers.append(worker)
+        self._node_thread_pool.start(worker)
+
+    def _mark_backend_nodes_running(self, operation: str) -> None:
+        backend_types = {
+            "project",
+            "machine_backend",
+            "mandrel_backend",
+            "tow_backend",
+            "layer_stack_backend",
+            "pattern_optimisation_backend",
+            "coverage_mode",
+            "validation_backend",
+            "backend_check",
+            "plot_backend",
+            "csv_backend_export",
+            "gcode_backend_export",
+            "report_export",
+        }
+        for node in self._node_graph.nodes.values():
+            if node.type_id in backend_types:
+                node.status = "running"
+                node.message = operation.replace("_", " ")
+        self._redraw_node_graph()
+
+    def _on_backend_service_worker_finished(
+        self,
+        operation: str,
+        payload: object,
+        graph_data: dict[str, object],
+    ) -> None:
+        self._node_graph = NodeGraphState.from_dict(graph_data, self._node_registry)
+        if isinstance(payload, BackendCheckResult):
+            self._last_backend_check = payload
+            self._apply_backend_check_result(payload)
+            self._update_backend_report_panel(payload)
+            self._load_backend_artifacts(payload.output_directory)
+            status = "backend-ready" if payload.overall_ready else "not backend-ready"
+            self._set_node_status(f"Backend check complete: {status}")
+            if payload.traceback_text:
+                self.node_debug_log.appendPlainText(payload.traceback_text)
+        elif isinstance(payload, Path):
+            self._mark_backend_nodes_passed(f"Wrote {payload}")
+            self._set_node_status(f"{operation.replace('_', ' ').title()} complete: {payload}")
+            self._refresh_backend_artifacts()
+        else:
+            self._mark_backend_nodes_passed(f"{operation} complete")
+            self._set_node_status(f"{operation.replace('_', ' ').title()} complete")
+        self._redraw_node_graph()
+        self._set_backend_busy(False, f"Complete: {operation.replace('_', ' ')}")
+
+    def _on_backend_service_worker_failed(
+        self,
+        operation: str,
+        message: str,
+        traceback_text: str,
+    ) -> None:
+        for node in self._node_graph.nodes.values():
+            if node.status == "running":
+                node.status = "failed"
+                node.message = message
+        self._redraw_node_graph()
+        self._set_backend_busy(False, f"{operation.replace('_', ' ')} failed: {message}")
+        self._show_graph_error(
+            f"Backend {operation.replace('_', ' ')} failed",
+            RuntimeError(message),
+        )
+        if hasattr(self, "node_debug_log"):
+            self.node_debug_log.appendPlainText(traceback_text)
+
+    def _apply_backend_check_result(self, result: BackendCheckResult) -> None:
+        status = (
+            "passed"
+            if result.overall_ready
+            else "failed"
+            if result.traceback_text
+            else "warning"
+        )
+        message = "Backend-ready" if result.overall_ready else "Review backend report"
+        for node in self._node_graph.nodes.values():
+            if node.type_id in {
+                "project",
+                "machine_backend",
+                "mandrel_backend",
+                "tow_backend",
+                "layer_stack_backend",
+                "pattern_optimisation_backend",
+                "coverage_mode",
+                "validation_backend",
+                "backend_check",
+                "plot_backend",
+                "csv_backend_export",
+                "gcode_backend_export",
+                "report_export",
+            }:
+                node.status = cast(Any, status)
+                node.message = message
+        for label, passed in result.checks.items():
+            if label == "Pattern optimisation":
+                self._set_nodes_by_type_status(
+                    ("pattern_optimisation_backend",),
+                    "passed" if passed else "failed",
+                    label,
+                )
+            elif label in {"Machine kinematics", "Config"}:
+                self._set_nodes_by_type_status(
+                    ("machine_backend", "validation_backend"),
+                    "passed" if passed else "failed",
+                    label,
+                )
+            elif label == "Exports":
+                self._set_nodes_by_type_status(
+                    ("csv_backend_export", "gcode_backend_export", "report_export"),
+                    "passed" if passed else "failed",
+                    label,
+                )
+
+    def _set_nodes_by_type_status(
+        self,
+        type_ids: tuple[str, ...],
+        status: str,
+        message: str,
+    ) -> None:
+        for node in self._node_graph.nodes.values():
+            if node.type_id in type_ids:
+                node.status = cast(Any, status)
+                node.message = message
+
+    def _mark_backend_nodes_passed(self, message: str) -> None:
+        for node in self._node_graph.nodes.values():
+            if node.status == "running":
+                node.status = "passed"
+                node.message = message
+
+    def _refresh_backend_artifacts(self) -> None:
+        output_directory = (
+            self._last_backend_check.output_directory
+            if self._last_backend_check is not None
+            else self._backend_service.build_project_from_graph(self._node_graph).output.directory
+        )
+        self._load_backend_artifacts(output_directory)
+        self._set_node_status(f"Loaded backend artifacts from {output_directory}")
+
+    def _load_backend_artifacts(self, output_directory: Path | None) -> None:
+        if output_directory is None:
+            return
+        reports = self._backend_service.load_reports(output_directory)
+        plots = self._backend_service.load_plots(output_directory)
+        self._last_loaded_reports = reports
+        self._last_loaded_plots = plots
+        self._populate_report_list(reports)
+        self._populate_plot_list(plots)
+
+    def _update_backend_report_panel(self, result: BackendCheckResult) -> None:
+        if not hasattr(self, "backend_report_summary"):
+            return
+        lines = [
+            f"Backend-ready: {str(result.overall_ready).lower()}",
+            f"Machine-ready: {str(result.machine_ready).lower()}",
+            f"Summary hash: {result.summary_hash or 'not available'}",
+        ]
+        lines.extend(
+            f"{label}: {'PASS' if passed else 'FAIL'}"
+            for label, passed in result.checks.items()
+        )
+        if result.output_directory is not None:
+            lines.append(f"Output: {result.output_directory}")
+        self.backend_report_summary.setText("\n".join(lines))
+        if hasattr(self, "report_detail"):
+            detail = result.log
+            if result.traceback_text:
+                detail = f"{detail}\n\n{result.traceback_text}"
+            self.report_detail.setPlainText(detail)
+
+    def _populate_report_list(self, reports: LoadedReportSet) -> None:
+        if not hasattr(self, "report_list"):
+            return
+        self.report_list.clear()
+        for name, path in sorted(reports.paths.items()):
+            item = self._qt_widgets.QListWidgetItem(name.replace("_", " ").title())
+            item.setData(self._qt_core.Qt.ItemDataRole.UserRole, str(path))
+            self.report_list.addItem(item)
+
+    def _populate_plot_list(self, plots: LoadedPlotSet) -> None:
+        if not hasattr(self, "plot_list"):
+            return
+        self.plot_list.clear()
+        for path in plots.plots:
+            item = self._qt_widgets.QListWidgetItem(path.name)
+            item.setData(self._qt_core.Qt.ItemDataRole.UserRole, str(path))
+            self.plot_list.addItem(item)
+        if self.plot_list.count() and self.plot_list.currentItem() is None:
+            self.plot_list.setCurrentRow(0)
+
+    def _show_report_item(self, current: Any | None) -> None:
+        if current is None or not hasattr(self, "report_detail"):
+            return
+        path = Path(str(current.data(self._qt_core.Qt.ItemDataRole.UserRole)))
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self.report_detail.setPlainText(f"Could not load report {path}: {exc}")
+            return
+        self.report_detail.setPlainText(json.dumps(parsed, indent=2, sort_keys=True))
+
+    def _show_plot_item(self, current: Any | None) -> None:
+        if current is None:
+            return
+        self._current_plot_path = Path(
+            str(current.data(self._qt_core.Qt.ItemDataRole.UserRole))
+        )
+        self._fit_current_plot()
+
+    def _fit_current_plot(self) -> None:
+        if self._current_plot_path is None or not hasattr(self, "plot_preview"):
+            return
+        pixmap = self._qt_gui.QPixmap(str(self._current_plot_path))
+        if pixmap.isNull():
+            self.plot_preview.setText(f"Could not load plot: {self._current_plot_path}")
+            return
+        available_size = self.plot_preview.size()
+        if available_size.width() > 40 and available_size.height() > 40:
+            pixmap = pixmap.scaled(
+                available_size,
+                self._qt_core.Qt.AspectRatioMode.KeepAspectRatio,
+                self._qt_core.Qt.TransformationMode.SmoothTransformation,
+            )
+        self.plot_preview.setPixmap(pixmap)
+        self.plot_preview.setToolTip(str(self._current_plot_path))
+
+    def _open_current_plot_external(self) -> None:
+        if self._current_plot_path is None:
+            self._set_node_status("No plot selected")
+            return
+        self._qt_gui.QDesktopServices.openUrl(
+            self._qt_core.QUrl.fromLocalFile(str(self._current_plot_path))
+        )
 
     def _draw_node_graph_result(self, result: GraphExecutionResult) -> None:
         program = None
@@ -3123,6 +3980,7 @@ class _PreviewWindow:
     def _current_node_graph_data(self) -> dict[str, object]:
         if hasattr(self, "node_scene"):
             self._sync_node_graph_from_scene()
+            self._sync_node_view_state()
         self._log_graph_event("Project save graph state")
         return self._node_graph.to_dict()
 
@@ -3137,7 +3995,7 @@ class _PreviewWindow:
         self._log_graph_event("Project load graph state")
         if hasattr(self, "node_scene"):
             self._redraw_node_graph()
-            self._schedule_fit_node_graph()
+            self._restore_node_view_state()
 
     def _set_project_path(self, path: Path) -> None:
         self._current_project_path = path
@@ -3191,6 +4049,39 @@ class _PreviewWindow:
         )
         if filename:
             line_edit.setText(filename)
+
+    def _import_backend_config_dialog(self) -> None:
+        filename, _ = self._qt_widgets.QFileDialog.getOpenFileName(
+            self.widget,
+            "Import backend config",
+            "examples",
+            "Config Files (*.yaml *.yml *.json);;All Files (*)",
+        )
+        if not filename:
+            return
+        graph = self._backend_service.import_config_to_graph(filename)
+        self._node_graph = graph
+        if hasattr(self, "node_scene"):
+            self._redraw_node_graph()
+            self._schedule_fit_node_graph()
+        config = self._backend_service.build_project_from_graph(graph)
+        if hasattr(self, "project_name"):
+            self.project_name.setText(config.project.name)
+        self._set_gui_status(f"Imported backend config: {filename}")
+        self._load_backend_artifacts(config.output.directory)
+
+    def _export_backend_config_dialog(self) -> None:
+        filename, _ = self._qt_widgets.QFileDialog.getSaveFileName(
+            self.widget,
+            "Export backend config",
+            "exports/gui_winding_job.yaml",
+            "YAML Files (*.yaml *.yml);;JSON Files (*.json);;All Files (*)",
+        )
+        if not filename:
+            return
+        self._sync_node_graph_from_scene()
+        path = self._backend_service.export_graph_to_config(self._node_graph, filename)
+        self._set_gui_status(f"Exported backend config: {path}")
 
     def _on_mode_changed(self, *_args: Any) -> None:
         self._render_scene()
@@ -3469,9 +4360,14 @@ def _preview_radius_mm(mandrel: Any) -> float:
 
 def _node_status_color(status: str) -> str:
     colors = {
+        "not_run": "#7d8790",
         "not_configured": "#7d8790",
         "ready": "#4f9f72",
+        "running": "#3b82c4",
         "warning": "#c89438",
+        "failed": "#d65757",
+        "passed": "#51a36f",
+        "stale": "#8f6bd3",
         "error": "#d65757",
         "processing": "#3b82c4",
         "complete": "#51a36f",
@@ -3482,13 +4378,23 @@ def _node_status_color(status: str) -> str:
 
 def _socket_kind_color(kind: str) -> str:
     colors = {
+        "project_config": "#6f8fd3",
+        "machine_config": "#c89438",
         "mandrel": "#2f9fcf",
         "tow": "#9b6fd3",
         "machine": "#c89438",
+        "layer": "#7bbf68",
         "layer_stack": "#5fb56c",
+        "pattern_candidates": "#72a5d8",
+        "selected_pattern": "#55b3ad",
+        "winding_program": "#55b3ad",
         "program": "#55b3ad",
         "coverage": "#8cbf4f",
+        "coverage_mode": "#8cbf4f",
         "simulation": "#8f8de0",
+        "validation_report": "#a58de0",
+        "plots": "#d0a845",
+        "exports": "#d08a45",
         "export": "#d08a45",
         "any": "#9aa7b2",
     }

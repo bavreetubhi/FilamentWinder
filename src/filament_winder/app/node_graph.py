@@ -22,20 +22,35 @@ from filament_winder.io import GCodeOptions, export_gcode, export_winding_progra
 from filament_winder.io.dxf_import import import_dxf_zr_profile
 
 SocketKind = Literal[
+    "project_config",
+    "machine_config",
     "mandrel",
     "tow",
     "machine",
+    "layer",
     "layer_stack",
+    "pattern_candidates",
+    "selected_pattern",
+    "winding_program",
     "program",
     "coverage",
+    "coverage_mode",
     "simulation",
+    "validation_report",
+    "plots",
+    "exports",
     "export",
     "any",
 ]
 NodeStatus = Literal[
+    "not_run",
     "not_configured",
     "ready",
+    "running",
     "warning",
+    "failed",
+    "passed",
+    "stale",
     "error",
     "processing",
     "complete",
@@ -170,6 +185,9 @@ class NodeGraphState:
     groups: dict[str, NodeGroup] = field(default_factory=dict)
     selected_node_ids: tuple[str, ...] = ()
     schema_version: int = 1
+    view_zoom: float = 1.0
+    view_center_x: float = 1100.0
+    view_center_y: float = 450.0
 
     def add_node(
         self,
@@ -363,11 +381,11 @@ class NodeGraphState:
         return tuple(downstream)
 
     def mark_downstream_dirty(self, node_id: str) -> None:
-        dirty_ids = (node_id, *self.downstream_node_ids(node_id))
-        for dirty_id in dirty_ids:
-            if dirty_id in self.nodes:
-                self.nodes[dirty_id].status = "dirty"
-                self.nodes[dirty_id].message = "Needs recompute"
+        stale_ids = (node_id, *self.downstream_node_ids(node_id))
+        for stale_id in stale_ids:
+            if stale_id in self.nodes:
+                self.nodes[stale_id].status = "stale"
+                self.nodes[stale_id].message = "Needs recompute"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -376,6 +394,11 @@ class NodeGraphState:
             "links": [link.to_dict() for link in self.links.values()],
             "groups": [group.to_dict() for group in self.groups.values()],
             "selected_node_ids": list(self.selected_node_ids),
+            "view": {
+                "zoom": self.view_zoom,
+                "center_x": self.view_center_x,
+                "center_y": self.view_center_y,
+            },
         }
 
     @classmethod
@@ -386,7 +409,14 @@ class NodeGraphState:
     ) -> NodeGraphState:
         if not data:
             return NodeGraphState()
-        graph = cls(schema_version=int(data.get("schema_version", 1)))
+        view_data = data.get("view", {})
+        view = view_data if isinstance(view_data, dict) else {}
+        graph = cls(
+            schema_version=int(data.get("schema_version", 1)),
+            view_zoom=float(view.get("zoom", data.get("view_zoom", 1.0))),
+            view_center_x=float(view.get("center_x", data.get("view_center_x", 1100.0))),
+            view_center_y=float(view.get("center_y", data.get("view_center_y", 450.0))),
+        )
         for node_data in data.get("nodes", ()):
             node = NodeInstance.from_dict(node_data)
             if node.type_id not in registry:
@@ -443,7 +473,10 @@ class GraphExecutionResult:
 class GraphMutationResult:
     success: bool
     node_id: str | None = None
+    node_ids: tuple[str, ...] = ()
+    link_id: str | None = None
     error: str | None = None
+    message: str = ""
 
 
 class NodeGraphController:
@@ -475,6 +508,77 @@ class NodeGraphController:
                 self._graph.nodes.pop(node_id, None)
             return GraphMutationResult(success=False, error=str(exc))
         return GraphMutationResult(success=True, node_id=node.id)
+
+    def duplicate_node(self, node_id: str) -> GraphMutationResult:
+        before_node_ids = set(self._graph.nodes)
+        try:
+            node = self._graph.duplicate_node(node_id, self._registry)
+            validate_node_instance(node, _definition(self._registry, node.type_id))
+        except Exception as exc:  # noqa: BLE001 - converted to controlled UI error
+            for added_node_id in set(self._graph.nodes) - before_node_ids:
+                self._graph.nodes.pop(added_node_id, None)
+            return GraphMutationResult(success=False, error=str(exc))
+        return GraphMutationResult(success=True, node_id=node.id, node_ids=(node.id,))
+
+    def duplicate_branch(self, root_node_id: str) -> GraphMutationResult:
+        before_node_ids = set(self._graph.nodes)
+        try:
+            branch_node_ids = (root_node_id, *self._graph.downstream_node_ids(root_node_id))
+            duplicates: dict[str, NodeInstance] = {}
+            for index, source_id in enumerate(branch_node_ids):
+                duplicates[source_id] = self._graph.duplicate_node(
+                    source_id,
+                    self._registry,
+                    offset=(48.0, 190.0 + index * 8.0),
+                )
+            for link in tuple(self._graph.links.values()):
+                if link.source_node_id in duplicates and link.target_node_id in duplicates:
+                    self._graph.add_link(
+                        duplicates[link.source_node_id].id,
+                        link.source_socket,
+                        duplicates[link.target_node_id].id,
+                        link.target_socket,
+                        self._registry,
+                    )
+        except Exception as exc:  # noqa: BLE001 - converted to controlled UI error
+            for added_node_id in set(self._graph.nodes) - before_node_ids:
+                self._graph.delete_nodes((added_node_id,))
+            return GraphMutationResult(success=False, error=str(exc))
+        duplicate_ids = tuple(node.id for node in duplicates.values())
+        return GraphMutationResult(success=True, node_id=duplicate_ids[0], node_ids=duplicate_ids)
+
+    def delete_nodes(self, node_ids: tuple[str, ...]) -> GraphMutationResult:
+        try:
+            self._graph.delete_nodes(node_ids)
+        except Exception as exc:  # noqa: BLE001 - converted to controlled UI error
+            return GraphMutationResult(success=False, error=str(exc))
+        return GraphMutationResult(success=True, node_ids=tuple(node_ids))
+
+    def link_nodes(
+        self,
+        source_node_id: str,
+        source_socket: str,
+        target_node_id: str,
+        target_socket: str,
+    ) -> GraphMutationResult:
+        try:
+            link = self._graph.add_link(
+                source_node_id,
+                source_socket,
+                target_node_id,
+                target_socket,
+                self._registry,
+            )
+        except Exception as exc:  # noqa: BLE001 - converted to controlled UI error
+            return GraphMutationResult(success=False, error=str(exc))
+        return GraphMutationResult(success=True, link_id=link.id)
+
+    def unlink_nodes(self, node_ids: tuple[str, ...]) -> GraphMutationResult:
+        try:
+            self._graph.remove_links_for_nodes(node_ids)
+        except Exception as exc:  # noqa: BLE001 - converted to controlled UI error
+            return GraphMutationResult(success=False, error=str(exc))
+        return GraphMutationResult(success=True, node_ids=tuple(node_ids))
 
 
 class NodeGraphExecutor:
@@ -590,7 +694,7 @@ class NodeGraphExecutor:
 
 
 def default_node_registry() -> dict[str, NodeTypeDefinition]:
-    return {
+    registry = {
         "mandrel_profile": NodeTypeDefinition(
             type_id="mandrel_profile",
             label="Mandrel Profile",
@@ -734,6 +838,288 @@ def default_node_registry() -> dict[str, NodeTypeDefinition]:
             default_settings={"enabled": False, "port": ""},
         ),
     }
+    registry.update(_backend_node_registry())
+    return registry
+
+
+def _backend_node_registry() -> dict[str, NodeTypeDefinition]:
+    return {
+        "project": NodeTypeDefinition(
+            type_id="project",
+            label="Project",
+            category="Project",
+            color="#4b6f9f",
+            outputs=(NodeSocketDefinition("project_config", "project_config"),),
+            default_settings={
+                "name": "demo_domed_pressure_vessel",
+                "units": "mm",
+                "output_directory": "exports/demo_domed_pressure_vessel",
+            },
+        ),
+        "machine_backend": NodeTypeDefinition(
+            type_id="machine_backend",
+            label="Machine Config",
+            category="Machine",
+            color="#98733f",
+            inputs=(NodeSocketDefinition("project_config", "project_config"),),
+            outputs=(NodeSocketDefinition("machine_config", "machine_config"),),
+            default_settings={
+                "controller": "grbl_compatible",
+                "axis_order": ["A", "X", "Z", "B"],
+                "clearance_mm": 20.0,
+                "max_a_rpm": 120.0,
+                "max_x_mm": 300.0,
+                "max_z_mm": 1500.0,
+                "max_b_deg": 7200.0,
+                "max_b_velocity_deg_s": 240.0,
+                "max_segment_length_mm": 20.0,
+                "max_a_accel_deg_s2": 2500.0,
+                "max_x_accel_mm_s2": 2500.0,
+                "max_z_accel_mm_s2": 1000.0,
+                "max_b_accel_deg_s2": 10000.0,
+            },
+        ),
+        "mandrel_backend": NodeTypeDefinition(
+            type_id="mandrel_backend",
+            label="Mandrel",
+            category="Mandrel",
+            color="#2f6f9f",
+            inputs=(NodeSocketDefinition("machine_config", "machine_config"),),
+            outputs=(NodeSocketDefinition("mandrel", "mandrel"),),
+            default_settings={
+                "type": "cylinder_with_elliptical_domes",
+                "cylinder_length_mm": 1000.0,
+                "cylinder_radius_mm": 101.6,
+                "left_dome_length_mm": 120.0,
+                "right_dome_length_mm": 120.0,
+                "polar_opening_radius_mm": 25.0,
+                "mesh_points_z": 360,
+                "mesh_points_theta": 360,
+            },
+        ),
+        "tow_backend": NodeTypeDefinition(
+            type_id="tow_backend",
+            label="Tow / Material",
+            category="Material",
+            color="#7a5aa6",
+            inputs=(NodeSocketDefinition("mandrel", "mandrel"),),
+            outputs=(NodeSocketDefinition("tow", "tow"),),
+            default_settings={
+                "name": "carbon_tow",
+                "width_mm": 6.0,
+                "thickness_mm": 0.25,
+                "fibre_type": "carbon",
+                "resin_system": "",
+                "notes": "",
+            },
+        ),
+        "layer_stack_backend": NodeTypeDefinition(
+            type_id="layer_stack_backend",
+            label="Layer Stack",
+            category="Layers",
+            color="#487d53",
+            inputs=(
+                NodeSocketDefinition("tow", "tow"),
+                NodeSocketDefinition("layer", "layer", required=False),
+            ),
+            outputs=(NodeSocketDefinition("layer_stack", "layer_stack"),),
+            default_settings={"layers": _default_backend_layers()},
+        ),
+        "hoop_layer": NodeTypeDefinition(
+            type_id="hoop_layer",
+            label="Hoop Layer",
+            category="Layers",
+            color="#6f8f3f",
+            inputs=(NodeSocketDefinition("tow", "tow", required=False),),
+            outputs=(NodeSocketDefinition("layer", "layer"),),
+            default_settings={
+                "name": "hoop_cylinder",
+                "enabled": True,
+                "region": "cylinder_only",
+                "type": "hoop",
+                "winding_angle_deg": 90.0,
+                "passes": 1,
+                "coverage_target": 1.0,
+                "feedrate_mm_min": 500.0,
+                "points": 80,
+                "colour": "#1e90ff",
+            },
+        ),
+        "geodesic_layer": NodeTypeDefinition(
+            type_id="geodesic_layer",
+            label="Geodesic Layer",
+            category="Layers",
+            color="#3f7d7d",
+            inputs=(NodeSocketDefinition("tow", "tow", required=False),),
+            outputs=(NodeSocketDefinition("layer", "layer"),),
+            default_settings={
+                "name": "geodesic_dome_to_dome",
+                "enabled": True,
+                "region": "dome_to_dome",
+                "type": "geodesic",
+                "initial_angle_deg": 45.0,
+                "winding_angle_deg": 45.0,
+                "direction": "forward",
+                "passes": "auto",
+                "turnaround_radius_mm": 28.0,
+                "polar_opening_radius_mm": 25.0,
+                "coverage_target": 1.0,
+                "feedrate_mm_min": 450.0,
+                "points": 140,
+                "colour": "#1e90ff",
+            },
+        ),
+        "non_geodesic_layer": NodeTypeDefinition(
+            type_id="non_geodesic_layer",
+            label="Non-Geodesic Layer",
+            category="Layers",
+            color="#5d718f",
+            inputs=(NodeSocketDefinition("tow", "tow", required=False),),
+            outputs=(NodeSocketDefinition("layer", "layer"),),
+            default_settings={
+                "name": "non_geodesic_controlled",
+                "enabled": True,
+                "region": "dome_to_dome",
+                "type": "non_geodesic",
+                "target_angle_deg": 35.0,
+                "winding_angle_deg": 35.0,
+                "direction": "reverse",
+                "passes": "auto",
+                "turnaround_radius_mm": 28.0,
+                "polar_opening_radius_mm": 25.0,
+                "coverage_target": 1.0,
+                "feedrate_mm_min": 400.0,
+                "points": 140,
+                "colour": "#ff851b",
+            },
+        ),
+        "coverage_mode": NodeTypeDefinition(
+            type_id="coverage_mode",
+            label="Coverage Mode",
+            category="Pattern",
+            color="#657f3f",
+            inputs=(NodeSocketDefinition("project_config", "project_config", required=False),),
+            outputs=(NodeSocketDefinition("coverage_mode", "coverage_mode"),),
+            default_settings={
+                "individual_layer_full_coverage": False,
+                "stack_level_full_coverage": True,
+                "paired_layer_coverage": True,
+                "z_cells": 160,
+                "theta_cells": 240,
+                "tow_band_model": "rectangular_surface_band",
+            },
+        ),
+        "pattern_optimisation_backend": NodeTypeDefinition(
+            type_id="pattern_optimisation_backend",
+            label="Pattern Optimisation",
+            category="Pattern",
+            color="#517aa3",
+            inputs=(
+                NodeSocketDefinition("machine_config", "machine_config", required=False),
+                NodeSocketDefinition("mandrel", "mandrel", required=False),
+                NodeSocketDefinition("tow", "tow", required=False),
+                NodeSocketDefinition("layer_stack", "layer_stack"),
+                NodeSocketDefinition("coverage_mode", "coverage_mode", required=False),
+            ),
+            outputs=(
+                NodeSocketDefinition("pattern_candidates", "pattern_candidates"),
+                NodeSocketDefinition("selected_pattern", "selected_pattern"),
+                NodeSocketDefinition("winding_program", "winding_program"),
+            ),
+            default_settings={
+                "method": "textbook_integer_closure",
+                "max_p": 500,
+                "max_k": 500,
+                "max_d": 20,
+                "angle_tolerance_deg": 0.5,
+                "require_gcd_clean_pattern": True,
+                "candidate_count": 10,
+                "target_layer_thickness_mm": 0.25,
+                "max_layer_overlap_percent": 35.0,
+                "max_stack_overlap_percent": 45.0,
+                "max_thickness_variation_percent": 75.0,
+                "max_polar_buildup_mm": 0.75,
+                "max_coverage_count": 20,
+                "max_estimated_winding_time_min": 1300.0,
+            },
+        ),
+        "validation_backend": NodeTypeDefinition(
+            type_id="validation_backend",
+            label="Validation",
+            category="Validation",
+            color="#6b6aa8",
+            inputs=(
+                NodeSocketDefinition("winding_program", "winding_program"),
+                NodeSocketDefinition("selected_pattern", "selected_pattern", required=False),
+                NodeSocketDefinition("machine_config", "machine_config", required=False),
+            ),
+            outputs=(NodeSocketDefinition("validation_report", "validation_report"),),
+            default_settings={},
+        ),
+        "backend_check": NodeTypeDefinition(
+            type_id="backend_check",
+            label="Backend Check",
+            category="Validation",
+            color="#6b6aa8",
+            inputs=(NodeSocketDefinition("validation_report", "validation_report"),),
+            outputs=(NodeSocketDefinition("validation_report", "validation_report"),),
+            default_settings={},
+        ),
+        "plot_backend": NodeTypeDefinition(
+            type_id="plot_backend",
+            label="Plot",
+            category="Export",
+            color="#8a6741",
+            inputs=(
+                NodeSocketDefinition("winding_program", "winding_program"),
+                NodeSocketDefinition("validation_report", "validation_report", required=False),
+            ),
+            outputs=(NodeSocketDefinition("plots", "plots"),),
+            default_settings={
+                "enabled": True,
+                "save": True,
+                "show": False,
+                "formats": ["png"],
+                "modes": ["unwrapped", "three_d", "debug_passes", "debug_transitions"],
+            },
+        ),
+        "csv_backend_export": NodeTypeDefinition(
+            type_id="csv_backend_export",
+            label="CSV Export",
+            category="Export",
+            color="#8a6741",
+            inputs=(NodeSocketDefinition("winding_program", "winding_program"),),
+            outputs=(NodeSocketDefinition("exports", "exports"),),
+            default_settings={"enabled": True},
+        ),
+        "gcode_backend_export": NodeTypeDefinition(
+            type_id="gcode_backend_export",
+            label="G-code Export",
+            category="Export",
+            color="#8a523f",
+            inputs=(NodeSocketDefinition("winding_program", "winding_program"),),
+            outputs=(NodeSocketDefinition("exports", "exports"),),
+            default_settings={"enabled": True},
+        ),
+        "report_export": NodeTypeDefinition(
+            type_id="report_export",
+            label="Report Export",
+            category="Export",
+            color="#8a6741",
+            inputs=(NodeSocketDefinition("validation_report", "validation_report"),),
+            outputs=(NodeSocketDefinition("exports", "exports"),),
+            default_settings={"enabled": True},
+        ),
+        "controller_run_backend": NodeTypeDefinition(
+            type_id="controller_run_backend",
+            label="Controller / Machine Run",
+            category="Controller",
+            color="#8a3f3f",
+            inputs=(NodeSocketDefinition("exports", "exports", required=False),),
+            outputs=(NodeSocketDefinition("exports", "exports"),),
+            default_settings={"enabled": False, "port": ""},
+        ),
+    }
 
 
 def validate_node_type_definition(definition: NodeTypeDefinition) -> None:
@@ -857,6 +1243,117 @@ def default_filament_winder_graph(
     graph.add_link(pattern.id, "program", csv_export.id, "program", registry)
     graph.add_link(pattern.id, "program", gcode_export.id, "program", registry)
     return graph
+
+
+def default_backend_winding_graph() -> NodeGraphState:
+    """Default node workflow for the config-driven domed winding backend."""
+
+    registry = default_node_registry()
+    graph = NodeGraphState()
+    project = graph.add_node("project", registry, x=40.0, y=60.0)
+    machine = graph.add_node("machine_backend", registry, x=380.0, y=60.0)
+    mandrel = graph.add_node("mandrel_backend", registry, x=720.0, y=60.0)
+    tow = graph.add_node("tow_backend", registry, x=1060.0, y=60.0)
+    layers = graph.add_node("layer_stack_backend", registry, x=1400.0, y=60.0)
+    coverage = graph.add_node("coverage_mode", registry, x=1400.0, y=260.0)
+    pattern = graph.add_node("pattern_optimisation_backend", registry, x=1760.0, y=80.0)
+    validation = graph.add_node("validation_backend", registry, x=2140.0, y=60.0)
+    backend_check = graph.add_node("backend_check", registry, x=2480.0, y=60.0)
+    plots = graph.add_node("plot_backend", registry, x=2840.0, y=20.0)
+    reports = graph.add_node("report_export", registry, x=2840.0, y=200.0)
+    csv_export = graph.add_node("csv_backend_export", registry, x=3200.0, y=20.0)
+    gcode_export = graph.add_node("gcode_backend_export", registry, x=3200.0, y=200.0)
+
+    graph.add_link(project.id, "project_config", machine.id, "project_config", registry)
+    graph.add_link(machine.id, "machine_config", mandrel.id, "machine_config", registry)
+    graph.add_link(mandrel.id, "mandrel", tow.id, "mandrel", registry)
+    graph.add_link(tow.id, "tow", layers.id, "tow", registry)
+    graph.add_link(project.id, "project_config", coverage.id, "project_config", registry)
+    graph.add_link(machine.id, "machine_config", pattern.id, "machine_config", registry)
+    graph.add_link(mandrel.id, "mandrel", pattern.id, "mandrel", registry)
+    graph.add_link(tow.id, "tow", pattern.id, "tow", registry)
+    graph.add_link(layers.id, "layer_stack", pattern.id, "layer_stack", registry)
+    graph.add_link(coverage.id, "coverage_mode", pattern.id, "coverage_mode", registry)
+    graph.add_link(pattern.id, "winding_program", validation.id, "winding_program", registry)
+    graph.add_link(pattern.id, "selected_pattern", validation.id, "selected_pattern", registry)
+    graph.add_link(machine.id, "machine_config", validation.id, "machine_config", registry)
+    graph.add_link(
+        validation.id,
+        "validation_report",
+        backend_check.id,
+        "validation_report",
+        registry,
+    )
+    graph.add_link(pattern.id, "winding_program", plots.id, "winding_program", registry)
+    graph.add_link(validation.id, "validation_report", plots.id, "validation_report", registry)
+    graph.add_link(
+        validation.id,
+        "validation_report",
+        reports.id,
+        "validation_report",
+        registry,
+    )
+    graph.add_link(pattern.id, "winding_program", csv_export.id, "winding_program", registry)
+    graph.add_link(pattern.id, "winding_program", gcode_export.id, "winding_program", registry)
+    return graph
+
+
+def _default_backend_layers() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "hoop_cylinder_1",
+            "enabled": True,
+            "region": "cylinder_only",
+            "type": "hoop",
+            "winding_mode": "hoop",
+            "winding_angle_deg": 90.0,
+            "passes": 1,
+            "coverage_target": 1.0,
+            "feedrate_mm_min": 500.0,
+            "transition_before": False,
+            "transition_after": True,
+            "points": 80,
+            "colour": "#1e90ff",
+        },
+        {
+            "name": "geodesic_dome_to_dome_1",
+            "enabled": True,
+            "region": "dome_to_dome",
+            "type": "geodesic",
+            "winding_mode": "geodesic",
+            "initial_angle_deg": 45.0,
+            "winding_angle_deg": 45.0,
+            "direction": "forward",
+            "passes": "auto",
+            "turnaround_radius_mm": 28.0,
+            "polar_opening_radius_mm": 25.0,
+            "coverage_target": 1.0,
+            "feedrate_mm_min": 450.0,
+            "transition_before": True,
+            "transition_after": True,
+            "points": 140,
+            "colour": "#1e90ff",
+        },
+        {
+            "name": "non_geodesic_controlled_1",
+            "enabled": True,
+            "region": "dome_to_dome",
+            "type": "non_geodesic",
+            "winding_mode": "non_geodesic",
+            "target_angle_deg": 35.0,
+            "winding_angle_deg": 35.0,
+            "direction": "reverse",
+            "passes": "auto",
+            "turnaround_radius_mm": 28.0,
+            "polar_opening_radius_mm": 25.0,
+            "coverage_target": 1.0,
+            "feedrate_mm_min": 400.0,
+            "transition_before": True,
+            "transition_after": True,
+            "points": 140,
+            "colour": "#ff851b",
+        },
+    ]
 
 
 def _execute_mandrel_profile(node: NodeInstance) -> dict[str, Any]:
@@ -1004,7 +1501,18 @@ def _validate_socket_definitions(
 
 
 def _compatible_socket_kinds(output_kind: SocketKind, input_kind: SocketKind) -> bool:
-    return output_kind == input_kind or input_kind == "any" or output_kind == "any"
+    aliases = {
+        "program": "winding_program",
+        "export": "exports",
+        "machine": "machine_config",
+    }
+    normalised_output = aliases.get(output_kind, output_kind)
+    normalised_input = aliases.get(input_kind, input_kind)
+    return (
+        normalised_output == normalised_input
+        or normalised_input == "any"
+        or normalised_output == "any"
+    )
 
 
 def _new_id(prefix: str) -> str:
@@ -1014,9 +1522,14 @@ def _new_id(prefix: str) -> str:
 
 def _node_status(raw_status: Any) -> NodeStatus:
     if raw_status in {
+        "not_run",
         "not_configured",
         "ready",
+        "running",
         "warning",
+        "failed",
+        "passed",
+        "stale",
         "error",
         "processing",
         "complete",
