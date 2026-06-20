@@ -114,6 +114,13 @@ class QualityLimitsConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class CoverageModeConfig:
+    individual_layer_full_coverage: bool = False
+    stack_level_full_coverage: bool = True
+    paired_layer_coverage: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class LayerConfig:
     name: str
     type: str
@@ -183,6 +190,7 @@ class WindingJobConfig:
     pattern_objectives: PatternObjectivesConfig = field(default_factory=PatternObjectivesConfig)
     hoop_winding: HoopWindingConfig = field(default_factory=HoopWindingConfig)
     quality_limits: QualityLimitsConfig = field(default_factory=QualityLimitsConfig)
+    coverage_mode: CoverageModeConfig = field(default_factory=CoverageModeConfig)
     coverage: CoverageConfig = field(default_factory=CoverageConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     plot: PlotConfig = field(default_factory=PlotConfig)
@@ -204,6 +212,7 @@ class WindingJobConfig:
             pattern_objectives=_pattern_objectives_config(data.get("pattern_objectives", {})),
             hoop_winding=_hoop_winding_config(data.get("hoop_winding", {})),
             quality_limits=_quality_limits_config(data.get("quality_limits", {})),
+            coverage_mode=_coverage_mode_config(data.get("coverage_mode", {})),
             coverage=_coverage_config(data.get("coverage", {})),
             output=_output_config(data.get("output", {})),
             plot=_plot_config(data.get("plot", {})),
@@ -354,6 +363,17 @@ def _quality_limits_config(raw: object) -> QualityLimitsConfig:
         max_estimated_winding_time_min=float(
             data.get("max_estimated_winding_time_min", 600.0)
         ),
+    )
+
+
+def _coverage_mode_config(raw: object) -> CoverageModeConfig:
+    data = _mapping(raw, "coverage_mode")
+    return CoverageModeConfig(
+        individual_layer_full_coverage=bool(
+            data.get("individual_layer_full_coverage", False)
+        ),
+        stack_level_full_coverage=bool(data.get("stack_level_full_coverage", True)),
+        paired_layer_coverage=bool(data.get("paired_layer_coverage", True)),
     )
 
 

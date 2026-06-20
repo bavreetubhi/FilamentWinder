@@ -124,6 +124,8 @@ def test_hoop_layer_generates_full_coverage(tmp_path: Path) -> None:
     assert hoop_report["hoop_continuity"]["passed"] is True
     assert hoop_report["hoop_continuity"]["exact_pure_hoop_angle"] is False
     assert hoop_report["continuous_traverse_passed"] is True
+    assert hoop_report["turnaround_quality"]["validator"] == "validate_continuous_hoop_traverse"
+    assert hoop_report["overlap_percent"] < 5.0
 
 
 def test_transition_rows_are_reported(tmp_path: Path) -> None:
@@ -230,6 +232,21 @@ def test_cli_validate_and_generate_commands_run(
     assert "Config valid" in capsys.readouterr().out
     assert main(["generate", "--config", str(config_path)]) == 0
     assert "Project: test_stack" in capsys.readouterr().out
+
+
+def test_backend_check_command_runs(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = _write_config(tmp_path)
+
+    status = main(["backend-check", "--config", str(config_path)])
+    output = capsys.readouterr().out
+
+    assert status in {0, 1}
+    assert "Backend Check" in output
+    assert "Region quality:" in output
+    assert "Exports:" in output
 
 
 def test_cli_inspect_coverage_and_export_gcode_run(

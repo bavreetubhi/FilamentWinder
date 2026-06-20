@@ -124,6 +124,7 @@ def plot_layer_diagnostics(
         ("thickness_distribution", coverage_count),
         ("stack_thickness_map", coverage_count),
         ("stack_overlap_map", np.maximum(coverage_count - 1, 0)),
+        ("region_quality_map", _region_quality_values(mandrel, coverage_map)),
         ("strict_quality_summary", _strict_quality_values(coverage_count)),
     )
     for plot_type, values in heatmap_specs:
@@ -318,6 +319,23 @@ def _strict_quality_values(coverage_count: np.ndarray) -> np.ndarray:
     values[1, 0] = float(np.mean(coverage_count == 0))
     values[2, 0] = float(np.mean(coverage_count > 1))
     values[3, 0] = float(np.max(coverage_count)) if coverage_count.size else 0.0
+    return values
+
+
+def _region_quality_values(
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    coverage_map: Any,
+) -> np.ndarray:
+    z_values = np.asarray(coverage_map.z_mm, dtype=float)
+    radius = mandrel.radius_at(z_values)
+    max_radius = max(float(np.max(radius)), 1e-9)
+    values = np.zeros(np.asarray(coverage_map.coverage_count).shape, dtype=float)
+    cylinder = radius >= max_radius * 0.98
+    polar = radius <= max_radius * 0.28
+    dome = (~cylinder) & (~polar)
+    values[cylinder, :] = 0.75
+    values[dome, :] = 0.5
+    values[polar, :] = 0.15
     return values
 
 

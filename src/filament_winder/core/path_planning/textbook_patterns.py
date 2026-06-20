@@ -170,6 +170,10 @@ class PatternSearchRequest:
     require_gcd_clean_pattern: bool = True
     candidate_count: int = 10
     thickness_model: ThicknessModel = "classic_smeared_thickness"
+    max_coverage_estimate: float = 1.35
+    max_winding_time_min: float = 600.0
+    max_thickness_variation_percent: float = 75.0
+    max_polar_buildup_mm: float = 0.75
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +199,13 @@ class PatternSelectionResult:
                 "equatorial_radius_mm": self.request.equatorial_radius_mm,
                 "trajectory_length_mm": self.request.trajectory_length_mm,
                 "angle_tolerance_deg": self.request.angle_tolerance_deg,
+                "target_coverage": self.request.target_coverage,
+                "max_coverage_estimate": self.request.max_coverage_estimate,
+                "max_winding_time_min": self.request.max_winding_time_min,
+                "max_thickness_variation_percent": (
+                    self.request.max_thickness_variation_percent
+                ),
+                "max_polar_buildup_mm": self.request.max_polar_buildup_mm,
             },
             "selected": None if self.selected is None else self.selected.to_dict(),
             "candidates": [candidate.to_dict() for candidate in self.candidates],
@@ -304,8 +315,8 @@ def select_winding_pattern(
     candidates: list[WindingPatternCandidate] = []
     rejected: list[WindingPatternCandidate] = []
     rejection_counts: dict[str, int] = {}
-    min_nd = max(1, int(math.floor(required_nd * 0.6)))
-    max_nd = max(min_nd, int(math.ceil(required_nd * 1.8)) + max(12, request.candidate_count))
+    min_nd = max(1, int(math.floor(required_nd * 0.45)))
+    max_nd = max(min_nd, int(math.ceil(required_nd * 1.25)) + max(12, request.candidate_count))
     actual_step = _normalise_angle_0_360(request.delta_phi_total_deg)
     pattern_index = 0
     for pattern_type in ("leading", "lagging"):
@@ -339,7 +350,7 @@ def select_winding_pattern(
                         candidates.append(candidate)
     candidates.sort(key=lambda candidate: candidate.score)
     rejected.sort(key=lambda candidate: candidate.score)
-    selected = candidates[0] if candidates else None
+    selected = candidates[0] if candidates else (rejected[0] if rejected else None)
     return PatternSelectionResult(
         request=request,
         selected=selected,
@@ -445,10 +456,19 @@ def _make_candidate(
         rejection_reasons.append("repeated_gcd_pattern")
     if coverage_estimate < request.target_coverage * 0.92:
         rejection_reasons.append("insufficient_coverage")
-    if coverage_estimate > request.target_coverage * 1.8:
+    if coverage_estimate > request.max_coverage_estimate:
+        rejection_reasons.append("excessive_coverage")
+    elif coverage_estimate > request.target_coverage * 1.15:
         warnings.append("high overlap estimate")
     if layer_thickness < _target_thickness(request) * 0.9:
         rejection_reasons.append("insufficient_thickness")
+    winding_time_min = request.trajectory_length_mm * nd / max(request.feedrate_mm_min, 1e-9)
+    if winding_time_min > request.max_winding_time_min:
+        rejection_reasons.append("excessive_winding_time")
+    if distribution.summary.thickness_variation_percent > request.max_thickness_variation_percent:
+        rejection_reasons.append("excessive_thickness_variation")
+    if distribution.summary.polar_buildup_mm > request.max_polar_buildup_mm:
+        rejection_reasons.append("excessive_polar_buildup")
     score = _candidate_score(
         closure_error=closure_error,
         coverage_estimate=coverage_estimate,
@@ -456,7 +476,7 @@ def _make_candidate(
         thickness_summary=distribution.summary,
         windings=nd,
         required_nd=required_nd,
-        winding_time_min=request.trajectory_length_mm * nd / max(request.feedrate_mm_min, 1e-9),
+        winding_time_min=winding_time_min,
     )
     return WindingPatternCandidate(
         pattern_id=f"{request.layer_id}-{pattern_type}-{pattern_index:04d}",
@@ -478,10 +498,7 @@ def _make_candidate(
         number_of_closed_layers=d,
         gcd_check=gcd_check,
         closure_error_deg=closure_error,
-        estimated_winding_time_min=request.trajectory_length_mm * nd / max(
-            request.feedrate_mm_min,
-            1e-9,
-        ),
+        estimated_winding_time_min=winding_time_min,
         coverage_estimate=coverage_estimate,
         thickness_distribution=distribution,
         warnings=tuple(warnings),
@@ -577,13 +594,16 @@ def _candidate_score(
     coverage_error = abs(coverage_estimate - target_coverage)
     overlap_penalty = max(coverage_estimate - target_coverage, 0.0)
     winding_penalty = abs(windings - required_nd) / max(required_nd, 1)
+    excessive_time_penalty = max(winding_time_min - 60.0, 0.0)
     return (
-        closure_error * 1000.0
-        + coverage_error * 120.0
-        + overlap_penalty * 40.0
+        closure_error * 250.0
+        + coverage_error * 160.0
+        + overlap_penalty * 320.0
         + thickness_summary.thickness_variation_percent * 0.2
+        + thickness_summary.polar_buildup_mm * 80.0
         + winding_penalty * 15.0
-        + winding_time_min * 0.05
+        + winding_time_min * 0.25
+        + excessive_time_penalty * 0.75
     )
 
 

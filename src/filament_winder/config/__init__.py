@@ -3,6 +3,7 @@
 from filament_winder.config.loader import load_winding_config
 from filament_winder.config.schema import (
     CoverageConfig,
+    CoverageModeConfig,
     HoopWindingConfig,
     LaminateTargetsConfig,
     LayerConfig,
@@ -32,6 +33,7 @@ __all__ = [
     "ProjectConfig",
     "QualityLimitsConfig",
     "CoverageConfig",
+    "CoverageModeConfig",
     "RovingConfig",
     "TowConfig",
     "WindingJobConfig",

@@ -74,7 +74,12 @@ quality_limits:
   max_polar_buildup_mm: 0.75
   max_coverage_count: 20
   allow_min_thickness_zero: false
-  max_estimated_winding_time_min: 600
+  max_estimated_winding_time_min: 1300
+
+coverage_mode:
+  individual_layer_full_coverage: false
+  stack_level_full_coverage: true
+  paired_layer_coverage: true
 
 layers:
   - name: hoop_cylinder_1

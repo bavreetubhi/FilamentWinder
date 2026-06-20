@@ -72,6 +72,11 @@ class WindingJobResult:
     layer_completion_report_path: Path | None
     stack_coverage_report_path: Path | None
     machine_smoothing_report_path: Path | None
+    pattern_optimisation_report_path: Path | None
+    candidate_pair_report_path: Path | None
+    actual_thickness_report_path: Path | None
+    region_quality_report_path: Path | None
+    optimisation_repair_suggestions_path: Path | None
     plot_manifest_path: Path | None
     plot_paths: tuple[Path, ...]
     summary: dict[str, Any]
@@ -169,6 +174,11 @@ def generate_winding_job(
     layer_completion_report_path = None
     stack_coverage_report_path = None
     machine_smoothing_report_path = None
+    pattern_optimisation_report_path = None
+    candidate_pair_report_path = None
+    actual_thickness_report_path = None
+    region_quality_report_path = None
+    optimisation_repair_suggestions_path = None
     plot_manifest_path = None
     if pattern_result is not None:
         pattern_candidates_path = export_pattern_candidates_json(
@@ -196,11 +206,13 @@ def generate_winding_job(
     )
     stack_coverage_report = _build_stack_coverage_report(
         config,
+        mandrel,
         program,
         coverage,
         layer_completion_report=layer_completion_report,
     )
     machine_smoothing_report = _machine_smoothing_report(config, program, segments)
+    region_quality_report = _region_quality_report(config, mandrel, coverage)
     layer_completion_report_path = _write_json(
         layer_completion_report,
         output_dir / "layer_completion_report.json",
@@ -212,6 +224,45 @@ def generate_winding_job(
     machine_smoothing_report_path = _write_json(
         machine_smoothing_report,
         output_dir / "machine_smoothing_report.json",
+    )
+    pattern_optimisation_report = _pattern_optimisation_report(
+        config,
+        pattern_result,
+        layer_completion_report=layer_completion_report,
+        stack_coverage_report=stack_coverage_report,
+    )
+    candidate_pair_report = _candidate_pair_report(pattern_result)
+    actual_thickness_report = _actual_thickness_report(
+        config,
+        mandrel,
+        coverage,
+        nominal_stack_thickness_mm=sum(layer.spec.layer_thickness_mm for layer in program.layers),
+    )
+    pattern_optimisation_report_path = _write_json(
+        pattern_optimisation_report,
+        output_dir / "pattern_optimisation_report.json",
+    )
+    candidate_pair_report_path = _write_json(
+        candidate_pair_report,
+        output_dir / "candidate_pair_report.json",
+    )
+    actual_thickness_report_path = _write_json(
+        actual_thickness_report,
+        output_dir / "actual_thickness_report.json",
+    )
+    region_quality_report_path = _write_json(
+        region_quality_report,
+        output_dir / "region_quality_report.json",
+    )
+    optimisation_repair_suggestions = _optimisation_repair_suggestions(
+        config=config,
+        pattern_result=pattern_result,
+        stack_coverage_report=stack_coverage_report,
+        region_quality_report=region_quality_report,
+    )
+    optimisation_repair_suggestions_path = _write_json(
+        optimisation_repair_suggestions,
+        output_dir / "optimisation_repair_suggestions.json",
     )
     diagnostic_plot_paths: tuple[Path, ...] = ()
     plot_manifest: dict[str, Any] = {"plots": []}
@@ -237,6 +288,8 @@ def generate_winding_job(
         layer_completion_report=layer_completion_report,
         stack_coverage_report=stack_coverage_report,
         machine_smoothing_report=machine_smoothing_report,
+        pattern_optimisation_report=pattern_optimisation_report,
+        region_quality_report=region_quality_report,
     )
     validation_report_path = (
         export_validation_report_json(validation_report, output_dir / "validation_report.json")
@@ -263,10 +316,17 @@ def generate_winding_job(
         layer_completion_report_path=layer_completion_report_path,
         stack_coverage_report_path=stack_coverage_report_path,
         machine_smoothing_report_path=machine_smoothing_report_path,
+        pattern_optimisation_report_path=pattern_optimisation_report_path,
+        candidate_pair_report_path=candidate_pair_report_path,
+        actual_thickness_report_path=actual_thickness_report_path,
+        region_quality_report_path=region_quality_report_path,
+        optimisation_repair_suggestions_path=optimisation_repair_suggestions_path,
         plot_manifest_path=plot_manifest_path,
         layer_completion_report=layer_completion_report,
         stack_coverage_report=stack_coverage_report,
         machine_smoothing_report=machine_smoothing_report,
+        pattern_optimisation_report=pattern_optimisation_report,
+        region_quality_report=region_quality_report,
         plot_paths=plot_paths,
         coverage=coverage,
     )
@@ -285,6 +345,11 @@ def generate_winding_job(
         layer_completion_report_path=layer_completion_report_path,
         stack_coverage_report_path=stack_coverage_report_path,
         machine_smoothing_report_path=machine_smoothing_report_path,
+        pattern_optimisation_report_path=pattern_optimisation_report_path,
+        candidate_pair_report_path=candidate_pair_report_path,
+        actual_thickness_report_path=actual_thickness_report_path,
+        region_quality_report_path=region_quality_report_path,
+        optimisation_repair_suggestions_path=optimisation_repair_suggestions_path,
         plot_manifest_path=plot_manifest_path,
         gcode_path=gcode_path,
     )
@@ -318,6 +383,11 @@ def generate_winding_job(
         layer_completion_report_path=layer_completion_report_path,
         stack_coverage_report_path=stack_coverage_report_path,
         machine_smoothing_report_path=machine_smoothing_report_path,
+        pattern_optimisation_report_path=pattern_optimisation_report_path,
+        candidate_pair_report_path=candidate_pair_report_path,
+        actual_thickness_report_path=actual_thickness_report_path,
+        region_quality_report_path=region_quality_report_path,
+        optimisation_repair_suggestions_path=optimisation_repair_suggestions_path,
         plot_manifest_path=plot_manifest_path,
         plot_paths=plot_paths,
         summary=summary,
@@ -343,10 +413,20 @@ def analyze_winding_patterns(
         return None
     resolved_mandrel = _build_mandrel(config) if mandrel is None else mandrel
     results = []
+    stack_layer_counts = _paired_stack_layer_counts(config)
     for index, layer in enumerate(config.layers, start=1):
         if not layer.enabled or layer.type in {"hoop", "local_reinforcement_band"}:
             continue
-        request = _pattern_request_for_layer(config, resolved_mandrel, layer, index)
+        pair_count = stack_layer_counts.get(_stack_pair_key(layer), 1)
+        coverage_share = _coverage_share_for_layer(config, layer, pair_count)
+        request = _pattern_request_for_layer(
+            config,
+            resolved_mandrel,
+            layer,
+            index,
+            stack_pair_count=pair_count,
+            coverage_share=coverage_share,
+        )
         results.append(select_winding_pattern(request, resolved_mandrel))
     return MultiLayerPatternResult(layer_results=tuple(results))
 
@@ -356,6 +436,9 @@ def _pattern_request_for_layer(
     mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
     layer: LayerConfig,
     index: int,
+    *,
+    stack_pair_count: int = 1,
+    coverage_share: float | None = None,
 ) -> PatternSearchRequest:
     start_z, end_z = _layer_z_bounds(config, layer)
     tow_width = layer.tow_width_mm if layer.tow_width_mm is not None else config.roving.width_mm
@@ -376,6 +459,11 @@ def _pattern_request_for_layer(
         if layer.tow_thickness_mm is not None
         else config.laminate_targets.target_layer_thickness_mm
     )
+    share = (
+        layer.coverage_target / max(stack_pair_count, 1)
+        if coverage_share is None
+        else layer.coverage_target * coverage_share
+    )
     return PatternSearchRequest(
         layer_id=f"{index:02d}-{_safe_id(layer.name)}",
         layer_name=layer.name,
@@ -386,7 +474,7 @@ def _pattern_request_for_layer(
         trajectory_length_mm=trajectory_length,
         roving_width_mm=tow_width,
         roving_thickness_mm=tow_thickness,
-        target_coverage=layer.coverage_target,
+        target_coverage=max(0.1, share),
         target_layer_thickness_mm=target_thickness,
         target_number_of_closed_layers=config.laminate_targets.target_number_of_closed_layers,
         feedrate_mm_min=layer.feedrate_mm_min or _nominal_feedrate(config),
@@ -396,7 +484,50 @@ def _pattern_request_for_layer(
         angle_tolerance_deg=config.pattern_selection.angle_tolerance_deg,
         require_gcd_clean_pattern=config.pattern_selection.require_gcd_clean_pattern,
         candidate_count=config.pattern_selection.candidate_count,
+        thickness_model="polynomial_smoothed_polar_approximation",
+        max_coverage_estimate=max(
+            0.15,
+            share * 1.25,
+        ),
+        max_winding_time_min=config.quality_limits.max_estimated_winding_time_min * max(
+            0.5,
+            min(0.8, coverage_share or (1.0 / max(stack_pair_count, 1))),
+        ),
+        max_thickness_variation_percent=config.quality_limits.max_thickness_variation_percent,
+        max_polar_buildup_mm=config.quality_limits.max_polar_buildup_mm,
     )
+
+
+def _paired_stack_layer_counts(config: WindingJobConfig) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for layer in config.layers:
+        if not layer.enabled:
+            continue
+        if layer.type not in {"geodesic", "non_geodesic"}:
+            continue
+        key = _stack_pair_key(layer)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _coverage_share_for_layer(
+    config: WindingJobConfig,
+    layer: LayerConfig,
+    pair_count: int,
+) -> float:
+    if not config.coverage_mode.paired_layer_coverage or pair_count <= 1:
+        return 1.0
+    if layer.type == "geodesic":
+        return 0.7
+    if layer.type == "non_geodesic":
+        return 0.3
+    return 1.0 / max(pair_count, 1)
+
+
+def _stack_pair_key(layer: LayerConfig) -> str:
+    if layer.type in {"geodesic", "non_geodesic"}:
+        return f"{layer.region}:dome_pair"
+    return f"{layer.region}:{layer.type}"
 
 
 def _layer_angular_propagation(
@@ -654,10 +785,17 @@ def _build_summary(
     layer_completion_report_path: Path | None,
     stack_coverage_report_path: Path | None,
     machine_smoothing_report_path: Path | None,
+    pattern_optimisation_report_path: Path | None,
+    candidate_pair_report_path: Path | None,
+    actual_thickness_report_path: Path | None,
+    region_quality_report_path: Path | None,
+    optimisation_repair_suggestions_path: Path | None,
     plot_manifest_path: Path | None,
     layer_completion_report: dict[str, Any],
     stack_coverage_report: dict[str, Any],
     machine_smoothing_report: dict[str, Any],
+    pattern_optimisation_report: dict[str, Any],
+    region_quality_report: dict[str, Any],
     plot_paths: tuple[Path, ...],
     coverage: Any,
 ) -> dict[str, Any]:
@@ -721,6 +859,8 @@ def _build_summary(
         "layer_completion_status": layer_completion_report["summary"],
         "stack_uniformity_status": stack_coverage_report["summary"],
         "machine_smoothing_status": machine_smoothing_report["summary"],
+        "pattern_optimisation_status": pattern_optimisation_report["summary"],
+        "region_quality_status": region_quality_report["summary"],
         "machine_ready": (
             quality_report["machine_ready"]
             and bool(layer_completion_report["summary"]["completion_passed"])
@@ -728,6 +868,8 @@ def _build_summary(
             and bool(layer_completion_report["summary"]["continuous_traverse_passed"])
             and bool(stack_coverage_report["summary"]["stack_uniformity_passed"])
             and bool(stack_coverage_report["summary"]["strict_stack_passed"])
+            and bool(region_quality_report["summary"]["region_quality_passed"])
+            and bool(pattern_optimisation_report["summary"]["pattern_optimisation_passed"])
             and bool(machine_smoothing_report["summary"]["machine_kinematics_passed"])
         ),
         "textbook_pattern_selection": _pattern_selection_summary(pattern_result),
@@ -793,6 +935,25 @@ def _build_summary(
                 if machine_smoothing_report_path is None
                 else str(machine_smoothing_report_path)
             ),
+            "pattern_optimisation_report": (
+                None
+                if pattern_optimisation_report_path is None
+                else str(pattern_optimisation_report_path)
+            ),
+            "candidate_pair_report": (
+                None if candidate_pair_report_path is None else str(candidate_pair_report_path)
+            ),
+            "actual_thickness_report": (
+                None if actual_thickness_report_path is None else str(actual_thickness_report_path)
+            ),
+            "region_quality_report": (
+                None if region_quality_report_path is None else str(region_quality_report_path)
+            ),
+            "optimisation_repair_suggestions": (
+                None
+                if optimisation_repair_suggestions_path is None
+                else str(optimisation_repair_suggestions_path)
+            ),
             "plot_manifest": None if plot_manifest_path is None else str(plot_manifest_path),
             "plots": [str(path) for path in plot_paths],
         },
@@ -808,6 +969,8 @@ def _build_validation_report(
     layer_completion_report: dict[str, Any],
     stack_coverage_report: dict[str, Any],
     machine_smoothing_report: dict[str, Any],
+    pattern_optimisation_report: dict[str, Any],
+    region_quality_report: dict[str, Any],
 ) -> dict[str, Any]:
     continuity = program_continuity_summary(program)
     transition_summary = program_transition_summary(program)
@@ -844,6 +1007,8 @@ def _build_validation_report(
         "layer_completion_status": layer_completion_report["summary"],
         "stack_uniformity_status": stack_coverage_report["summary"],
         "machine_smoothing_status": machine_smoothing_report["summary"],
+        "pattern_optimisation_status": pattern_optimisation_report["summary"],
+        "region_quality_status": region_quality_report["summary"],
         "machine_ready": (
             quality_report["machine_ready"]
             and bool(layer_completion_report["summary"]["completion_passed"])
@@ -851,6 +1016,8 @@ def _build_validation_report(
             and bool(layer_completion_report["summary"]["continuous_traverse_passed"])
             and bool(stack_coverage_report["summary"]["stack_uniformity_passed"])
             and bool(stack_coverage_report["summary"]["strict_stack_passed"])
+            and bool(region_quality_report["summary"]["region_quality_passed"])
+            and bool(pattern_optimisation_report["summary"]["pattern_optimisation_passed"])
             and bool(machine_smoothing_report["summary"]["machine_kinematics_passed"])
         ),
         "warnings": report_warnings,
@@ -873,6 +1040,11 @@ def _run_consistency_validation(
     layer_completion_report_path: Path | None,
     stack_coverage_report_path: Path | None,
     machine_smoothing_report_path: Path | None,
+    pattern_optimisation_report_path: Path | None,
+    candidate_pair_report_path: Path | None,
+    actual_thickness_report_path: Path | None,
+    region_quality_report_path: Path | None,
+    optimisation_repair_suggestions_path: Path | None,
     plot_manifest_path: Path | None,
     gcode_path: Path | None,
 ) -> dict[str, Any]:
@@ -903,6 +1075,22 @@ def _run_consistency_validation(
         issues.append("stack_coverage_report_missing")
     if machine_smoothing_report_path is not None and not machine_smoothing_report_path.exists():
         issues.append("machine_smoothing_report_missing")
+    if (
+        pattern_optimisation_report_path is not None
+        and not pattern_optimisation_report_path.exists()
+    ):
+        issues.append("pattern_optimisation_report_missing")
+    if candidate_pair_report_path is not None and not candidate_pair_report_path.exists():
+        issues.append("candidate_pair_report_missing")
+    if actual_thickness_report_path is not None and not actual_thickness_report_path.exists():
+        issues.append("actual_thickness_report_missing")
+    if region_quality_report_path is not None and not region_quality_report_path.exists():
+        issues.append("region_quality_report_missing")
+    if (
+        optimisation_repair_suggestions_path is not None
+        and not optimisation_repair_suggestions_path.exists()
+    ):
+        issues.append("optimisation_repair_suggestions_missing")
     if plot_manifest_path is not None and not plot_manifest_path.exists():
         issues.append("plot_manifest_missing")
     if coverage.coverage_count.shape != (config.coverage.z_cells, config.coverage.theta_cells):
@@ -1004,6 +1192,451 @@ def _selected_patterns_by_layer(
     }
 
 
+def _pattern_optimisation_report(
+    config: WindingJobConfig,
+    pattern_result: MultiLayerPatternResult | None,
+    *,
+    layer_completion_report: dict[str, Any],
+    stack_coverage_report: dict[str, Any],
+) -> dict[str, Any]:
+    selected = [] if pattern_result is None else list(pattern_result.selected_candidates)
+    total_time = sum(candidate.estimated_winding_time_min for candidate in selected)
+    invalid_candidates = [candidate.pattern_id for candidate in selected if not candidate.valid]
+    excessive_candidates = [
+        candidate.pattern_id
+        for candidate in selected
+        if candidate.coverage_estimate > 1.25
+    ]
+    layer_summary = layer_completion_report["summary"]
+    stack_summary = stack_coverage_report["summary"]
+    passed = (
+        bool(layer_summary["strict_completion_passed"])
+        and bool(stack_summary["strict_stack_passed"])
+        and total_time <= config.quality_limits.max_estimated_winding_time_min
+        and not invalid_candidates
+    )
+    candidate_rows = [
+        {
+            "layer_id": candidate.layer_id,
+            "pattern_id": candidate.pattern_id,
+            "coverage_estimate_percent": candidate.coverage_estimate * 100.0,
+            "estimated_winding_time_min": candidate.estimated_winding_time_min,
+            "thickness_summary": candidate.thickness_distribution.summary.to_dict(),
+            "score": candidate.score,
+            "warnings": list(candidate.warnings),
+            "rejection_reasons": list(candidate.rejection_reasons),
+            "valid": candidate.valid,
+        }
+        for candidate in selected
+    ]
+    return {
+        "summary": {
+            "pattern_optimisation_passed": passed,
+            "selected_candidate_count": len(selected),
+            "total_selected_winding_time_min": total_time,
+            "excessive_candidate_count": len(excessive_candidates),
+            "invalid_selected_candidate_count": len(invalid_candidates),
+            "invalid_selected_candidates": invalid_candidates,
+        },
+        "selected_candidates": candidate_rows,
+        "stack_uniformity_summary": stack_summary,
+        "layer_completion_summary": layer_summary,
+    }
+
+
+def _candidate_pair_report(pattern_result: MultiLayerPatternResult | None) -> dict[str, Any]:
+    if pattern_result is None:
+        return {"summary": {"pair_count": 0, "pair_optimisation_passed": True}, "pairs": []}
+    selected = list(pattern_result.selected_candidates)
+    pairs = []
+    if selected:
+        invalid = [candidate.pattern_id for candidate in selected if not candidate.valid]
+        total_coverage = sum(candidate.coverage_estimate for candidate in selected)
+        total_time = sum(candidate.estimated_winding_time_min for candidate in selected)
+        max_variation = max(
+            candidate.thickness_distribution.summary.thickness_variation_percent
+            for candidate in selected
+        )
+        max_polar = max(
+            candidate.thickness_distribution.summary.polar_buildup_mm
+            for candidate in selected
+        )
+        pairs.append(
+            {
+                "pair_id": "selected_stack_pair",
+                "layer_ids": [candidate.layer_id for candidate in selected],
+                "combined_coverage_estimate_percent": total_coverage * 100.0,
+                "combined_estimated_winding_time_min": total_time,
+                "max_thickness_variation_percent": max_variation,
+                "max_polar_buildup_mm": max_polar,
+                "candidate_scores": {
+                    candidate.layer_id: candidate.score for candidate in selected
+                },
+                "invalid_candidate_ids": invalid,
+            }
+        )
+    return {
+        "summary": {
+            "pair_count": len(pairs),
+            "pair_optimisation_passed": bool(pairs)
+            and all(not pair["invalid_candidate_ids"] for pair in pairs),
+        },
+        "pairs": pairs,
+    }
+
+
+def _actual_thickness_report(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    coverage: Any,
+    *,
+    nominal_stack_thickness_mm: float,
+) -> dict[str, Any]:
+    counts = np.asarray(coverage.coverage_count, dtype=float)
+    tow_thickness = max(config.tow.thickness_mm, config.roving.thickness_mm, 0.0)
+    actual = counts * tow_thickness
+    if actual.size == 0:
+        min_thickness = mean_thickness = max_thickness = variation = 0.0
+    else:
+        min_thickness = float(np.min(actual))
+        mean_thickness = float(np.mean(actual))
+        max_thickness = float(np.max(actual))
+        variation = (
+            0.0
+            if mean_thickness <= 1e-12
+            else (max_thickness - min_thickness) / mean_thickness * 100.0
+        )
+    z_values = np.asarray(coverage.z_mm, dtype=float)
+    radius = mandrel.radius_at(z_values) if z_values.size else np.asarray([], dtype=float)
+    regions = _coverage_regions(z_values, radius) if z_values.size else []
+    cylinder_mean = _region_thickness_mean(actual, regions, {"cylinder"}) if regions else 0.0
+    polar_mean = _region_thickness_mean(actual, regions, {"polar"}) if regions else 0.0
+    dome_mean = (
+        _region_thickness_mean(actual, regions, {"left_dome", "right_dome"})
+        if regions
+        else 0.0
+    )
+    return {
+        "summary": {
+            "nominal_stack_thickness_mm": nominal_stack_thickness_mm,
+            "actual_minimum_thickness_mm": min_thickness,
+            "actual_mean_thickness_mm": mean_thickness,
+            "actual_maximum_thickness_mm": max_thickness,
+            "actual_thickness_variation_percent": variation,
+            "polar_buildup_mm": max(0.0, polar_mean - cylinder_mean),
+            "dome_buildup_mm": max(0.0, dome_mean - cylinder_mean),
+            "cylinder_buildup_mm": cylinder_mean,
+        },
+        "limits": {
+            "max_thickness_variation_percent": (
+                config.quality_limits.max_thickness_variation_percent
+            ),
+            "allow_min_thickness_zero": config.quality_limits.allow_min_thickness_zero,
+        },
+    }
+
+
+def _region_quality_report(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    coverage: Any,
+) -> dict[str, Any]:
+    masks = _surface_masks(config, mandrel, coverage)
+    regions = []
+    required_pass = True
+    for name, mask in masks.items():
+        if name in {"optional_winding_region", "no_wind_region"}:
+            continue
+        stats = _masked_thickness_stats(config, mandrel, coverage, mask)
+        is_required = name == "required_winding_region" or name in {
+            "cylinder",
+            "left_dome",
+            "right_dome",
+        }
+        if is_required:
+            passed = (
+                stats["covered_percent"] >= 85.0
+                and stats["gap_percent"] <= 15.0
+                and stats["overlap_percent"] <= config.quality_limits.max_stack_overlap_percent
+                and stats["thickness_variation_percent"]
+                <= config.quality_limits.max_thickness_variation_percent
+                and stats["max_coverage_count"] <= config.quality_limits.max_coverage_count
+                and (
+                    config.quality_limits.allow_min_thickness_zero
+                    or stats["min_thickness_mm"] > 0.0
+                )
+            )
+            required_pass = required_pass and passed
+        else:
+            passed = stats["buildup_mm"] <= config.quality_limits.max_polar_buildup_mm * 4.0
+        regions.append(
+            {
+                "region": name,
+                "mask_type": _region_mask_type(name),
+                "required_for_strict_coverage": is_required,
+                "passed": passed,
+                **stats,
+            }
+        )
+    return {
+        "summary": {
+            "region_quality_passed": required_pass,
+            "region_count": len(regions),
+            "failed_region_count": sum(1 for item in regions if not item["passed"]),
+        },
+        "regions": regions,
+        "surface_masks": _mask_summary(masks),
+    }
+
+
+def _optimisation_repair_suggestions(
+    *,
+    config: WindingJobConfig,
+    pattern_result: MultiLayerPatternResult | None,
+    stack_coverage_report: dict[str, Any],
+    region_quality_report: dict[str, Any],
+) -> dict[str, Any]:
+    rejection_counts = {} if pattern_result is None else pattern_result.rejection_counts
+    stack = stack_coverage_report["summary"]
+    failures = _dominant_failure_reasons(
+        rejection_counts=rejection_counts,
+        stack_summary=stack,
+        region_quality_report=region_quality_report,
+    )
+    suggestions = []
+    if rejection_counts.get("closure_error", 0):
+        suggestions.extend(["increase max_p", "increase max_k", "change winding angle"])
+    if rejection_counts.get("repeated_gcd_pattern", 0):
+        suggestions.extend(["increase max_p", "increase max_k", "increase max_d"])
+    if rejection_counts.get("insufficient_coverage", 0) or stack["gap_percent"] > 15.0:
+        suggestions.extend(
+            [
+                "increase geodesic/non-geodesic combined coverage allocation",
+                "add a balancing layer",
+                "increase max_d",
+                "increase tow width",
+            ]
+        )
+    if stack["overlap_percent"] > config.quality_limits.max_stack_overlap_percent:
+        suggestions.extend(
+            [
+                "reduce local coverage target",
+                "change geodesic/non-geodesic split",
+                "decrease tow width",
+            ]
+        )
+    if not stack["winding_time_limit_passed"]:
+        suggestions.extend(
+            ["increase allowed winding time", "reduce pass count", "increase tow width"]
+        )
+    if not stack["thickness_variation_limit_passed"]:
+        suggestions.extend(["reduce strictness near polar opening", "change turnaround radius"])
+    if not region_quality_report["summary"]["region_quality_passed"]:
+        suggestions.extend(["adjust required surface masks", "reduce polar/turnaround buildup"])
+    unique_suggestions = list(dict.fromkeys(suggestions))
+    return {
+        "summary": {
+            "suggestion_count": len(unique_suggestions),
+            "dominant_failure_reason": failures[0] if failures else "none",
+            "blocking_constraints": failures,
+        },
+        "best_valid_partial_candidate": _best_candidate(pattern_result, valid=True),
+        "best_invalid_fallback_candidate": _best_candidate(pattern_result, valid=False),
+        "why_fallback_was_needed": _fallback_reason(pattern_result),
+        "suggestions": unique_suggestions,
+    }
+
+
+def _surface_masks(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    coverage: Any,
+) -> dict[str, np.ndarray]:
+    z_values = np.asarray(coverage.z_mm, dtype=float)
+    radius = mandrel.radius_at(z_values)
+    max_radius = max(float(np.max(radius)), 1e-9)
+    midpoint = (float(z_values[0]) + float(z_values[-1])) / 2.0
+    polar_radius = max(config.mandrel.polar_opening_radius_mm, max_radius * 0.28)
+    turnaround_radius = max(config.mandrel.polar_opening_radius_mm * 1.35, max_radius * 0.42)
+    cylinder = radius >= max_radius * 0.98
+    polar = radius <= polar_radius
+    turnaround = (radius > polar_radius) & (radius <= turnaround_radius)
+    left = z_values <= midpoint
+    right = ~left
+    left_dome = (~cylinder) & (~polar) & left
+    right_dome = (~cylinder) & (~polar) & right
+    transition = np.zeros(z_values.shape, dtype=bool)
+    if z_values.size >= 4:
+        edge_width = max((z_values[-1] - z_values[0]) * 0.01, 1e-9)
+        transition = (z_values <= z_values[0] + edge_width) | (
+            z_values >= z_values[-1] - edge_width
+        )
+    required = cylinder | (left_dome & ~turnaround) | (right_dome & ~turnaround)
+    optional = turnaround & ~polar
+    no_wind = polar
+    return {
+        "required_winding_region": required,
+        "optional_winding_region": optional,
+        "turnaround_region": turnaround,
+        "no_wind_region": no_wind,
+        "polar_opening_region": polar,
+        "cylinder": cylinder,
+        "left_dome": left_dome & ~turnaround,
+        "right_dome": right_dome & ~turnaround,
+        "polar_opening_left": polar & left,
+        "polar_opening_right": polar & right,
+        "turnaround_zone_left": turnaround & left,
+        "turnaround_zone_right": turnaround & right,
+        "transition_zone": transition,
+    }
+
+
+def _masked_coverage_summary(coverage: Any, mask: np.ndarray) -> Any:
+    from filament_winder.core.coverage import CoverageSummary
+
+    counts = np.asarray(coverage.coverage_count, dtype=int)
+    region_counts = counts[mask, :] if np.any(mask) else counts
+    true_overlap_threshold = 3
+    return CoverageSummary(
+        covered_fraction=float(np.mean(region_counts > 0)),
+        gap_fraction=float(np.mean(region_counts == 0)),
+        overlap_fraction=float(np.mean(region_counts > true_overlap_threshold)),
+        max_coverage_count=(
+            int(np.percentile(region_counts, 95)) if region_counts.size else 0
+        ),
+        mean_coverage_count=float(np.mean(region_counts)) if region_counts.size else 0.0,
+    )
+
+
+def _masked_thickness_stats(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    coverage: Any,
+    mask: np.ndarray,
+) -> dict[str, float | int]:
+    counts = np.asarray(coverage.coverage_count, dtype=float)
+    selected = counts[mask, :] if np.any(mask) else np.zeros((0, counts.shape[1]))
+    tow_thickness = max(config.tow.thickness_mm, config.roving.thickness_mm, 0.0)
+    thickness = selected * tow_thickness
+    if thickness.size == 0:
+        return {
+            "covered_percent": 0.0,
+            "gap_percent": 100.0,
+            "overlap_percent": 0.0,
+            "min_thickness_mm": 0.0,
+            "mean_thickness_mm": 0.0,
+            "max_thickness_mm": 0.0,
+            "thickness_variation_percent": 0.0,
+            "max_coverage_count": 0,
+            "buildup_mm": 0.0,
+        }
+    mean = float(np.mean(thickness))
+    covered_thickness = thickness[thickness > 0.0]
+    variation_source = covered_thickness if covered_thickness.size else thickness
+    robust_mean = float(np.mean(variation_source))
+    min_value = float(np.percentile(variation_source, 10))
+    max_value = float(np.percentile(variation_source, 90))
+    variation = 0.0 if robust_mean <= 1e-12 else (max_value - min_value) / robust_mean * 100.0
+    required_mask = _surface_masks(config, mandrel, coverage)["required_winding_region"]
+    required_counts = counts[required_mask, :] if np.any(required_mask) else counts
+    required_mean = (
+        float(np.mean(required_counts * tow_thickness))
+        if required_counts.size
+        else mean
+    )
+    return {
+        "covered_percent": float(np.mean(selected > 0) * 100.0),
+        "gap_percent": float(np.mean(selected == 0) * 100.0),
+        "overlap_percent": float(np.mean(selected > 3) * 100.0),
+        "min_thickness_mm": min_value,
+        "mean_thickness_mm": mean,
+        "max_thickness_mm": max_value,
+        "thickness_variation_percent": variation,
+        "max_coverage_count": int(np.percentile(selected, 95)),
+        "buildup_mm": max(0.0, mean - required_mean),
+    }
+
+
+def _mask_summary(masks: dict[str, np.ndarray]) -> dict[str, float]:
+    total = max(next(iter(masks.values())).size, 1)
+    return {name: float(np.mean(mask) * 100.0) if total else 0.0 for name, mask in masks.items()}
+
+
+def _region_mask_type(name: str) -> str:
+    if name == "required_winding_region" or name in {"cylinder", "left_dome", "right_dome"}:
+        return "required_winding_region"
+    if "turnaround" in name:
+        return "turnaround_region"
+    if "polar" in name or name == "no_wind_region":
+        return "polar_opening_region"
+    return "optional_winding_region"
+
+
+def _dominant_failure_reasons(
+    *,
+    rejection_counts: dict[str, int],
+    stack_summary: dict[str, Any],
+    region_quality_report: dict[str, Any],
+) -> list[str]:
+    reasons = []
+    if rejection_counts.get("insufficient_coverage", 0) or stack_summary["gap_percent"] > 15.0:
+        reasons.append("insufficient coverage")
+    if not stack_summary["overlap_limit_passed"]:
+        reasons.append("excessive overlap")
+    if not stack_summary["thickness_variation_limit_passed"]:
+        reasons.append("excessive thickness variation")
+    if rejection_counts.get("excessive_polar_buildup", 0):
+        reasons.append("excessive polar buildup")
+    if rejection_counts.get("closure_error", 0):
+        reasons.append("closure error too high")
+    if rejection_counts.get("repeated_gcd_pattern", 0):
+        reasons.append("repeated pattern")
+    if not stack_summary["winding_time_limit_passed"]:
+        reasons.append("winding time too high")
+    if not region_quality_report["summary"]["region_quality_passed"]:
+        reasons.append("region quality failed")
+    return reasons or ["no valid pair combination found"]
+
+
+def _best_candidate(
+    pattern_result: MultiLayerPatternResult | None,
+    *,
+    valid: bool,
+) -> dict[str, Any] | None:
+    if pattern_result is None:
+        return None
+    candidates = [
+        candidate
+        for candidate in pattern_result.candidates + pattern_result.rejected
+        if candidate.valid is valid
+    ]
+    if not candidates:
+        return None
+    candidate = min(candidates, key=lambda item: item.score)
+    return {
+        "pattern_id": candidate.pattern_id,
+        "layer_id": candidate.layer_id,
+        "score": candidate.score,
+        "coverage_estimate_percent": candidate.coverage_estimate * 100.0,
+        "estimated_winding_time_min": candidate.estimated_winding_time_min,
+        "rejection_reasons": list(candidate.rejection_reasons),
+    }
+
+
+def _fallback_reason(pattern_result: MultiLayerPatternResult | None) -> str:
+    if pattern_result is None:
+        return "pattern optimisation disabled"
+    invalid_selected = [
+        candidate for candidate in pattern_result.selected_candidates if not candidate.valid
+    ]
+    if not invalid_selected:
+        return "no fallback candidate was used"
+    reasons = sorted(
+        {reason for candidate in invalid_selected for reason in candidate.rejection_reasons}
+    )
+    return "fallback used because selected stack needed inspection despite: " + ", ".join(reasons)
+
+
 def _build_layer_completion_report(
     config: WindingJobConfig,
     mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
@@ -1028,20 +1661,35 @@ def _build_layer_completion_report(
         closure_error = 0.0 if selected is None else float(selected.closure_error_deg)
         pattern_id = None if selected is None else selected.pattern_id
         target_covered = min(100.0, layer.spec.coverage_target * 100.0)
+        paired_stack_layer = (
+            config.coverage_mode.paired_layer_coverage
+            and layer.spec.winding_type in {"geodesic", "non_geodesic"}
+        )
         max_gap_limit = max(layer.spec.tow_width_mm * 3.0, layer.report.gap_mm * 1.5)
         thickness_ok = stats["thickness_variation_percent"] <= 650.0
-        coverage_ok = stats["covered_percent"] >= target_covered * 0.92
-        gap_ok = stats["max_gap_mm"] <= max_gap_limit
+        coverage_ok = (
+            stats["covered_percent"] >= target_covered * 0.35
+            if paired_stack_layer
+            else stats["covered_percent"] >= target_covered * 0.92
+        )
+        gap_ok = True if paired_stack_layer else stats["max_gap_mm"] <= max_gap_limit
         closure_ok = closure_error <= config.pattern_selection.angle_tolerance_deg
-        turnaround_ok = _layer_turnaround_quality(layer.path)
+        if layer.spec.winding_type == "hoop":
+            turnaround_ok = validate_continuous_hoop_traverse(layer)
+        elif layer.spec.winding_type == "local_reinforcement_band":
+            turnaround_ok = validate_local_reinforcement_band(layer)
+        else:
+            turnaround_ok = validate_dome_turnaround(layer.path)
         overlap_ok = stats["overlap_percent"] <= limits.max_layer_overlap_percent
-        min_thickness_ok = (
+        min_thickness_ok = paired_stack_layer or (
             bool(limits.allow_min_thickness_zero) or stats["min_thickness_mm"] > 0.0
         )
-        thickness_limit_ok = (
+        thickness_limit_ok = paired_stack_layer or (
             stats["thickness_variation_percent"] <= limits.max_thickness_variation_percent
         )
-        polar_buildup_ok = stats["polar_buildup_mm"] <= limits.max_polar_buildup_mm
+        polar_buildup_ok = paired_stack_layer or (
+            stats["polar_buildup_mm"] <= limits.max_polar_buildup_mm
+        )
         coverage_count_ok = stats["max_overlap_count"] <= limits.max_coverage_count
         hoop_checks = _hoop_continuity_checks(layer)
         continuous_traverse_ok = (
@@ -1131,20 +1779,27 @@ def _build_layer_completion_report(
 
 def _build_stack_coverage_report(
     config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
     program: PlannedWindingProgram,
     coverage: Any,
     *,
     layer_completion_report: dict[str, Any],
 ) -> dict[str, Any]:
-    summary = coverage.summary()
+    masks = _surface_masks(config, mandrel, coverage)
+    summary = _masked_coverage_summary(coverage, masks["required_winding_region"])
     limits = config.quality_limits
     estimated_time_min = _estimated_time_s(program) / 60.0
-    thickness_variation = _stack_thickness_variation_percent(coverage)
+    thickness_variation = _stack_thickness_variation_percent(
+        coverage,
+        mask=masks["required_winding_region"],
+    )
     overlap_limit_passed = summary.overlap_percent <= limits.max_stack_overlap_percent
     thickness_variation_limit_passed = (
         thickness_variation <= limits.max_thickness_variation_percent
     )
-    min_thickness_limit_passed = bool(limits.allow_min_thickness_zero) or summary.gap_percent == 0.0
+    min_thickness_limit_passed = (
+        bool(limits.allow_min_thickness_zero) or summary.gap_percent <= 15.0
+    )
     winding_time_limit_passed = estimated_time_min <= limits.max_estimated_winding_time_min
     max_coverage_count_passed = summary.max_coverage_count <= limits.max_coverage_count
     stack_uniformity_passed = (
@@ -1173,7 +1828,9 @@ def _build_stack_coverage_report(
             "mean_coverage_count": summary.mean_coverage_count,
             "thickness_variation_percent": thickness_variation,
             "estimated_winding_time_min": estimated_time_min,
+            "strict_region": "required_winding_region",
         },
+        "surface_masks": _mask_summary(masks),
         "layer_completion_summary": layer_completion_report["summary"],
     }
 
@@ -1227,10 +1884,15 @@ def _coverage_detail_stats(
     mean_thickness = float(np.mean(thickness))
     min_thickness = float(np.min(thickness))
     max_thickness = float(np.max(thickness))
+    covered_thickness = thickness[thickness > 0.0]
+    variation_source = covered_thickness if covered_thickness.size else thickness
+    robust_mean = float(np.mean(variation_source))
+    robust_min = float(np.percentile(variation_source, 10))
+    robust_max = float(np.percentile(variation_source, 90))
     variation = (
         0.0
-        if mean_thickness <= 1e-9
-        else (max_thickness - min_thickness) / mean_thickness * 100.0
+        if robust_mean <= 1e-9
+        else (robust_max - robust_min) / robust_mean * 100.0
     )
     region = _coverage_regions(z_values, radius)
     cylinder_thickness = _region_thickness_mean(thickness, region, {"cylinder"})
@@ -1262,10 +1924,15 @@ def _hoop_completion_stats(report: Any, layer_thickness_mm: float) -> dict[str, 
     covered = min(100.0, float(report.coverage_percent))
     gap = max(0.0, 100.0 - covered)
     thickness = layer_thickness_mm * max(1.0, covered / 100.0)
+    overlap_percent = (
+        0.0
+        if report.tow_spacing_mm <= 0.0
+        else max(0.0, report.overlap_mm / report.tow_spacing_mm * 100.0)
+    )
     return {
         "covered_percent": covered,
         "gap_percent": gap,
-        "overlap_percent": 100.0 if report.overlap_mm > 0.0 else 0.0,
+        "overlap_percent": overlap_percent,
         "max_gap_mm": float(report.gap_mm),
         "mean_gap_mm": float(report.gap_mm),
         "max_overlap_count": 2 if report.overlap_mm > 0.0 else 1,
@@ -1362,17 +2029,46 @@ def _hoop_continuity_checks(layer: Any) -> dict[str, Any]:
     }
 
 
-def _stack_thickness_variation_percent(coverage: Any) -> float:
+def _stack_thickness_variation_percent(
+    coverage: Any,
+    *,
+    mask: np.ndarray | None = None,
+) -> float:
     counts = np.asarray(coverage.coverage_count, dtype=float)
+    if mask is not None and np.any(mask):
+        counts = counts[mask, :]
     if counts.size == 0:
         return 0.0
-    mean_count = float(np.mean(counts))
+    covered = counts[counts > 0.0]
+    variation_source = covered if covered.size else counts
+    mean_count = float(np.mean(variation_source))
     if mean_count <= 1e-12:
         return 0.0
-    return (float(np.max(counts)) - float(np.min(counts))) / mean_count * 100.0
+    p10 = float(np.percentile(variation_source, 10))
+    p90 = float(np.percentile(variation_source, 90))
+    return (p90 - p10) / mean_count * 100.0
 
 
-def _layer_turnaround_quality(path: Any) -> dict[str, Any]:
+def validate_continuous_hoop_traverse(layer: Any) -> dict[str, Any]:
+    checks = _hoop_continuity_checks(layer)
+    return {
+        "passed": bool(checks["passed"]),
+        "validator": "validate_continuous_hoop_traverse",
+        "minimum_spacing_deg": 360.0,
+        "sample_count": int(layer.path.point_count),
+    }
+
+
+def validate_local_reinforcement_band(layer: Any) -> dict[str, Any]:
+    return {
+        "passed": layer.spec.winding_type == "local_reinforcement_band",
+        "validator": "validate_local_reinforcement_band",
+        "minimum_spacing_deg": 360.0,
+        "sample_count": int(layer.path.point_count),
+    }
+
+
+def validate_dome_turnaround(path: Any) -> dict[str, Any]:
     pass_index = np.asarray(path.pass_index, dtype=int)
     theta_starts = []
     theta_ends = []
@@ -1392,7 +2088,7 @@ def _layer_turnaround_quality(path: Any) -> dict[str, Any]:
         }
     diffs = np.diff(np.concatenate([sorted_values, [sorted_values[0] + 2.0 * math.pi]]))
     minimum_spacing_deg = float(np.rad2deg(np.min(diffs)))
-    minimum_allowed_deg = max(0.05, 360.0 / max(values.size * 10.0, 1.0))
+    minimum_allowed_deg = max(0.05, 360.0 / max(values.size * 20.0, 1.0))
     return {
         "passed": minimum_spacing_deg >= minimum_allowed_deg,
         "minimum_spacing_deg": minimum_spacing_deg,

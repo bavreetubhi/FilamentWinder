@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -90,8 +91,56 @@ def test_pattern_rejects_large_closure_error() -> None:
         CylinderMandrel(length_mm=50.0, radius_mm=5.0),
     )
 
-    assert result.selected is None
+    assert result.selected is not None
+    assert not result.selected.valid
     assert result.rejection_counts["closure_error"] > 0
+
+
+def test_pattern_rejects_excessive_coverage_candidate() -> None:
+    result = select_winding_pattern(
+        PatternSearchRequest(
+            layer_id="layer",
+            layer_name="layer",
+            winding_type="helical",
+            winding_angle_deg=45.0,
+            delta_phi_total_deg=202.5,
+            equatorial_radius_mm=12.0,
+            trajectory_length_mm=100.0,
+            roving_width_mm=3.0,
+            roving_thickness_mm=0.25,
+            target_coverage=0.2,
+            feedrate_mm_min=500.0,
+            max_p=12,
+            max_k=6,
+            max_d=3,
+            max_coverage_estimate=0.21,
+            candidate_count=10,
+        ),
+        CylinderMandrel(length_mm=50.0, radius_mm=12.0),
+    )
+
+    assert result.rejection_counts["excessive_coverage"] > 0
+
+
+def test_pattern_score_penalises_high_overlap_and_time() -> None:
+    low_overlap = select_winding_pattern(
+        _request(delta_phi_total_deg=202.5, radius_mm=8.0),
+        CylinderMandrel(length_mm=50.0, radius_mm=8.0),
+    )
+    high_overlap_request = replace(
+        _request(delta_phi_total_deg=202.5, radius_mm=8.0),
+        target_coverage=0.25,
+        max_coverage_estimate=2.0,
+        feedrate_mm_min=100.0,
+    )
+    high_overlap = select_winding_pattern(
+        high_overlap_request,
+        CylinderMandrel(length_mm=50.0, radius_mm=8.0),
+    )
+
+    assert low_overlap.selected is not None
+    assert high_overlap.selected is not None
+    assert high_overlap.selected.score > low_overlap.selected.score
 
 
 def test_geodesic_angle_changes_on_dome() -> None:
@@ -149,6 +198,26 @@ def test_selected_pattern_generates_closed_layer_and_exports(tmp_path: Path) -> 
     assert (
         result.machine_smoothing_report_path is not None
         and result.machine_smoothing_report_path.exists()
+    )
+    assert (
+        result.pattern_optimisation_report_path is not None
+        and result.pattern_optimisation_report_path.exists()
+    )
+    assert (
+        result.candidate_pair_report_path is not None
+        and result.candidate_pair_report_path.exists()
+    )
+    assert (
+        result.actual_thickness_report_path is not None
+        and result.actual_thickness_report_path.exists()
+    )
+    assert (
+        result.region_quality_report_path is not None
+        and result.region_quality_report_path.exists()
+    )
+    assert (
+        result.optimisation_repair_suggestions_path is not None
+        and result.optimisation_repair_suggestions_path.exists()
     )
     assert "thickness_summary" in selected
     assert "manufacturing_report" in result.summary
@@ -217,6 +286,23 @@ def test_plot_layers_cli_writes_manifest(
     output = capsys.readouterr().out
     assert "plot_manifest.json" in output
     assert (tmp_path / "out" / "layer_01_helical_unwrapped.png").exists()
+
+
+def test_repair_suggestions_created_when_no_valid_pattern(tmp_path: Path) -> None:
+    config_path = _write_textbook_config(tmp_path)
+    text = config_path.read_text(encoding="utf-8").replace(
+        "angle_tolerance_deg: 0.5",
+        "angle_tolerance_deg: 0.0001",
+    )
+    config_path.write_text(text, encoding="utf-8")
+
+    result = generate_winding_job(load_winding_config(config_path), make_plots=False)
+
+    assert result.optimisation_repair_suggestions_path is not None
+    suggestions = json.loads(
+        result.optimisation_repair_suggestions_path.read_text(encoding="utf-8")
+    )
+    assert suggestions["summary"]["suggestion_count"] > 0
 
 
 def _request(

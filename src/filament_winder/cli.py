@@ -179,6 +179,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_output.set_defaults(func=_run_validate_output)
 
+    backend_check = subparsers.add_parser(
+        "backend-check",
+        help="Run full backend generation, validation, export, and report checks",
+    )
+    backend_check.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="YAML/JSON/TOML config path",
+    )
+    backend_check.set_defaults(func=_run_backend_check)
+
     cylinder = subparsers.add_parser("cylinder", help="Generate a cylinder helical winding path")
     cylinder.add_argument("--length", type=float, required=True, help="Mandrel length in mm")
     cylinder.add_argument("--radius", type=float, required=True, help="Mandrel radius in mm")
@@ -996,19 +1008,117 @@ def _run_validate_output(args: argparse.Namespace) -> int:
     return 0 if validation.ok else 1
 
 
+def _run_backend_check(args: argparse.Namespace) -> int:
+    config_ok = False
+    path_ok = False
+    exports_ok = False
+    try:
+        config = load_winding_config(args.config)
+        validate_winding_job_config(config)
+        config_ok = True
+        result = generate_winding_job(
+            config,
+            export_csv=True,
+            export_summary=True,
+            make_plots=True,
+        )
+        if result.csv_path is None:
+            raise ValueError("CSV output is disabled")
+        validation = validate_path_csv(result.csv_path, summary_path=result.summary_path)
+        path_ok = validation.ok
+        exports_ok = _backend_required_exports_exist(result)
+    except (OSError, ValueError) as exc:
+        print(f"Backend check failed: {exc}", file=sys.stderr)
+        result = None
+    summary = {} if result is None else result.summary
+    layer_status = summary.get("layer_completion_status", {})
+    stack_status = summary.get("stack_uniformity_status", {})
+    region_status = summary.get("region_quality_status", {})
+    machine_status = summary.get("machine_smoothing_status", {})
+    optimisation_status = summary.get("pattern_optimisation_status", {})
+    checks = {
+        "Config": config_ok,
+        "Pattern optimisation": bool(
+            isinstance(optimisation_status, dict)
+            and optimisation_status.get("pattern_optimisation_passed")
+        ),
+        "Path generation": path_ok,
+        "Hoop continuity": bool(
+            isinstance(layer_status, dict)
+            and layer_status.get("continuous_traverse_passed", True)
+        ),
+        "Layer quality": bool(
+            isinstance(layer_status, dict)
+            and layer_status.get("strict_completion_passed")
+        ),
+        "Stack uniformity": bool(
+            isinstance(stack_status, dict)
+            and stack_status.get("strict_stack_passed")
+        ),
+        "Region quality": bool(
+            isinstance(region_status, dict)
+            and region_status.get("region_quality_passed")
+        ),
+        "Machine kinematics": bool(
+            isinstance(machine_status, dict)
+            and machine_status.get("machine_kinematics_passed")
+        ),
+        "Exports": exports_ok,
+    }
+    overall = bool(summary.get("machine_ready")) and all(checks.values())
+    print("Backend Check")
+    print("-------------")
+    for label, passed in checks.items():
+        print(f"{label}: {'PASS' if passed else 'FAIL'}")
+    print(f"Overall backend-ready: {str(overall).lower()}")
+    return 0 if overall else 1
+
+
+def _backend_required_exports_exist(result: object) -> bool:
+    paths = [
+        getattr(result, "summary_path", None),
+        getattr(result, "validation_report_path", None),
+        getattr(result, "layer_completion_report_path", None),
+        getattr(result, "stack_coverage_report_path", None),
+        getattr(result, "region_quality_report_path", None),
+        getattr(result, "machine_smoothing_report_path", None),
+        getattr(result, "pattern_optimisation_report_path", None),
+        getattr(result, "candidate_pair_report_path", None),
+        getattr(result, "actual_thickness_report_path", None),
+        getattr(result, "optimisation_repair_suggestions_path", None),
+        getattr(result, "selected_pattern_path", None),
+        getattr(result, "pattern_candidates_path", None),
+        getattr(result, "pattern_rejection_report_path", None),
+        getattr(result, "plot_manifest_path", None),
+        getattr(result, "csv_path", None),
+        getattr(result, "gcode_path", None),
+        getattr(result, "segments_path", None),
+        getattr(result, "coverage_grid_path", None),
+    ]
+    return all(path is not None and Path(path).exists() for path in paths)
+
+
 def _format_manufacturing_status(summary: dict[str, object]) -> str:
     manufacturing = summary.get("manufacturing_report")
     if not isinstance(manufacturing, dict):
         return ""
     layer_status = summary.get("layer_completion_status")
     stack_status = summary.get("stack_uniformity_status")
+    region_status = summary.get("region_quality_status")
     smoothing_status = summary.get("machine_smoothing_status")
+    optimisation_status = summary.get("pattern_optimisation_status")
     layer_pass = isinstance(layer_status, dict) and bool(layer_status.get("completion_passed"))
     stack_pass = isinstance(stack_status, dict) and bool(
         stack_status.get("stack_uniformity_passed")
     )
     machine_pass = isinstance(smoothing_status, dict) and bool(
         smoothing_status.get("machine_kinematics_passed")
+    )
+    optimisation_pass = isinstance(optimisation_status, dict) and bool(
+        optimisation_status.get("pattern_optimisation_passed")
+    )
+    region_pass = isinstance(region_status, dict) and bool(
+        region_status.get("region_quality_passed")
     )
     hoop_pass = isinstance(layer_status, dict) and bool(
         layer_status.get("continuous_traverse_passed", True)
@@ -1019,7 +1129,10 @@ def _format_manufacturing_status(summary: dict[str, object]) -> str:
         "-----------------------\n"
         f"Layer completion: {'PASS' if layer_pass else 'FAIL'}\n"
         f"Hoop continuity: {'PASS' if hoop_pass else 'FAIL'}\n"
+        f"Layer quality: {'PASS' if layer_pass else 'FAIL'}\n"
         f"Stack uniformity: {'PASS' if stack_pass else 'FAIL'}\n"
+        f"Region quality: {'PASS' if region_pass else 'FAIL'}\n"
+        f"Pattern optimisation: {'PASS' if optimisation_pass else 'FAIL'}\n"
         f"Machine kinematics: {'PASS' if machine_pass else 'FAIL'}\n"
         f"Overall machine-ready: {str(machine_ready).lower()}"
     )
