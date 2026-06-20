@@ -1,0 +1,132 @@
+2026-06-20 21:13:35,074 INFO filament_winder.gui: Application startup
+2026-06-20 21:13:35,500 INFO filament_winder.gui: Workflow tab opened
+2026-06-20 21:13:40,659 INFO filament_winder.gui: Button clicked: Fit Node Graph
+2026-06-20 21:13:40,659 INFO filament_winder.gui: Action started: Fit Node Graph
+2026-06-20 21:13:40,660 INFO filament_winder.gui: Action completed: Fit Node Graph
+2026-06-20 21:15:08,706 INFO filament_winder.gui: Link creation started: material_tow_2813691fb1.tow
+2026-06-20 21:15:09,219 ERROR filament_winder.gui: Link creation failed: drop link on a compatible input socket
+Traceback (most recent call last):
+  File "C:\Users\User\Documents\filament Winder\src\filament_winder\app\gui.py", line 1139, in _finish_socket_drag
+    raise ValueError("drop link on a compatible input socket")
+ValueError: drop link on a compatible input socket
+
+2026-06-20 21:15:10,113 INFO filament_winder.gui: Link creation started: material_tow_2813691fb1.tow
+2026-06-20 21:15:11,031 ERROR filament_winder.gui: Link creation failed: drop link on a compatible input socket
+Traceback (most recent call last):
+  File "C:\Users\User\Documents\filament Winder\src\filament_winder\app\gui.py", line 1139, in _finish_socket_drag
+    raise ValueError("drop link on a compatible input socket")
+ValueError: drop link on a compatible input socket
+
+2026-06-20 21:15:12,007 INFO filament_winder.gui: Link creation started: material_tow_2813691fb1.tow
+2026-06-20 21:15:12,107 ERROR filament_winder.gui: Link creation failed: drop link on a compatible input socket
+Traceback (most recent call last):
+  File "C:\Users\User\Documents\filament Winder\src\filament_winder\app\gui.py", line 1139, in _finish_socket_drag
+    raise ValueError("drop link on a compatible input socket")
+ValueError: drop link on a compatible input socket
+
+2026-06-20 21:15:13,146 INFO filament_winder.gui: Link creation started: material_tow_2813691fb1.tow
+2026-06-20 21:15:13,598 ERROR filament_winder.gui: Link creation failed: drop link on a compatible input socket
+Traceback (most recent call last):
+  File "C:\Users\User\Documents\filament Winder\src\filament_winder\app\gui.py", line 1139, in _finish_socket_drag
+    raise ValueError("drop link on a compatible input socket")
+ValueError: drop link on a compatible input socket
+
+2026-06-20 21:15:14,173 INFO filament_winder.gui: Link creation started: material_tow_2813691fb1.tow
+2026-06-20 21:15:15,653 ERROR filament_winder.gui: Link creation failed: drop link on a compatible input socket
+Traceback (most recent call last):
+  File "C:\Users\User\Documents\filament Winder\src\filament_winder\app\gui.py", line 1139, in _finish_socket_drag
+    raise ValueError("drop link on a compatible input socket")
+ValueError: drop link on a compatible input socket
+
+2026-06-20 21:15:16,438 INFO filament_winder.gui: Link creation started: material_tow_2813691fb1.tow
+2026-06-20 21:15:16,644 ERROR filament_winder.gui: Link creation failed: drop link on a compatible input socket
+Traceback (most recent call last):
+  File "C:\Users\User\Documents\filament Winder\src\filament_winder\app\gui.py", line 1139, in _finish_socket_drag
+    raise ValueError("drop link on a compatible input socket")
+ValueError: drop link on a compatible input socket
+
+2026-06-20 21:15:20,269 INFO filament_winder.gui: Button clicked: Link
+2026-06-20 21:15:20,269 INFO filament_winder.gui: Action started: Link
+2026-06-20 21:15:20,269 INFO filament_winder.gui: Link creation started: material_tow_2813691fb1 -> layer_stack_3616a3d2b2
+2026-06-20 21:15:20,269 INFO filament_winder.gui: Link creation succeeded
+2026-06-20 21:15:20,269 INFO filament_winder.gui: Action completed: Link
+2026-06-20 21:15:42,417 INFO filament_winder.gui: Button clicked: Add Hoop Layer
+2026-06-20 21:15:42,417 INFO filament_winder.gui: Action started: Add Hoop Layer
+2026-06-20 21:15:42,641 INFO filament_winder.gui: Action completed: Add Hoop Layer
+2026-06-20 21:16:24,391 INFO filament_winder.gui: Button clicked: Open Project
+2026-06-20 21:16:24,391 INFO filament_winder.gui: Action started: Open Project
+2026-06-20 21:16:30,188 INFO filament_winder.gui: Action completed: Open Project
+2026-06-20 21:17:00,888 INFO filament_winder.gui: Button clicked: Delete Layer
+2026-06-20 21:17:00,888 INFO filament_winder.gui: Action started: Delete Layer
+2026-06-20 21:17:00,994 INFO filament_winder.gui: Action completed: Delete Layer
+2026-06-20 21:17:01,029 INFO filament_winder.gui: Button clicked: Delete Layer
+2026-06-20 21:17:01,029 INFO filament_winder.gui: Action started: Delete Layer
+2026-06-20 21:17:01,130 INFO filament_winder.gui: Action completed: Delete Layer
+2026-06-20 21:17:01,175 INFO filament_winder.gui: Button clicked: Delete Layer
+2026-06-20 21:17:01,176 INFO filament_winder.gui: Action started: Delete Layer
+2026-06-20 21:17:01,264 INFO filament_winder.gui: Action completed: Delete Layer
+2026-06-20 21:17:01,321 INFO filament_winder.gui: Button clicked: Delete Layer
+2026-06-20 21:17:01,321 INFO filament_winder.gui: Action started: Delete Layer
+2026-06-20 21:17:01,410 INFO filament_winder.gui: Action completed: Delete Layer
+2026-06-20 21:17:01,480 INFO filament_winder.gui: Button clicked: Delete Layer
+2026-06-20 21:17:01,480 INFO filament_winder.gui: Action started: Delete Layer
+2026-06-20 21:17:01,570 INFO filament_winder.gui: Action completed: Delete Layer
+2026-06-20 21:17:01,652 INFO filament_winder.gui: Button clicked: Delete Layer
+2026-06-20 21:17:01,652 INFO filament_winder.gui: Action started: Delete Layer
+2026-06-20 21:17:01,743 INFO filament_winder.gui: Action completed: Delete Layer
+2026-06-20 21:17:02,827 INFO filament_winder.gui: Button clicked: Delete Layer
+2026-06-20 21:17:02,827 INFO filament_winder.gui: Action started: Delete Layer
+2026-06-20 21:17:02,917 INFO filament_winder.gui: Action completed: Delete Layer
+2026-06-20 21:17:03,576 INFO filament_winder.gui: Button clicked: Delete Layer
+2026-06-20 21:17:03,576 INFO filament_winder.gui: Action started: Delete Layer
+2026-06-20 21:17:03,689 INFO filament_winder.gui: Action completed: Delete Layer
+2026-06-20 21:17:04,213 INFO filament_winder.gui: Button clicked: Delete Layer
+2026-06-20 21:17:04,213 INFO filament_winder.gui: Action started: Delete Layer
+2026-06-20 21:17:04,305 INFO filament_winder.gui: Action completed: Delete Layer
+2026-06-20 21:17:05,050 INFO filament_winder.gui: Button clicked: Delete Layer
+2026-06-20 21:17:05,050 INFO filament_winder.gui: Action started: Delete Layer
+2026-06-20 21:17:05,145 INFO filament_winder.gui: Action completed: Delete Layer
+2026-06-20 21:17:09,145 INFO filament_winder.gui: Button clicked: Update Preview
+2026-06-20 21:17:09,145 INFO filament_winder.gui: Action started: Update Preview
+2026-06-20 21:17:09,236 INFO filament_winder.gui: Action completed: Update Preview
+2026-06-20 21:17:13,006 INFO filament_winder.gui: Button clicked: Fit Mandrel
+2026-06-20 21:17:13,006 INFO filament_winder.gui: Action started: Fit Mandrel
+2026-06-20 21:17:13,092 INFO filament_winder.gui: Action completed: Fit Mandrel
+2026-06-20 21:17:14,809 INFO filament_winder.gui: Button clicked: Toggle Tow Band
+2026-06-20 21:17:14,809 INFO filament_winder.gui: Action started: Toggle Tow Band
+2026-06-20 21:17:14,900 INFO filament_winder.gui: Action completed: Toggle Tow Band
+2026-06-20 21:17:15,580 INFO filament_winder.gui: Button clicked: Toggle Tow Path
+2026-06-20 21:17:15,580 INFO filament_winder.gui: Action started: Toggle Tow Path
+2026-06-20 21:17:15,669 INFO filament_winder.gui: Action completed: Toggle Tow Path
+2026-06-20 21:17:17,321 INFO filament_winder.gui: Button clicked: Toggle Tow Band
+2026-06-20 21:17:17,321 INFO filament_winder.gui: Action started: Toggle Tow Band
+2026-06-20 21:17:17,412 INFO filament_winder.gui: Action completed: Toggle Tow Band
+2026-06-20 21:17:18,378 INFO filament_winder.gui: Button clicked: Toggle Tow Band
+2026-06-20 21:17:18,379 INFO filament_winder.gui: Action started: Toggle Tow Band
+2026-06-20 21:17:18,467 INFO filament_winder.gui: Action completed: Toggle Tow Band
+2026-06-20 21:17:18,757 INFO filament_winder.gui: Button clicked: Toggle Tow Path
+2026-06-20 21:17:18,757 INFO filament_winder.gui: Action started: Toggle Tow Path
+2026-06-20 21:17:18,847 INFO filament_winder.gui: Action completed: Toggle Tow Path
+2026-06-20 21:17:21,950 INFO filament_winder.gui: Button clicked: Add Helical Layer
+2026-06-20 21:17:21,950 INFO filament_winder.gui: Action started: Add Helical Layer
+2026-06-20 21:17:22,045 INFO filament_winder.gui: Action completed: Add Helical Layer
+2026-06-20 21:17:24,547 INFO filament_winder.gui: Button clicked: Update Preview
+2026-06-20 21:17:24,547 INFO filament_winder.gui: Action started: Update Preview
+2026-06-20 21:17:24,637 INFO filament_winder.gui: Action completed: Update Preview
+2026-06-20 21:17:28,727 INFO filament_winder.gui: Button clicked: Update Preview
+2026-06-20 21:17:28,727 INFO filament_winder.gui: Action started: Update Preview
+2026-06-20 21:17:28,815 INFO filament_winder.gui: Action completed: Update Preview
+2026-06-20 21:17:29,637 INFO filament_winder.gui: Button clicked: Update Preview
+2026-06-20 21:17:29,637 INFO filament_winder.gui: Action started: Update Preview
+2026-06-20 21:17:29,759 INFO filament_winder.gui: Action completed: Update Preview
+2026-06-20 21:17:37,381 INFO filament_winder.gui: Button clicked: Update Preview
+2026-06-20 21:17:37,381 INFO filament_winder.gui: Action started: Update Preview
+2026-06-20 21:17:37,471 INFO filament_winder.gui: Action completed: Update Preview
+2026-06-20 21:17:52,529 INFO filament_winder.gui: Button clicked: Update Preview
+2026-06-20 21:17:52,529 INFO filament_winder.gui: Action started: Update Preview
+2026-06-20 21:17:52,619 INFO filament_winder.gui: Action completed: Update Preview
+2026-06-20 21:18:24,519 INFO filament_winder.gui: Button clicked: Update Preview
+2026-06-20 21:18:24,519 INFO filament_winder.gui: Action started: Update Preview
+2026-06-20 21:18:24,616 INFO filament_winder.gui: Action completed: Update Preview
+2026-06-20 21:19:19,070 INFO filament_winder.gui: Button clicked: Apply Node Settings
+2026-06-20 21:19:19,070 INFO filament_winder.gui: Action started: Apply Node Settings

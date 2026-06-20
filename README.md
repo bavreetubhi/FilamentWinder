@@ -1,11 +1,13 @@
 # FilamentWinder
 
-Python-based 4-axis filament winding software for wet winding carbon fibre over axisymmetric mandrels.
+Python-based 4-axis filament winding software for wet winding carbon fibre over
+axisymmetric mandrels.
 
-The first implementation is built around a clean engineering pipeline:
+The first implementation is intentionally small and follows this engineering
+pipeline:
 
 ```text
-Mandrel geometry -> surface tow path -> tow band / coverage -> A/X/Z/B machine path -> CSV / G-code
+Mandrel/profile -> surface path or layer schedule -> coverage/validation -> A/X/Z/B machine path -> CSV / G-code
 ```
 
 ## Axis convention
@@ -19,38 +21,55 @@ Mandrel geometry -> surface tow path -> tow band / coverage -> A/X/Z/B machine p
 
 ## Current status
 
-This repo contains a working Version 0.1 foundation:
+This repo contains the Version 0.1 foundation from the project plan:
 
-- Axisymmetric mandrel model based on `r = r(z)`.
-- Procedural cylinder mandrel generation.
-- Vectorised helical cylinder winding path generation.
-- Multi-pass alternating winding support.
-- Full-width tow band mesh generation.
-- Approximate z-theta coverage map.
-- A/X/Z/B kinematic conversion.
-- Machine limit validation.
-- CSV export.
-- GRBL-style / FluidNC-style G-code export.
-- Versioned JSON project model.
-- Optional DXF Z-R profile importer.
-- CLI for generating a basic cylinder winding program.
-- Tests covering geometry, path generation, export, project files, and coverage.
+- Python package structure under `src/filament_winder`.
+- `CylinderMandrel` for constant-radius mandrels.
+- `HelicalPathGenerator` for single-pass and multi-pass cylinder helical paths.
+- Surface path output as `z`, `theta`, `x`, and `y`.
+- Full-width tow band strip generation for cylinder paths.
+- Pattern closure estimates and pass-to-pass phase offsets.
+- Closed cylinder pattern optimization for target coverage.
+- Approximate Z-theta cylinder coverage maps with gap/overlap summaries.
+- First-order A/X/Z/B machine mapping.
+- Machine limit validation and rectangular X-Z no-go-zone checks.
+- Optional live PySide6/VisPy preview with a tabbed setup workflow for cylinder
+  winding, DXF profile winding, pattern planning, project load/save, and export
+  controls.
+- CSV export for surface points and machine positions.
+- GRBL-style G-code export through a modular post-processor.
+- Wavefront OBJ preview export for the cylinder, helix, and tow band.
+- Versioned JSON project files.
+- ASCII DXF Z-R profile import for common `LINE`, `LWPOLYLINE`, and `POLYLINE`
+  vertex data.
+- First-order profile-aware helical paths over imported Z-R profiles, with
+  singular-radius guardrails.
+- Profile turnaround paths that avoid pole/opening radii below a configured
+  minimum.
+- Dome-aware profile winding paths that use a geodesic turnaround radius and
+  transition into the requested helix angle on the max-radius section.
+- Nosecone and general axisymmetric profile modes with minimum-radius safe
+  turnarounds for tapered or complex Z-R profiles.
+- Variable tow-eye angle output for dome paths.
+- Layer-level winding schedules with pattern reports, transition moves,
+  per-point layer/circuit metadata, feed targets, and winding-program CSV export.
+- Axisymmetric surface coverage checks for changing-radius profile paths.
+- Unit tests for the math core, exports, project files, DXF import, validation,
+  and CLI outputs.
+
+Direct controller communication, production collision simulation,
+acceleration-limited motion, and calibrated non-geodesic slip modelling are not
+included yet. Those belong to later milestones.
 
 ## Install
 
 ```bash
 python -m venv .venv
-. .venv/Scripts/activate  # Windows PowerShell: .venv\Scripts\Activate.ps1
+.venv\Scripts\Activate.ps1
 pip install -e .[dev]
 ```
 
-Optional DXF support:
-
-```bash
-pip install -e .[dxf]
-```
-
-Optional GUI dependencies:
+Optional live preview dependencies:
 
 ```bash
 pip install -e .[gui]
@@ -59,51 +78,196 @@ pip install -e .[gui]
 ## Generate a cylinder winding path
 
 ```bash
-filament-winder cylinder \
-  --length 1000 \
-  --radius 101.6 \
-  --tow-width 6 \
-  --angle 45 \
-  --passes 2 \
-  --points 1200 \
-  --feed 500 \
-  --csv exports/cylinder_path.csv \
-  --gcode exports/cylinder_path.gcode
+filament-winder cylinder ^
+  --length 1000 ^
+  --radius 100 ^
+  --tow-width 6 ^
+  --angle 45 ^
+  --points 500 ^
+  --passes 4 ^
+  --clearance 25 ^
+  --csv exports/cylinder_path.csv ^
+  --gcode exports/cylinder_path.gcode ^
+  --coverage-csv exports/cylinder_coverage.csv ^
+  --coverage-summary-csv exports/cylinder_coverage_summary.csv ^
+  --preview-obj exports/cylinder_preview.obj ^
+  --project exports/cylinder_project.fwp.json ^
+  --validate ^
+  --x-min 0 ^
+  --x-max 150 ^
+  --z-min 0 ^
+  --z-max 1000
 ```
 
-Outputs:
+The CSV contains:
 
 ```text
-exports/cylinder_path.csv
-exports/cylinder_path.gcode
+index,pass_index,z_mm,theta_rad,surface_x_mm,surface_y_mm,surface_z_mm,A_deg,X_mm,Z_mm,B_deg
+```
+
+Inspect an imported DXF Z-R profile:
+
+```bash
+filament-winder dxf-info mandrels/profile.dxf --samples 200
+```
+
+Generate a profile turnaround path that avoids winding into pole/opening
+singularities:
+
+```bash
+filament-winder profile-turnaround mandrels/profile.dxf ^
+  --angle 35 ^
+  --tow-width 3 ^
+  --min-radius 5 ^
+  --csv exports/profile_turnaround_path.csv ^
+  --gcode exports/profile_turnaround_path.gcode
+```
+
+The repo includes `mandrels/profile.dxf` as a small test profile and
+`mandrels/2000mm_8in_od_elliptical_dome_profile.dxf` as a smoother 2000 mm by
+8 inch OD elliptical-dome sample. Replace either with your own ASCII DXF Z-R
+profile when you are ready to wind a real mandrel.
+
+Generate a dome-aware path that winds the domes and the cylinder helix as one
+continuous path:
+
+```bash
+filament-winder profile-dome mandrels/2000mm_8in_od_elliptical_dome_profile.dxf ^
+  --angle 35 ^
+  --tow-width 3 ^
+  --csv exports/profile_dome_path.csv ^
+  --gcode exports/profile_dome_path.gcode
+```
+
+`profile-dome` uses the max profile radius as the cylinder radius. It computes
+the geodesic turnaround radius as `max_radius * sin(angle)`, follows the
+Clairaut angle change over the domes, and outputs variable `B_deg` tow-eye
+angles in the CSV/G-code.
+
+Launch the live cylinder preview:
+
+```bash
+filament-winder preview --length 1000 --radius 100 --tow-width 6 --angle 45 --passes 4
+```
+
+Launch the GUI directly in DXF profile mode with the smoother 2000 mm by
+8 inch OD sample profile:
+
+```bash
+filament-winder preview --profile-dome --profile mandrels/2000mm_8in_od_elliptical_dome_profile.dxf --tow-width 3 --angle 35 --points 500
+```
+
+For nosecone-style or general axisymmetric profiles, start with:
+
+```bash
+filament-winder preview --profile-dome --profile mandrels/2000mm_8in_od_elliptical_dome_profile.dxf --profile-path-mode nosecone --min-radius 5 --tow-width 3 --angle 35
+```
+
+The preview draws the mandrel horizontally. Camera controls:
+
+- Left-drag: full orbit around the part
+- Shift + left-drag or middle-drag: pan
+- Mouse wheel or right-drag: zoom
+- Reset View: return to the centered horizontal view
+
+The left setup panel is split into tabs:
+
+- Setup: preview mode and project load/save.
+- Path: cylinder dimensions and DXF profile path settings.
+- Pattern: full-layer planning settings.
+- Export: CSV, G-code, coverage, summary, and OBJ paths.
+
+The settings side of the window is vertically scrollable, and the divider
+between settings and the 3D viewport can be dragged to resize the workspace.
+
+The Preview Mode selector switches between the cylinder view and a DXF-backed
+Profile Dome view. In Profile Dome mode, choose an ASCII DXF Z-R profile and
+select the profile path type:
+
+- `Dome (geodesic)`: Clairaut/geodesic dome winding with variable `B`.
+- `Nosecone`: fixed-angle profile turnaround to a configured minimum radius.
+- `Axisymmetric`: profile helix when possible, with safe turnaround fallback
+  for profiles that include poles or small-radius ends.
+
+Set the tow width, winding angle, points/span, min/turn radius, turnaround
+settings, and circuits, then click Inspect DXF Import to verify the profile or
+Update Preview to render the path. Profile exports write CSV and G-code;
+coverage and OBJ exports remain cylinder-only unless cylinder pattern coverage
+is selected.
+
+The Pattern Planner panel turns the preview from a single path into a full layer
+program. Enable **Use full pattern** to generate:
+
+- cylinder hoop, `+helical`, and `-helical` schedules with closure reports
+- DXF profile schedules for geodesic dome, nosecone, or general axisymmetric
+  path modes
+- per-layer colored preview paths and visible transition moves
+- winding-program CSV with layer/circuit metadata, local radius, local angle,
+  A/X/Z/B, feedrate, curvature, and slip-risk columns
+- G-code using the adaptive per-point feed schedule
+
+For profile modes, the hoop checkbox is ignored because hoop planning is
+currently cylinder-only.
+
+The preview Project panel can import and export `.fwp.json` files. Saved GUI
+projects preserve cylinder dimensions, profile path and mode, pattern planner
+settings, tow width, winding angle, points per pass/span, pass count, phase
+mode, alternating direction, radial clearance, feedrate, and export paths.
+
+The Export panel can write the current preview to CSV, GRBL-style G-code,
+coverage CSV, coverage summary CSV, and OBJ preview files. Pattern mode writes
+program CSV/G-code; cylinder pattern mode can also export coverage CSVs. OBJ
+export remains for the single-path cylinder preview. Use Set Export Folder to
+assign all export paths at once from the current project name.
+
+The Optimize Pattern button searches integer-turn closed cylinder patterns and
+updates the GUI angle/pass count to the best candidate for the target coverage.
+
+Find optimized cylinder candidates from the CLI:
+
+```bash
+filament-winder optimize-cylinder ^
+  --length 1000 ^
+  --radius 100 ^
+  --tow-width 6 ^
+  --target-coverage 100 ^
+  --max-passes 120
 ```
 
 ## Python API example
 
 ```python
-from filament_winder.geometry import AxisymmetricMandrel
-from filament_winder.path import HelicalLayerSpec, generate_cylinder_helix
-from filament_winder.kinematics import machine_path_from_surface_path
-from filament_winder.export import export_csv, export_gcode
+from filament_winder.core.geometry import CylinderMandrel
+from filament_winder.core.kinematics import machine_path_from_surface_path
+from filament_winder.core.path_planning import (
+    HelicalPathConfig,
+    HelicalPathGenerator,
+    estimate_cylinder_pattern_closure,
+)
+from filament_winder.core.tow import generate_cylinder_tow_band
+from filament_winder.io import export_cylinder_preview_obj, export_gcode, export_winding_csv
 
-mandrel = AxisymmetricMandrel.cylinder(length_mm=1000.0, radius_mm=101.6)
-spec = HelicalLayerSpec(
+mandrel = CylinderMandrel(length_mm=1000.0, radius_mm=100.0)
+config = HelicalPathConfig(
     winding_angle_deg=45.0,
     tow_width_mm=6.0,
-    passes=2,
-    points_per_pass=1200,
+    point_count=500,
+    passes=4,
 )
+surface_path = HelicalPathGenerator(mandrel, config).generate()
+motion_table = machine_path_from_surface_path(surface_path, radial_clearance_mm=25.0)
+tow_band = generate_cylinder_tow_band(mandrel, surface_path)
+closure = estimate_cylinder_pattern_closure(mandrel, config)
 
-surface_path = generate_cylinder_helix(mandrel, spec)
-machine_path = machine_path_from_surface_path(mandrel, surface_path)
-
-export_csv(machine_path, "exports/path.csv")
-export_gcode(machine_path, "exports/path.gcode")
+export_winding_csv(surface_path, motion_table, "exports/path.csv")
+export_gcode(motion_table, "exports/path.gcode")
+export_cylinder_preview_obj(mandrel, surface_path, "exports/path.obj", tow_band=tow_band)
+print(closure)
 ```
 
 ## Coordinate foundation
 
-All geometry is represented as an axisymmetric radius function:
+All future geometry should be represented as an axisymmetric radius function:
 
 ```text
 r = r(z)
@@ -122,46 +286,35 @@ tan(alpha) = r dtheta / dz
 dtheta = tan(alpha) / r dz
 ```
 
-Machine mapping, first-order implementation:
+Version 0.1 machine mapping:
 
 ```text
 A = theta in degrees
 Z = mandrel z coordinate
 X = local radius + clearance
-B = local tow tangent angle
+B = requested winding angle
 ```
 
 ## Project structure
 
 ```text
+app/main.py
+docs/version_0_1.md
+examples/cylinder_v0_1.py
 src/filament_winder/
-  config.py       Machine, axis, and tow configuration
-  geometry.py     Axisymmetric mandrel and mesh generation
-  path.py         Helical path generation and pattern estimates
-  tow.py          Full-width tow band mesh generation
-  kinematics.py   A/X/Z/B machine path conversion
-  validation.py   Mandrel and machine-path validation
-  coverage.py     Approximate surface coverage maps
-  export.py       CSV and GRBL-style G-code export
-  project.py      Versioned project file models
-  dxf.py          Optional DXF Z-R profile import
-  cli.py          Command-line interface
-
-app/main.py       Optional GUI entry point placeholder
-tests/            Unit tests
-examples/         Usage examples
-docs/             Architecture and milestone notes
+  app/
+  cli.py
+  project.py
+  core/
+    geometry/
+    path_planning/
+    kinematics/
+    coverage.py
+    tow.py
+    validation.py
+  io/
+tests/
 ```
-
-## Controller target
-
-The exporter produces GRBL-style G-code with four coordinated axes:
-
-```gcode
-G1 Z0.0000 A0.0000 X126.6000 B45.0000 F500.000
-```
-
-Use this with a controller/firmware stack that supports configured multi-axis motion, such as FluidNC or grblHAL. Vanilla GRBL is useful as a protocol reference, but should not be treated as the final 4-axis machine platform.
 
 ## Test
 
@@ -169,11 +322,16 @@ Use this with a controller/firmware stack that supports configured multi-axis mo
 pytest
 ```
 
+## Filament winding path guide
+
+See `docs/FILAMENT_WINDING_PATHS_AND_PATTERNS.md` for a beginner-oriented
+explanation of winding angles, closure, circuits, starts, coverage, dome
+turnarounds, layer schedules, transitions, machine output, and validation.
+
 ## Next development targets
 
-1. Real VisPy viewport for mandrel, path, tow band, axis triad, and machine preview.
-2. DXF profile preview and cleaning UI.
-3. Dome-aware geodesic and non-geodesic path generation.
-4. Slip-risk and no-go-zone validation.
-5. Direct serial sender with jog, home, unlock, dry-run, pause, resume, and stop.
-6. Layer stack editor with gap/overlap maps and layer buildup.
+1. Add a CLI command for saved multi-layer schedules.
+2. Add editable arbitrary layer stacks and layer buildup thickness in the GUI.
+3. Add DXF profile preview and cleaning controls.
+4. Add controller communication with dry-run, pause/resume, and stop.
+5. Add non-geodesic dome path tuning modes with calibrated slip limits.

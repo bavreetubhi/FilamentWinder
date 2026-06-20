@@ -1,0 +1,77 @@
+project:
+  name: demo_cylinder_stack
+  units: mm
+
+machine:
+  axis_order: [A, X, Z, B]
+  mandrel_orientation: horizontal
+  controller: grbl_compatible
+  clearance_mm: 20
+
+mandrel:
+  type: cylinder
+  length_mm: 1000
+  radius_mm: 101.6
+  mesh_points_z: 400
+  mesh_points_theta: 360
+
+tow:
+  tow_id: carbon_tow
+  name: carbon_tow
+  width_mm: 6.0
+  thickness_mm: 0.25
+
+layers:
+  - name: hoop_1
+    enabled: true
+    type: hoop
+    winding_angle_deg: 90
+    direction: forward
+    passes: 1
+    coverage_target: 1.0
+    feedrate_mm_min: 500
+    start_z_mm: 0
+    end_z_mm: 1000
+    colour: "#999999"
+    points: 120
+
+  - name: helical_plus_45
+    enabled: true
+    type: helical
+    winding_angle_deg: 45
+    direction: forward
+    passes: auto
+    coverage_target: 1.0
+    feedrate_mm_min: 500
+    start_z_mm: 0
+    end_z_mm: 1000
+    colour: "#cc4444"
+    points: 240
+
+  - name: helical_minus_45
+    enabled: true
+    type: helical
+    winding_angle_deg: -45
+    direction: reverse
+    passes: auto
+    coverage_target: 1.0
+    feedrate_mm_min: 500
+    start_z_mm: 0
+    end_z_mm: 1000
+    colour: "#4466cc"
+    points: 240
+
+output:
+  directory: exports/demo_cylinder_stack
+  csv: true
+  summary_json: true
+  gcode: false
+
+plot:
+  enabled: true
+  show: false
+  save: true
+  formats: [png]
+  modes: [unwrapped, three_d, debug_passes, debug_transitions]
+  include_2d_unwrapped: true
+  include_3d_path: true

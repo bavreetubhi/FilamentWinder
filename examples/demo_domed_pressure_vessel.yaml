@@ -1,0 +1,144 @@
+project:
+  name: demo_domed_pressure_vessel
+  units: mm
+
+machine:
+  axis_order: [A, X, Z, B]
+  controller: grbl_compatible
+  clearance_mm: 20
+  max_a_rpm: 120
+  max_x_mm: 300
+  max_z_mm: 1500
+  max_b_deg: 7200
+  max_b_velocity_deg_s: 240
+  max_segment_length_mm: 20
+  max_a_accel_deg_s2: 2500
+  max_x_accel_mm_s2: 2500
+  max_z_accel_mm_s2: 1000
+  max_b_accel_deg_s2: 10000
+
+mandrel:
+  type: cylinder_with_elliptical_domes
+  cylinder_length_mm: 1000
+  cylinder_radius_mm: 101.6
+  left_dome_length_mm: 120
+  right_dome_length_mm: 120
+  polar_opening_radius_mm: 25
+  mesh_points_z: 360
+  mesh_points_theta: 360
+
+tow:
+  name: carbon_tow
+  width_mm: 6.0
+  thickness_mm: 0.25
+
+roving:
+  width_mm: 6.0
+  thickness_mm: 0.25
+  fiber_volume_fraction: 0.5
+  resin_factor: auto
+
+laminate_targets:
+  mode: simplified
+  target_layer_thickness_mm: 0.25
+  target_total_thickness_mm: null
+  required_thickness_profile: null
+
+pattern_selection:
+  method: textbook_integer_closure
+  max_p: 500
+  max_k: 500
+  max_d: 20
+  angle_tolerance_deg: 0.5
+  require_gcd_clean_pattern: true
+  candidate_count: 10
+
+pattern_objectives:
+  minimise_winding_time: true
+  minimise_overlap: true
+  minimise_polar_buildup: true
+  require_closed_pattern: true
+
+hoop_winding:
+  mode: continuous_traverse
+  nominal_angle_deg: 89.0
+  min_angle_offset_from_pure_hoop_deg: 0.25
+  axial_pitch_mode: tow_width
+  allow_exact_pure_hoop: false
+  tow_state_during_traverse: on
+
+quality_limits:
+  max_layer_overlap_percent: 35
+  max_stack_overlap_percent: 45
+  max_thickness_variation_percent: 75
+  max_polar_buildup_mm: 0.75
+  max_coverage_count: 20
+  allow_min_thickness_zero: false
+  max_estimated_winding_time_min: 600
+
+layers:
+  - name: hoop_cylinder_1
+    enabled: true
+    region: cylinder_only
+    winding_mode: hoop
+    winding_angle_deg: 90
+    passes: 1
+    coverage_target: 1.0
+    feedrate_mm_min: 500
+    transition_before: none
+    transition_after: angle_ramp_transition
+    points: 80
+
+  - name: geodesic_dome_to_dome_1
+    enabled: true
+    region: dome_to_dome
+    winding_mode: geodesic
+    initial_angle_deg: 45
+    winding_angle_deg: 45
+    direction: forward
+    passes: auto
+    turnaround_radius_mm: 28
+    polar_opening_radius_mm: 25
+    coverage_target: 1.0
+    feedrate_mm_min: 450
+    transition_before: angle_ramp_transition
+    transition_after: dome_turnaround
+    points: 140
+
+  - name: non_geodesic_controlled_1
+    enabled: true
+    region: dome_to_dome
+    winding_mode: non_geodesic
+    target_angle_deg: 35
+    winding_angle_deg: 35
+    allowed_angle_error_deg: 5
+    max_slip_risk_deg: 15
+    direction: reverse
+    passes: auto
+    turnaround_radius_mm: 28
+    polar_opening_radius_mm: 25
+    coverage_target: 1.0
+    feedrate_mm_min: 400
+    transition_before: smooth_surface_transition
+    transition_after: smooth_surface_transition
+    points: 140
+
+coverage:
+  z_cells: 160
+  theta_cells: 240
+  tow_band_model: rectangular_surface_band
+
+output:
+  directory: exports/demo_domed_pressure_vessel
+  csv: true
+  gcode: true
+  segments: true
+  validation_report: true
+  coverage_grid: true
+
+plot:
+  enabled: true
+  show: false
+  save: true
+  formats: [png]
+  modes: [unwrapped, three_d, debug_passes, debug_transitions]
