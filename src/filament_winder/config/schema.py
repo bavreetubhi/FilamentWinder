@@ -129,6 +129,36 @@ class CoverageModeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class PinLayoutConfig:
+    enabled: bool = False
+    layout_type: str = "shoulder_cross"
+    shoulders: str = "both"
+    count_per_shoulder: int = 4
+    angular_offset_deg: float = 0.0
+    left_shoulder_z_mm: float | None = None
+    right_shoulder_z_mm: float | None = None
+    shoulder_zone_width_mm: float = 60.0
+    pin_radius_mm: float = 4.0
+    pin_height_mm: float = 25.0
+    pin_standoff_mm: float = 2.0
+    pin_clearance_mm: float = 0.5
+    min_wrap_deg: float = 120.0
+    max_wrap_deg: float = 270.0
+    max_buildup_height_mm: float = 8.0
+    max_contact_balance_ratio: float = 1.25
+    friction_coefficient: float | None = None
+    min_bend_radius_mm: float | None = None
+    route_family: str = "shoulder_cross_reinforcement"
+    routing_mode: str = "deterministic"
+    candidate_count: int = 192
+    route_step_size: int = 0
+    wrap_direction: str = "both"
+    target_dome_angle_min_deg: float = 25.0
+    target_dome_angle_max_deg: float = 55.0
+    coverage_tolerance_mm: float = 6.0
+
+
+@dataclass(frozen=True, slots=True)
 class LayerConfig:
     name: str
     type: str
@@ -202,6 +232,7 @@ class WindingJobConfig:
     hoop_winding: HoopWindingConfig = field(default_factory=HoopWindingConfig)
     quality_limits: QualityLimitsConfig = field(default_factory=QualityLimitsConfig)
     coverage_mode: CoverageModeConfig = field(default_factory=CoverageModeConfig)
+    pin_layout: PinLayoutConfig = field(default_factory=PinLayoutConfig)
     coverage: CoverageConfig = field(default_factory=CoverageConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     plot: PlotConfig = field(default_factory=PlotConfig)
@@ -224,6 +255,7 @@ class WindingJobConfig:
             hoop_winding=_hoop_winding_config(data.get("hoop_winding", {})),
             quality_limits=_quality_limits_config(data.get("quality_limits", {})),
             coverage_mode=_coverage_mode_config(data.get("coverage_mode", {})),
+            pin_layout=_pin_layout_config(data.get("pin_layout", {})),
             coverage=_coverage_config(data.get("coverage", {})),
             output=_output_config(data.get("output", {})),
             plot=_plot_config(data.get("plot", {})),
@@ -397,6 +429,40 @@ def _coverage_mode_config(raw: object) -> CoverageModeConfig:
         ),
         stack_level_full_coverage=bool(data.get("stack_level_full_coverage", True)),
         paired_layer_coverage=bool(data.get("paired_layer_coverage", True)),
+    )
+
+
+def _pin_layout_config(raw: object) -> PinLayoutConfig:
+    data = _mapping(raw, "pin_layout")
+    return PinLayoutConfig(
+        enabled=bool(data.get("enabled", False)),
+        layout_type=str(data.get("layout_type", data.get("type", "shoulder_cross"))),
+        shoulders=str(data.get("shoulders", "both")),
+        count_per_shoulder=int(data.get("count_per_shoulder", data.get("pin_count", 4))),
+        angular_offset_deg=float(data.get("angular_offset_deg", 0.0)),
+        left_shoulder_z_mm=_optional_float(data.get("left_shoulder_z_mm")),
+        right_shoulder_z_mm=_optional_float(data.get("right_shoulder_z_mm")),
+        shoulder_zone_width_mm=float(data.get("shoulder_zone_width_mm", 60.0)),
+        pin_radius_mm=float(data.get("pin_radius_mm", data.get("radius_mm", 4.0))),
+        pin_height_mm=float(data.get("pin_height_mm", data.get("height_mm", 25.0))),
+        pin_standoff_mm=float(data.get("pin_standoff_mm", data.get("standoff_mm", 2.0))),
+        pin_clearance_mm=float(data.get("pin_clearance_mm", data.get("clearance_mm", 0.5))),
+        min_wrap_deg=float(data.get("min_wrap_deg", 120.0)),
+        max_wrap_deg=float(data.get("max_wrap_deg", 270.0)),
+        max_buildup_height_mm=float(data.get("max_buildup_height_mm", 8.0)),
+        max_contact_balance_ratio=float(data.get("max_contact_balance_ratio", 1.25)),
+        friction_coefficient=_optional_float(
+            data.get("friction_coefficient", data.get("friction_mu_pin"))
+        ),
+        min_bend_radius_mm=_optional_float(data.get("min_bend_radius_mm")),
+        route_family=str(data.get("route_family", "shoulder_cross_reinforcement")),
+        routing_mode=str(data.get("routing_mode", "deterministic")),
+        candidate_count=int(data.get("candidate_count", data.get("candidate_limit", 192))),
+        route_step_size=int(data.get("route_step_size", data.get("step_size", 0))),
+        wrap_direction=str(data.get("wrap_direction", "both")),
+        target_dome_angle_min_deg=float(data.get("target_dome_angle_min_deg", 25.0)),
+        target_dome_angle_max_deg=float(data.get("target_dome_angle_max_deg", 55.0)),
+        coverage_tolerance_mm=float(data.get("coverage_tolerance_mm", 6.0)),
     )
 
 

@@ -177,6 +177,7 @@ def test_selected_pattern_generates_closed_layer_and_exports(tmp_path: Path) -> 
         layer for layer in result.program.layers if layer.spec.winding_type == "helical"
     )
     assert helical_layer.report.circuits == selected["nd"]
+    assert helical_layer.report.angular_shift_deg == pytest.approx(360.0 / selected["nd"])
     assert result.pattern_candidates_path is not None and result.pattern_candidates_path.exists()
     assert result.selected_pattern_path is not None and result.selected_pattern_path.exists()
     assert (

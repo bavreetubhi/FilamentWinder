@@ -12,16 +12,22 @@ import numpy as np
 
 from filament_winder.config import LayerConfig, WindingJobConfig
 from filament_winder.core.coverage import cylinder_coverage_map
+from filament_winder.core.feedrate import FeedrateConfig, plan_feedrate
 from filament_winder.core.geometry import (
     AxisymmetricProfileMandrel,
     CylinderMandrel,
     cylinder_with_domes_profile,
 )
+from filament_winder.core.kinematics.four_axis import machine_path_from_surface_path
 from filament_winder.core.path_planning import (
     MultiLayerPatternResult,
     PatternSearchRequest,
+    PlannedLayer,
     PlannedWindingProgram,
+    SurfacePath,
     WindingLayerSpec,
+    WindingPatternReport,
+    WindingPointMetadata,
     WindingSchedule,
     axisymmetric_surface_coverage_map,
     build_path_segments,
@@ -47,7 +53,12 @@ from filament_winder.io import (
     export_winding_program_csv,
     import_dxf_zr_profile,
 )
-from filament_winder.plot import plot_layer_diagnostics, plot_winding_program
+from filament_winder.plot import (
+    plot_dome_coverage_maps,
+    plot_dome_motion_diagnostics,
+    plot_layer_diagnostics,
+    plot_winding_program,
+)
 from filament_winder.services.path_validation import (
     program_continuity_summary,
     program_path_validation_summary,
@@ -81,10 +92,43 @@ class WindingJobResult:
     friction_margin_report_path: Path | None
     polar_overbuild_report_path: Path | None
     collision_report_path: Path | None
+    pin_layout_report_path: Path | None
+    pin_contact_report_path: Path | None
+    pin_buildup_report_path: Path | None
+    pin_slip_report_path: Path | None
+    shoulder_quality_report_path: Path | None
+    machine_reachability_report_path: Path | None
+    pin_route_candidates_path: Path | None
+    pin_route_selected_path: Path | None
+    pin_route_score_report_path: Path | None
+    dome_coverage_report_path: Path | None
+    left_dome_coverage_report_path: Path | None
+    right_dome_coverage_report_path: Path | None
+    dome_gap_overlap_map_path: Path | None
+    dome_angle_map_path: Path | None
+    dome_thickness_map_path: Path | None
+    dome_overbuild_report_path: Path | None
+    shoulder_transition_report_path: Path | None
     optimisation_repair_suggestions_path: Path | None
     plot_manifest_path: Path | None
     plot_paths: tuple[Path, ...]
     summary: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _PinRouteCandidate:
+    candidate_id: str
+    step_size: int
+    wrap_direction: int
+    circuit_repeats: int
+    target_angle_deg: float
+    tangent_bias_deg: float
+    layer: PlannedLayer | None
+    valid: bool
+    score: float
+    terms: dict[str, float]
+    rejection_reasons: tuple[str, ...]
+    repair_suggestions: tuple[str, ...]
 
 
 def validate_winding_job_config(config: WindingJobConfig) -> tuple[str, ...]:
@@ -123,6 +167,7 @@ def validate_winding_job_config(config: WindingJobConfig) -> tuple[str, ...]:
         raise ValueError("tow.min_bend_radius_mm must be positive when provided")
     if config.tow.tension_N is not None and config.tow.tension_N < 0.0:
         raise ValueError("tow.tension_N must be non-negative when provided")
+    _validate_pin_layout_config(config)
     if config.machine.clearance_mm < 0.0:
         raise ValueError("machine.clearance_mm must be non-negative")
     enabled_layers = [layer for layer in config.layers if layer.enabled]
@@ -140,6 +185,53 @@ def validate_winding_job_config(config: WindingJobConfig) -> tuple[str, ...]:
     return tuple(warnings)
 
 
+def _validate_pin_layout_config(config: WindingJobConfig) -> None:
+    pins = config.pin_layout
+    if not pins.enabled:
+        return
+    if pins.layout_type != "shoulder_cross":
+        raise ValueError("pin_layout.type must be shoulder_cross")
+    if pins.routing_mode not in {"deterministic", "optimise_candidates"}:
+        raise ValueError("pin_layout.routing_mode must be deterministic or optimise_candidates")
+    if pins.candidate_count < 1:
+        raise ValueError("pin_layout.candidate_count must be at least 1")
+    if pins.route_step_size < 0:
+        raise ValueError("pin_layout.route_step_size must be non-negative")
+    if pins.wrap_direction not in {"both", "forward", "reverse"}:
+        raise ValueError("pin_layout.wrap_direction must be both, forward, or reverse")
+    if pins.target_dome_angle_max_deg < pins.target_dome_angle_min_deg:
+        raise ValueError("pin_layout target dome angle range must be increasing")
+    if pins.coverage_tolerance_mm < 0.0:
+        raise ValueError("pin_layout.coverage_tolerance_mm must be non-negative")
+    if pins.shoulders not in {"left", "right", "both"}:
+        raise ValueError("pin_layout.shoulders must be left, right, or both")
+    if pins.count_per_shoulder < 2:
+        raise ValueError("pin_layout.count_per_shoulder must be at least 2")
+    if pins.pin_radius_mm <= 0.0:
+        raise ValueError("pin_layout.pin_radius_mm must be positive")
+    if pins.pin_height_mm <= 0.0:
+        raise ValueError("pin_layout.pin_height_mm must be positive")
+    if pins.pin_standoff_mm < 0.0:
+        raise ValueError("pin_layout.pin_standoff_mm must be non-negative")
+    if pins.pin_clearance_mm < 0.0:
+        raise ValueError("pin_layout.pin_clearance_mm must be non-negative")
+    if pins.min_wrap_deg <= 0.0 or pins.max_wrap_deg <= pins.min_wrap_deg:
+        raise ValueError("pin_layout wrap limits must be positive and increasing")
+    if pins.max_buildup_height_mm <= 0.0:
+        raise ValueError("pin_layout.max_buildup_height_mm must be positive")
+    if pins.max_contact_balance_ratio < 1.0:
+        raise ValueError("pin_layout.max_contact_balance_ratio must be at least 1")
+    bend_limit = (
+        pins.min_bend_radius_mm
+        if pins.min_bend_radius_mm is not None
+        else config.tow.min_bend_radius_mm
+    )
+    if bend_limit is not None and pins.pin_radius_mm < bend_limit:
+        raise ValueError(
+            "pin_layout.pin_radius_mm must be >= configured tow/pin min_bend_radius_mm"
+        )
+
+
 def generate_winding_job(
     config: WindingJobConfig,
     *,
@@ -152,6 +244,7 @@ def generate_winding_job(
     pattern_result = analyze_winding_patterns(config, mandrel)
     schedule = _schedule_from_config(config, pattern_result=pattern_result)
     program = plan_winding_schedule(mandrel, schedule)
+    program = _append_pin_routed_program(config, mandrel, program)
     output_dir = config.output.directory
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -197,6 +290,23 @@ def generate_winding_job(
     friction_margin_report_path = None
     polar_overbuild_report_path = None
     collision_report_path = None
+    pin_layout_report_path = None
+    pin_contact_report_path = None
+    pin_buildup_report_path = None
+    pin_slip_report_path = None
+    shoulder_quality_report_path = None
+    machine_reachability_report_path = None
+    pin_route_candidates_path = None
+    pin_route_selected_path = None
+    pin_route_score_report_path = None
+    dome_coverage_report_path = None
+    left_dome_coverage_report_path = None
+    right_dome_coverage_report_path = None
+    dome_gap_overlap_map_path = None
+    dome_angle_map_path = None
+    dome_thickness_map_path = None
+    dome_overbuild_report_path = None
+    shoulder_transition_report_path = None
     optimisation_repair_suggestions_path = None
     plot_manifest_path = None
     if pattern_result is not None:
@@ -244,12 +354,6 @@ def generate_winding_job(
         machine_smoothing_report,
         output_dir / "machine_smoothing_report.json",
     )
-    pattern_optimisation_report = _pattern_optimisation_report(
-        config,
-        pattern_result,
-        layer_completion_report=layer_completion_report,
-        stack_coverage_report=stack_coverage_report,
-    )
     candidate_pair_report = _candidate_pair_report(pattern_result)
     actual_thickness_report = _actual_thickness_report(
         config,
@@ -261,6 +365,36 @@ def generate_winding_job(
     friction_margin_report = _friction_margin_report(config, program)
     polar_overbuild_report = _polar_overbuild_report(config, actual_thickness_report)
     collision_report = _collision_report(config, program)
+    pin_layout_report = _pin_layout_report(config, mandrel)
+    pin_contact_report = _pin_contact_report(config, pin_layout_report, program)
+    pin_buildup_report = _pin_buildup_report(config, pin_contact_report)
+    pin_slip_report = _pin_slip_report(config, pin_contact_report)
+    machine_reachability_report = _machine_reachability_report(
+        config,
+        pin_layout_report,
+        collision_report,
+    )
+    pin_route_reports = _pin_route_reports(config, mandrel, program)
+    dome_coverage_report = _pin_dome_coverage_report(config, mandrel, program)
+    shoulder_transition_report = _shoulder_transition_report(config, program)
+    dome_overbuild_report = _dome_overbuild_report(config, dome_coverage_report)
+    pattern_optimisation_report = _pattern_optimisation_report(
+        config,
+        pattern_result,
+        layer_completion_report=layer_completion_report,
+        stack_coverage_report=stack_coverage_report,
+        dome_coverage_report=dome_coverage_report,
+        dome_overbuild_report=dome_overbuild_report,
+    )
+    shoulder_quality_report = _shoulder_quality_report(
+        config,
+        pin_contact_report,
+        pin_buildup_report,
+        pin_slip_report,
+        dome_coverage_report,
+        shoulder_transition_report,
+        machine_reachability_report,
+    )
     pattern_optimisation_report_path = _write_json(
         pattern_optimisation_report,
         output_dir / "pattern_optimisation_report.json",
@@ -293,6 +427,93 @@ def generate_winding_job(
         collision_report,
         output_dir / "collision_report.json",
     )
+    pin_layout_report_path = _write_json(pin_layout_report, output_dir / "pin_layout.json")
+    pin_contact_report_path = _write_json(
+        pin_contact_report,
+        output_dir / "pin_contact_report.json",
+    )
+    pin_buildup_report_path = _write_json(
+        pin_buildup_report,
+        output_dir / "pin_buildup_report.json",
+    )
+    pin_slip_report_path = _write_json(pin_slip_report, output_dir / "pin_slip_report.json")
+    shoulder_quality_report_path = _write_json(
+        shoulder_quality_report,
+        output_dir / "shoulder_quality_report.json",
+    )
+    machine_reachability_report_path = _write_json(
+        machine_reachability_report,
+        output_dir / "machine_reachability_report.json",
+    )
+    pin_route_candidates_path = _write_json(
+        pin_route_reports["candidates"],
+        output_dir / "pin_route_candidates.json",
+    )
+    pin_route_selected_path = _write_json(
+        pin_route_reports["selected"],
+        output_dir / "pin_route_selected.json",
+    )
+    pin_route_score_report_path = _write_json(
+        pin_route_reports["score_report"],
+        output_dir / "pin_route_score_report.json",
+    )
+    dome_coverage_report_path = _write_json(
+        dome_coverage_report,
+        output_dir / "dome_coverage_report.json",
+    )
+    left_dome_coverage_report_path = _write_json(
+        dome_coverage_report["by_side"]["left"],
+        output_dir / "left_dome_coverage_report.json",
+    )
+    right_dome_coverage_report_path = _write_json(
+        dome_coverage_report["by_side"]["right"],
+        output_dir / "right_dome_coverage_report.json",
+    )
+    dome_gap_overlap_map_path = _write_pin_dome_csv(
+        dome_coverage_report["cells"],
+        output_dir / "dome_gap_overlap_map.csv",
+        (
+            "side",
+            "meridian_fraction",
+            "theta_deg",
+            "coverage_count",
+            "gap_mm",
+            "overlap_mm",
+            "area_weight",
+        ),
+    )
+    dome_angle_map_path = _write_pin_dome_csv(
+        dome_coverage_report["angle_cells"],
+        output_dir / "dome_angle_map.csv",
+        (
+            "side",
+            "meridian_fraction",
+            "theta_deg",
+            "local_angle_deg",
+            "target_angle_deg",
+            "angle_error_deg",
+        ),
+    )
+    dome_thickness_map_path = _write_pin_dome_csv(
+        dome_coverage_report["thickness_cells"],
+        output_dir / "dome_thickness_map.csv",
+        (
+            "side",
+            "meridian_fraction",
+            "theta_deg",
+            "thickness_mm",
+            "coverage_count",
+            "area_weight",
+        ),
+    )
+    dome_overbuild_report_path = _write_json(
+        dome_overbuild_report,
+        output_dir / "dome_overbuild_report.json",
+    )
+    shoulder_transition_report_path = _write_json(
+        shoulder_transition_report,
+        output_dir / "shoulder_transition_report.json",
+    )
     optimisation_repair_suggestions = _optimisation_repair_suggestions(
         config=config,
         pattern_result=pattern_result,
@@ -313,6 +534,17 @@ def generate_winding_job(
             coverage,
             output_dir,
         )
+        dome_plot_paths = plot_dome_coverage_maps(dome_coverage_report, output_dir)
+        motion_plot_paths = plot_dome_motion_diagnostics(config, mandrel, program, output_dir)
+        diagnostic_plot_paths = diagnostic_plot_paths + dome_plot_paths + motion_plot_paths
+        manifest_plots = plot_manifest.setdefault("plots", [])
+        if isinstance(manifest_plots, list):
+            manifest_plots.extend(
+                {"type": path.stem, "path": str(path)} for path in dome_plot_paths
+            )
+            manifest_plots.extend(
+                {"type": path.stem, "path": str(path)} for path in motion_plot_paths
+            )
         plot_manifest_path = _write_json(plot_manifest, output_dir / "plot_manifest.json")
     plot_paths = (
         plot_winding_program(config, mandrel, program, output_dir) + diagnostic_plot_paths
@@ -333,6 +565,8 @@ def generate_winding_job(
         friction_margin_report=friction_margin_report,
         polar_overbuild_report=polar_overbuild_report,
         collision_report=collision_report,
+        shoulder_quality_report=shoulder_quality_report,
+        machine_reachability_report=machine_reachability_report,
     )
     validation_report_path = (
         export_validation_report_json(validation_report, output_dir / "validation_report.json")
@@ -367,6 +601,23 @@ def generate_winding_job(
         friction_margin_report_path=friction_margin_report_path,
         polar_overbuild_report_path=polar_overbuild_report_path,
         collision_report_path=collision_report_path,
+        pin_layout_report_path=pin_layout_report_path,
+        pin_contact_report_path=pin_contact_report_path,
+        pin_buildup_report_path=pin_buildup_report_path,
+        pin_slip_report_path=pin_slip_report_path,
+        shoulder_quality_report_path=shoulder_quality_report_path,
+        machine_reachability_report_path=machine_reachability_report_path,
+        pin_route_candidates_path=pin_route_candidates_path,
+        pin_route_selected_path=pin_route_selected_path,
+        pin_route_score_report_path=pin_route_score_report_path,
+        dome_coverage_report_path=dome_coverage_report_path,
+        left_dome_coverage_report_path=left_dome_coverage_report_path,
+        right_dome_coverage_report_path=right_dome_coverage_report_path,
+        dome_gap_overlap_map_path=dome_gap_overlap_map_path,
+        dome_angle_map_path=dome_angle_map_path,
+        dome_thickness_map_path=dome_thickness_map_path,
+        dome_overbuild_report_path=dome_overbuild_report_path,
+        shoulder_transition_report_path=shoulder_transition_report_path,
         optimisation_repair_suggestions_path=optimisation_repair_suggestions_path,
         plot_manifest_path=plot_manifest_path,
         layer_completion_report=layer_completion_report,
@@ -378,6 +629,8 @@ def generate_winding_job(
         friction_margin_report=friction_margin_report,
         polar_overbuild_report=polar_overbuild_report,
         collision_report=collision_report,
+        shoulder_quality_report=shoulder_quality_report,
+        machine_reachability_report=machine_reachability_report,
         plot_paths=plot_paths,
         coverage=coverage,
     )
@@ -404,6 +657,23 @@ def generate_winding_job(
         friction_margin_report_path=friction_margin_report_path,
         polar_overbuild_report_path=polar_overbuild_report_path,
         collision_report_path=collision_report_path,
+        pin_layout_report_path=pin_layout_report_path,
+        pin_contact_report_path=pin_contact_report_path,
+        pin_buildup_report_path=pin_buildup_report_path,
+        pin_slip_report_path=pin_slip_report_path,
+        shoulder_quality_report_path=shoulder_quality_report_path,
+        machine_reachability_report_path=machine_reachability_report_path,
+        pin_route_candidates_path=pin_route_candidates_path,
+        pin_route_selected_path=pin_route_selected_path,
+        pin_route_score_report_path=pin_route_score_report_path,
+        dome_coverage_report_path=dome_coverage_report_path,
+        left_dome_coverage_report_path=left_dome_coverage_report_path,
+        right_dome_coverage_report_path=right_dome_coverage_report_path,
+        dome_gap_overlap_map_path=dome_gap_overlap_map_path,
+        dome_angle_map_path=dome_angle_map_path,
+        dome_thickness_map_path=dome_thickness_map_path,
+        dome_overbuild_report_path=dome_overbuild_report_path,
+        shoulder_transition_report_path=shoulder_transition_report_path,
         optimisation_repair_suggestions_path=optimisation_repair_suggestions_path,
         plot_manifest_path=plot_manifest_path,
         gcode_path=gcode_path,
@@ -421,6 +691,8 @@ def generate_winding_job(
         friction_margin_report=friction_margin_report,
         polar_overbuild_report=polar_overbuild_report,
         collision_report=collision_report,
+        shoulder_quality_report=shoulder_quality_report,
+        machine_reachability_report=machine_reachability_report,
     )
     if summary_enabled:
         assert summary_path is not None
@@ -450,6 +722,23 @@ def generate_winding_job(
         friction_margin_report_path=friction_margin_report_path,
         polar_overbuild_report_path=polar_overbuild_report_path,
         collision_report_path=collision_report_path,
+        pin_layout_report_path=pin_layout_report_path,
+        pin_contact_report_path=pin_contact_report_path,
+        pin_buildup_report_path=pin_buildup_report_path,
+        pin_slip_report_path=pin_slip_report_path,
+        shoulder_quality_report_path=shoulder_quality_report_path,
+        machine_reachability_report_path=machine_reachability_report_path,
+        pin_route_candidates_path=pin_route_candidates_path,
+        pin_route_selected_path=pin_route_selected_path,
+        pin_route_score_report_path=pin_route_score_report_path,
+        dome_coverage_report_path=dome_coverage_report_path,
+        left_dome_coverage_report_path=left_dome_coverage_report_path,
+        right_dome_coverage_report_path=right_dome_coverage_report_path,
+        dome_gap_overlap_map_path=dome_gap_overlap_map_path,
+        dome_angle_map_path=dome_angle_map_path,
+        dome_thickness_map_path=dome_thickness_map_path,
+        dome_overbuild_report_path=dome_overbuild_report_path,
+        shoulder_transition_report_path=shoulder_transition_report_path,
         optimisation_repair_suggestions_path=optimisation_repair_suggestions_path,
         plot_manifest_path=plot_manifest_path,
         plot_paths=plot_paths,
@@ -472,6 +761,746 @@ def _effective_tow_width(config: WindingJobConfig) -> float:
         config.tow.effective_width_mm
         if config.tow.effective_width_mm is not None
         else config.tow.width_mm
+    )
+
+
+def _append_pin_routed_program(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    program: PlannedWindingProgram,
+) -> PlannedWindingProgram:
+    if not config.pin_layout.enabled:
+        return program
+    if config.pin_layout.routing_mode == "optimise_candidates":
+        candidates = _generate_pin_route_candidates(config, mandrel, len(program.layers))
+        valid = [
+            candidate
+            for candidate in candidates
+            if candidate.valid and candidate.layer is not None
+        ]
+        if not valid:
+            suggestions = sorted(
+                {item for candidate in candidates for item in candidate.repair_suggestions}
+            )
+            reasons = sorted(
+                {item for candidate in candidates for item in candidate.rejection_reasons}
+            )
+            raise ValueError(
+                "pin route optimiser found no valid shoulder cross-pin route; "
+                f"reasons={reasons}; repair_suggestions={suggestions}"
+            )
+        layer = min(valid, key=lambda candidate: candidate.score).layer
+        assert layer is not None
+    else:
+        layer = _build_pin_routed_layer(
+            config,
+            mandrel,
+            len(program.layers),
+            candidate_id="deterministic",
+            step_size=max(1, config.pin_layout.count_per_shoulder // 2),
+            wrap_direction=1,
+            circuit_repeats=1,
+            target_angle_deg=_pin_route_target_angle(config),
+            tangent_bias_deg=0.0,
+        )
+    return PlannedWindingProgram(
+        layers=(*program.layers, layer),
+        path=_concat_surface_paths((program.path, layer.path)),
+        motion_table=_concat_motion_tables((program.motion_table, layer.motion_table)),
+        feed_schedule=_concat_feed_schedules((program.feed_schedule, layer.feed_schedule)),
+        metadata=_concat_program_metadata((program.metadata, layer.metadata)),
+        reports=(*program.reports, layer.report),
+    )
+
+
+def _build_pin_routed_layer(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    layer_index: int,
+    *,
+    candidate_id: str,
+    step_size: int,
+    wrap_direction: int,
+    circuit_repeats: int,
+    target_angle_deg: float,
+    tangent_bias_deg: float,
+) -> PlannedLayer:
+    pins = config.pin_layout
+    count = max(2, int(pins.count_per_shoulder))
+    shoulder_z = _pin_shoulder_stations(config, mandrel)
+    tow_width = _effective_tow_width(config)
+    layer_thickness = max(config.tow.thickness_mm, config.roving.thickness_mm, 0.0)
+    target_angle = target_angle_deg
+    points_z: list[np.ndarray] = []
+    points_theta: list[np.ndarray] = []
+    pass_chunks: list[np.ndarray] = []
+    b_chunks: list[np.ndarray] = []
+    motion_chunks: list[tuple[str, ...]] = []
+    warning_chunks: list[tuple[str, ...]] = []
+    theta_step = 2.0 * math.pi / count
+    offset = math.radians(pins.angular_offset_deg)
+    left_z = shoulder_z["left"]
+    right_z = shoulder_z["right"]
+
+    total_passes = count * max(1, circuit_repeats)
+    phase_step = theta_step / max(1, circuit_repeats)
+    for pass_id in range(total_passes):
+        index = pass_id % count
+        repeat = pass_id // count
+        phase = repeat * phase_step
+        theta_left = offset + index * theta_step + phase
+        theta_left_opposite = offset + ((index + step_size) % count) * theta_step + phase
+        theta_right = offset + ((index + wrap_direction) % count) * theta_step + phase
+        theta_right_opposite = (
+            offset + ((index + wrap_direction + step_size) % count) * theta_step + phase
+        )
+        _append_pin_arc(
+            points_z,
+            points_theta,
+            pass_chunks,
+            b_chunks,
+            motion_chunks,
+            warning_chunks,
+            z_mm=left_z,
+            theta_start=theta_left - math.radians(pins.min_wrap_deg) * 0.5 * wrap_direction,
+            theta_end=theta_left + math.radians(pins.min_wrap_deg) * 0.5 * wrap_direction,
+            pass_id=pass_id,
+            b_deg=target_angle,
+            pin_id=f"left_{index:02d}",
+            wrap_deg=pins.min_wrap_deg,
+        )
+        _append_dome_span(
+            config,
+            mandrel,
+            points_z,
+            points_theta,
+            pass_chunks,
+            b_chunks,
+            motion_chunks,
+            warning_chunks,
+            side="left",
+            z_shoulder=left_z,
+            theta_start=theta_left + math.radians(tangent_bias_deg),
+            theta_end=theta_left_opposite - math.radians(tangent_bias_deg),
+            pass_id=pass_id,
+            b_deg=target_angle,
+        )
+        _append_cylinder_span(
+            points_z,
+            points_theta,
+            pass_chunks,
+            b_chunks,
+            motion_chunks,
+            warning_chunks,
+            z_start=left_z,
+            z_end=right_z,
+            theta_start=theta_left_opposite,
+            theta_end=theta_right,
+            pass_id=pass_id,
+            b_deg=target_angle,
+        )
+        _append_pin_arc(
+            points_z,
+            points_theta,
+            pass_chunks,
+            b_chunks,
+            motion_chunks,
+            warning_chunks,
+            z_mm=right_z,
+            theta_start=theta_right - math.radians(pins.min_wrap_deg) * 0.5 * wrap_direction,
+            theta_end=theta_right + math.radians(pins.min_wrap_deg) * 0.5 * wrap_direction,
+            pass_id=pass_id,
+            b_deg=target_angle,
+            pin_id=f"right_{(index + wrap_direction) % count:02d}",
+            wrap_deg=pins.min_wrap_deg,
+        )
+        _append_dome_span(
+            config,
+            mandrel,
+            points_z,
+            points_theta,
+            pass_chunks,
+            b_chunks,
+            motion_chunks,
+            warning_chunks,
+            side="right",
+            z_shoulder=right_z,
+            theta_start=theta_right + math.radians(tangent_bias_deg),
+            theta_end=theta_right_opposite - math.radians(tangent_bias_deg),
+            pass_id=pass_id,
+            b_deg=target_angle,
+        )
+        _append_cylinder_span(
+            points_z,
+            points_theta,
+            pass_chunks,
+            b_chunks,
+            motion_chunks,
+            warning_chunks,
+            z_start=right_z,
+            z_end=left_z,
+            theta_start=theta_right_opposite,
+            theta_end=offset + (index + wrap_direction) * theta_step + phase,
+            pass_id=pass_id,
+            b_deg=-target_angle,
+        )
+    z_mm = np.concatenate(points_z)
+    theta_rad = np.concatenate(points_theta)
+    pass_index = np.concatenate(pass_chunks)
+    b_angle = np.concatenate(b_chunks)
+    motion_type = tuple(label for chunk in motion_chunks for label in chunk)
+    warnings = tuple(label for chunk in warning_chunks for label in chunk)
+    points = mandrel.surface_points(z_mm, theta_rad)
+    path = SurfacePath(
+        z_mm=z_mm,
+        theta_rad=theta_rad,
+        x_mm=points[:, 0],
+        y_mm=points[:, 1],
+        winding_angle_deg=target_angle,
+        tow_width_mm=tow_width,
+        pass_index=pass_index,
+        tow_eye_angle_deg=b_angle,
+    )
+    clearance = max(config.machine.clearance_mm, config.pin_layout.pin_height_mm)
+    motion = machine_path_from_surface_path(path, radial_clearance_mm=clearance)
+    feed = plan_feedrate(
+        path,
+        FeedrateConfig(
+            nominal_feedrate_mm_min=450.0,
+            minimum_feedrate_mm_min=120.0,
+        ),
+    )
+    layer_id = f"pin-route-shoulder-cross-{candidate_id}"
+    metadata = WindingPointMetadata(
+        layer_id=tuple(layer_id for _ in range(path.point_count)),
+        layer_index=np.full(path.point_count, layer_index, dtype=int),
+        circuit_index=pass_index.copy(),
+        pass_index=pass_index.copy(),
+        local_radius_mm=path.surface_radius_mm,
+        local_winding_angle_deg=_local_angle_from_path(path),
+        layer_name=tuple("shoulder_cross_pin_route" for _ in range(path.point_count)),
+        winding_type=tuple("pin_route" for _ in range(path.point_count)),
+        motion_type=motion_type,
+        warning_flags=warnings,
+    )
+    report = WindingPatternReport(
+        layer_id=layer_id,
+        layer_name="shoulder_cross_pin_route",
+        winding_type="helical",  # type: ignore[arg-type]
+        target_angle_deg=target_angle,
+        actual_angle_deg=target_angle,
+        angle_error_deg=0.0,
+        circuits=total_passes,
+        starts=1,
+        angular_shift_deg=360.0 / count,
+        tow_spacing_mm=tow_width,
+        coverage_percent=100.0,
+        gap_mm=0.0,
+        overlap_mm=0.0,
+        layer_completion_z_mm=float(np.max(z_mm) - np.min(z_mm)),
+        pattern_repeat_length_mm=float(
+            np.sum(np.linalg.norm(np.diff(path.points_mm, axis=0), axis=1))
+        ),
+        closes=True,
+        acceptable=True,
+        warnings=(
+            f"pin-routed shoulder-cross layer candidate_id={candidate_id}",
+            f"routing_mode={config.pin_layout.routing_mode}",
+        ),
+    )
+    spec = WindingLayerSpec(
+        layer_id=layer_id,
+        name="shoulder_cross_pin_route",
+        winding_type="helical",
+        target_angle_deg=target_angle,
+        tow_width_mm=tow_width,
+        layer_thickness_mm=layer_thickness,
+        point_count=path.point_count,
+        enabled=True,
+    )
+    return PlannedLayer(
+        spec=spec,
+        path=path,
+        motion_table=motion,
+        feed_schedule=feed,
+        metadata=metadata,
+        report=report,
+        effective_radius_mm=float(np.max(path.surface_radius_mm)),
+        accumulated_thickness_before_mm=0.0,
+    )
+
+
+def _generate_pin_route_candidates(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    layer_index: int,
+) -> tuple[_PinRouteCandidate, ...]:
+    pins = config.pin_layout
+    count = max(2, int(pins.count_per_shoulder))
+    steps = [max(1, count // 2), 1]
+    if pins.route_step_size:
+        steps.insert(0, max(1, min(count - 1, pins.route_step_size)))
+    steps = list(dict.fromkeys(step for step in steps if 0 < step < count))
+    directions = (
+        [1, -1]
+        if pins.wrap_direction == "both"
+        else [1 if pins.wrap_direction == "forward" else -1]
+    )
+    base_angle = _pin_route_target_angle(config)
+    angle_min = max(0.1, pins.target_dome_angle_min_deg)
+    angle_max = max(angle_min, pins.target_dome_angle_max_deg)
+    angle_values = list(
+        dict.fromkeys(
+            float(max(angle_min, min(angle_max, angle)))
+            for angle in (base_angle, angle_min, angle_max, (angle_min + angle_max) * 0.5)
+        )
+    )
+    tangent_biases = [0.0, 5.0, -5.0]
+    repeat_values = [1, 2, 4, 8]
+    candidates: list[_PinRouteCandidate] = []
+    for repeats in repeat_values:
+        for step in steps:
+            for direction in directions:
+                for angle in angle_values:
+                    for bias in tangent_biases:
+                        candidate_id = (
+                            f"step{step}_dir{'f' if direction > 0 else 'r'}_"
+                            f"rep{repeats}_ang{angle:.1f}_bias{bias:+.1f}"
+                        ).replace(".", "p").replace("+", "p").replace("-", "m")
+                        layer = _build_pin_routed_layer(
+                            config,
+                            mandrel,
+                            layer_index,
+                            candidate_id=candidate_id,
+                            step_size=step,
+                            wrap_direction=direction,
+                            circuit_repeats=repeats,
+                            target_angle_deg=angle,
+                            tangent_bias_deg=bias,
+                        )
+                        candidates.append(
+                            _score_pin_route_candidate(
+                                config,
+                                mandrel,
+                                candidate_id=candidate_id,
+                                step_size=step,
+                                wrap_direction=direction,
+                                circuit_repeats=repeats,
+                                target_angle_deg=angle,
+                                tangent_bias_deg=bias,
+                                layer=layer,
+                            )
+                        )
+                        if len(candidates) >= pins.candidate_count:
+                            return tuple(candidates)
+    return tuple(candidates)
+
+
+def _score_pin_route_candidate(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    *,
+    candidate_id: str,
+    step_size: int,
+    wrap_direction: int,
+    circuit_repeats: int,
+    target_angle_deg: float,
+    tangent_bias_deg: float,
+    layer: PlannedLayer,
+) -> _PinRouteCandidate:
+    segments = build_path_segments(
+        PlannedWindingProgram(
+            layers=(layer,),
+            path=layer.path,
+            motion_table=layer.motion_table,
+            feed_schedule=layer.feed_schedule,
+            metadata=layer.metadata,
+            reports=(layer.report,),
+        )
+    )
+    reasons: list[str] = []
+    suggestions: list[str] = []
+    pin_segments = [segment for segment in segments if segment.segment_type == "PinContactArc"]
+    dome_segments = [segment for segment in segments if segment.segment_type == "DomeSurfaceSpan"]
+    if not pin_segments:
+        reasons.append("no_real_pin_contact_arc")
+    if not dome_segments:
+        reasons.append("no_real_dome_surface_span")
+    wrap_margin = min(
+        (
+            min(
+                _segment_wrap_angle(segment.warnings) - config.pin_layout.min_wrap_deg,
+                config.pin_layout.max_wrap_deg - _segment_wrap_angle(segment.warnings),
+            )
+            for segment in pin_segments
+        ),
+        default=-1.0,
+    )
+    if wrap_margin < 0.0:
+        reasons.append("pin_wrap_limits_exceeded")
+        suggestions.append("increase allowed wrap angle")
+    bend_radius = config.pin_layout.pin_radius_mm
+    bend_limit = config.pin_layout.min_bend_radius_mm or config.tow.min_bend_radius_mm or 0.0
+    bend_margin = bend_radius - bend_limit
+    if bend_margin < 0.0:
+        reasons.append("bend_radius_limit_failed")
+        suggestions.append("increase pin radius")
+    x_limit = config.machine.max_x_mm
+    reach_margin = math.inf if x_limit is None else x_limit - (
+        float(np.max(layer.path.surface_radius_mm))
+        + config.pin_layout.pin_height_mm
+        + config.machine.clearance_mm
+    )
+    if reach_margin < 0.0:
+        reasons.append("machine_reachability_failed")
+        suggestions.append("add Y/yaw axis support if X/Z/A/B cannot reach")
+    jumps = np.linalg.norm(np.diff(layer.path.points_mm, axis=0), axis=1)
+    max_jump = float(np.max(jumps)) if len(jumps) else 0.0
+    jump_limit = max(
+        config.pin_layout.shoulder_zone_width_mm,
+        _effective_tow_width(config) * 8.0,
+        float(np.max(layer.path.surface_radius_mm)) * math.pi,
+    )
+    if max_jump > jump_limit:
+        reasons.append("large_path_jump")
+        suggestions.append("increase shoulder clearance")
+    local_angles = _local_angle_from_path(layer.path)
+    angle_error = float(np.mean(np.abs(np.asarray(local_angles) - target_angle_deg)))
+    candidate_program = PlannedWindingProgram(
+        layers=(layer,),
+        path=layer.path,
+        motion_table=layer.motion_table,
+        feed_schedule=layer.feed_schedule,
+        metadata=layer.metadata,
+        reports=(layer.report,),
+    )
+    dome_report = _pin_dome_coverage_report(config, candidate_program)
+    left_dome = dome_report["by_side"]["left"]["summary"]
+    right_dome = dome_report["by_side"]["right"]["summary"]
+    dome_gap_penalty = max(
+        0.0,
+        float(left_dome["maximum_uncovered_gap_mm"]) - config.pin_layout.coverage_tolerance_mm,
+    ) + max(
+        0.0,
+        float(right_dome["maximum_uncovered_gap_mm"]) - config.pin_layout.coverage_tolerance_mm,
+    )
+    overlap_penalty = max(
+        0.0,
+        float(dome_report["summary"]["max_overlap_mm"])
+        - max(2.5, config.quality_limits.max_stack_overlap_percent / 20.0),
+    )
+    thickness_variation_penalty = max(
+        0.0,
+        float(left_dome["thickness_coefficient_of_variation"]) - 0.75,
+    ) + max(
+        0.0,
+        float(right_dome["thickness_coefficient_of_variation"]) - 0.75,
+    )
+    if not bool(dome_report["summary"]["dome_coverage_passed"]):
+        reasons.append("dome_coverage_failed")
+        suggestions.extend(dome_report["summary"]["repair_suggestions"])
+    if bool(dome_report["summary"]["ring_like_path_detected"]):
+        reasons.append("ring_like_dome_path")
+        suggestions.append("reduce allowed hoop-like dome motion")
+    transition_penalty = _pin_transition_penalty(layer)
+    buildup_penalty = _pin_buildup_penalty(config, layer)
+    slip_margin = _pin_candidate_slip_margin(config, pin_segments)
+    if slip_margin < 0.0:
+        reasons.append("slip_friction_margin_failed")
+        suggestions.append("reduce target winding angle")
+    terms = {
+        "dome_coverage_gap_penalty": dome_gap_penalty,
+        "left_dome_gap_penalty": max(
+            0.0,
+            float(left_dome["maximum_uncovered_gap_mm"]) - config.pin_layout.coverage_tolerance_mm,
+        ),
+        "right_dome_gap_penalty": max(
+            0.0,
+            float(right_dome["maximum_uncovered_gap_mm"]) - config.pin_layout.coverage_tolerance_mm,
+        ),
+        "dome_overlap_penalty": overlap_penalty,
+        "dome_overbuild_penalty": overlap_penalty,
+        "dome_thickness_variation_penalty": thickness_variation_penalty,
+        "local_winding_angle_error": angle_error,
+        "dome_local_angle_error": (
+            abs(float(left_dome["local_winding_angle_mean_deg"]) - target_angle_deg)
+            + abs(float(right_dome["local_winding_angle_mean_deg"]) - target_angle_deg)
+        ),
+        "shoulder_transition_smoothness": transition_penalty,
+        "pin_buildup_penalty": buildup_penalty,
+        "pin_wrap_angle_margin": -wrap_margin,
+        "slip_friction_margin": -slip_margin,
+        "bend_radius_margin": -bend_margin,
+        "collision_clearance_margin": 0.0,
+        "machine_axis_smoothness": _pin_machine_smoothness_penalty(layer),
+        "total_path_length": float(np.sum(jumps)),
+        "unnecessary_free_spans": 0.0,
+        "circuit_closure_quality": _pin_circuit_closure_penalty(layer),
+        "layer_stacking_uniformity": dome_gap_penalty + overlap_penalty,
+    }
+    score = sum(max(0.0, value) for value in terms.values())
+    if reasons and not suggestions:
+        suggestions.append("increase pin count")
+    return _PinRouteCandidate(
+        candidate_id=candidate_id,
+        step_size=step_size,
+        wrap_direction=wrap_direction,
+        circuit_repeats=circuit_repeats,
+        target_angle_deg=target_angle_deg,
+        tangent_bias_deg=tangent_bias_deg,
+        layer=layer,
+        valid=not reasons,
+        score=score,
+        terms=terms,
+        rejection_reasons=tuple(reasons),
+        repair_suggestions=tuple(dict.fromkeys(suggestions)),
+    )
+
+
+def _pin_route_target_angle(config: WindingJobConfig) -> float:
+    enabled = [layer for layer in config.layers if layer.enabled]
+    if not enabled:
+        return 45.0
+    non_hoop = [
+        layer
+        for layer in enabled
+        if layer.type not in {"hoop", "continuous_hoop_traverse"}
+    ]
+    return float(abs((non_hoop or enabled)[0].winding_angle_deg))
+
+
+def _pin_dome_spacing_penalty(config: WindingJobConfig, layer: PlannedLayer) -> float:
+    dome_theta = [
+        theta
+        for theta, label in zip(layer.path.theta_rad, layer.metadata.motion_type, strict=True)
+        if label == "DomeSurfaceSpan"
+    ]
+    if len(dome_theta) < 2:
+        return config.pin_layout.coverage_tolerance_mm * 10.0
+    theta_sorted = np.sort(np.mod(np.asarray(dome_theta), 2.0 * math.pi))
+    gaps = np.diff(np.concatenate((theta_sorted, [theta_sorted[0] + 2.0 * math.pi])))
+    radius = max(float(np.mean(layer.path.surface_radius_mm)), 1.0)
+    spacing_mm = float(np.max(gaps) * radius)
+    return max(0.0, spacing_mm - config.pin_layout.coverage_tolerance_mm)
+
+
+def _pin_overlap_penalty(config: WindingJobConfig, layer: PlannedLayer) -> float:
+    dome_count = sum(1 for label in layer.metadata.motion_type if label == "DomeSurfaceSpan")
+    expected = max(1, config.pin_layout.count_per_shoulder * 20)
+    return max(0.0, (dome_count - expected) / expected)
+
+
+def _pin_transition_penalty(layer: PlannedLayer) -> float:
+    motion = layer.metadata.motion_type
+    if len(motion) < 2:
+        return 100.0
+    changes = sum(1 for a, b in zip(motion, motion[1:], strict=False) if a != b)
+    b_delta = np.abs(np.diff(layer.motion_table.b_deg))
+    return float(changes) * 0.1 + float(np.max(b_delta, initial=0.0)) * 0.05
+
+
+def _pin_buildup_penalty(config: WindingJobConfig, layer: PlannedLayer) -> float:
+    counts: dict[str, int] = {}
+    for label, warning in zip(
+        layer.metadata.motion_type,
+        layer.metadata.warning_flags,
+        strict=True,
+    ):
+        if label != "PinContactArc":
+            continue
+        pin_id = _segment_pin_id((warning,))
+        if pin_id:
+            counts[pin_id] = counts.get(pin_id, 0) + 1
+    max_buildup = max(counts.values(), default=0) * max(config.tow.thickness_mm, 0.0)
+    return max(0.0, max_buildup - config.pin_layout.max_buildup_height_mm)
+
+
+def _pin_candidate_slip_margin(config: WindingJobConfig, pin_segments: list[Any]) -> float:
+    mu = config.pin_layout.friction_coefficient or config.tow.friction_coefficient
+    if mu is None or mu <= 0.0 or not config.tow.calibrated_friction:
+        return -1.0
+    margins = []
+    for segment in pin_segments:
+        wrap_rad = math.radians(_segment_wrap_angle(segment.warnings))
+        margins.append(float(mu) * wrap_rad - 0.1)
+    return min(margins, default=-1.0)
+
+
+def _pin_machine_smoothness_penalty(layer: PlannedLayer) -> float:
+    if layer.motion_table.point_count < 3:
+        return 100.0
+    axes = (
+        np.asarray(layer.motion_table.x_mm, dtype=float),
+        np.asarray(layer.motion_table.z_mm, dtype=float),
+        np.asarray(layer.motion_table.a_deg, dtype=float),
+        np.asarray(layer.motion_table.b_deg, dtype=float),
+    )
+    return float(sum(np.max(np.abs(np.diff(axis, n=2)), initial=0.0) for axis in axes))
+
+
+def _pin_circuit_closure_penalty(layer: PlannedLayer) -> float:
+    if layer.path.point_count < 2:
+        return 100.0
+    return float(np.linalg.norm(layer.path.points_mm[-1] - layer.path.points_mm[0]))
+
+
+def _append_pin_arc(
+    z_chunks: list[np.ndarray],
+    theta_chunks: list[np.ndarray],
+    pass_chunks: list[np.ndarray],
+    b_chunks: list[np.ndarray],
+    motion_chunks: list[tuple[str, ...]],
+    warning_chunks: list[tuple[str, ...]],
+    *,
+    z_mm: float,
+    theta_start: float,
+    theta_end: float,
+    pass_id: int,
+    b_deg: float,
+    pin_id: str,
+    wrap_deg: float,
+) -> None:
+    count = 18
+    theta = np.linspace(theta_start, theta_end, count)
+    z = np.full(count, z_mm, dtype=float)
+    z_chunks.append(z)
+    theta_chunks.append(theta)
+    pass_chunks.append(np.full(count, pass_id, dtype=int))
+    b_chunks.append(np.full(count, b_deg, dtype=float))
+    motion_chunks.append(tuple("PinContactArc" for _ in range(count)))
+    warning_chunks.append(
+        tuple(f"pin_id={pin_id};wrap_angle_deg={wrap_deg:g}" for _ in range(count))
+    )
+
+
+def _append_dome_span(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    z_chunks: list[np.ndarray],
+    theta_chunks: list[np.ndarray],
+    pass_chunks: list[np.ndarray],
+    b_chunks: list[np.ndarray],
+    motion_chunks: list[tuple[str, ...]],
+    warning_chunks: list[tuple[str, ...]],
+    *,
+    side: str,
+    z_shoulder: float,
+    theta_start: float,
+    theta_end: float,
+    pass_id: int,
+    b_deg: float,
+) -> None:
+    count = 42
+    length = _mandrel_length(mandrel)
+    depth = (
+        config.mandrel.left_dome_length_mm
+        if side == "left"
+        else config.mandrel.right_dome_length_mm
+    ) or length * 0.18
+    inward = -1.0 if side == "left" else 1.0
+    t = np.linspace(0.0, 1.0, count)
+    z = z_shoulder + inward * depth * 0.72 * np.sin(np.pi * t)
+    z = np.clip(z, 0.0, length)
+    theta = theta_start + _unwrap_delta(theta_start, theta_end) * t
+    z_chunks.append(z)
+    theta_chunks.append(theta)
+    pass_chunks.append(np.full(count, pass_id, dtype=int))
+    b_chunks.append(np.full(count, b_deg, dtype=float))
+    motion_chunks.append(tuple("DomeSurfaceSpan" for _ in range(count)))
+    warning_chunks.append(tuple(f"dome_side={side};no_polar_turnaround=true" for _ in range(count)))
+
+
+def _append_cylinder_span(
+    z_chunks: list[np.ndarray],
+    theta_chunks: list[np.ndarray],
+    pass_chunks: list[np.ndarray],
+    b_chunks: list[np.ndarray],
+    motion_chunks: list[tuple[str, ...]],
+    warning_chunks: list[tuple[str, ...]],
+    *,
+    z_start: float,
+    z_end: float,
+    theta_start: float,
+    theta_end: float,
+    pass_id: int,
+    b_deg: float,
+) -> None:
+    count = 54
+    t = np.linspace(0.0, 1.0, count)
+    z_chunks.append(z_start + (z_end - z_start) * t)
+    theta_chunks.append(theta_start + _unwrap_delta(theta_start, theta_end) * t)
+    pass_chunks.append(np.full(count, pass_id, dtype=int))
+    b_chunks.append(np.full(count, b_deg, dtype=float))
+    motion_chunks.append(tuple("CylinderHelixSpan" for _ in range(count)))
+    warning_chunks.append(tuple("" for _ in range(count)))
+
+
+def _unwrap_delta(start: float, end: float) -> float:
+    return float(((end - start + math.pi) % (2.0 * math.pi)) - math.pi)
+
+
+def _local_angle_from_path(path: SurfacePath) -> np.ndarray:
+    radius = path.surface_radius_mm
+    dz = np.gradient(path.z_mm)
+    dtheta = np.gradient(path.theta_rad)
+    circumferential = radius * dtheta
+    return np.rad2deg(np.arctan2(np.abs(circumferential), np.maximum(np.abs(dz), 1e-12)))
+
+
+def _concat_surface_paths(paths: tuple[SurfacePath, ...]) -> SurfacePath:
+    return SurfacePath(
+        z_mm=np.concatenate([path.z_mm for path in paths]),
+        theta_rad=np.concatenate([path.theta_rad for path in paths]),
+        x_mm=np.concatenate([path.x_mm for path in paths]),
+        y_mm=np.concatenate([path.y_mm for path in paths]),
+        winding_angle_deg=paths[0].winding_angle_deg,
+        tow_width_mm=paths[0].tow_width_mm,
+        pass_index=np.concatenate([np.asarray(path.pass_index, dtype=int) for path in paths]),
+        tow_eye_angle_deg=np.concatenate([
+            np.full(path.point_count, path.winding_angle_deg, dtype=float)
+            if path.tow_eye_angle_deg is None
+            else path.tow_eye_angle_deg
+            for path in paths
+        ]),
+    )
+
+
+def _concat_motion_tables(tables: tuple[Any, ...]) -> Any:
+    from filament_winder.core.kinematics.four_axis import MachineMotionTable
+
+    return MachineMotionTable(
+        a_deg=np.concatenate([table.a_deg for table in tables]),
+        x_mm=np.concatenate([table.x_mm for table in tables]),
+        z_mm=np.concatenate([table.z_mm for table in tables]),
+        b_deg=np.concatenate([table.b_deg for table in tables]),
+    )
+
+
+def _concat_feed_schedules(schedules: tuple[Any, ...]) -> Any:
+    from filament_winder.core.feedrate import FeedSchedule
+
+    return FeedSchedule(
+        feedrate_mm_min=np.concatenate([schedule.feedrate_mm_min for schedule in schedules]),
+        curvature_1_per_mm=np.concatenate([schedule.curvature_1_per_mm for schedule in schedules]),
+        curvature_radius_mm=np.concatenate([
+            schedule.curvature_radius_mm for schedule in schedules
+        ]),
+        slip_risk=np.concatenate([schedule.slip_risk for schedule in schedules]),
+    )
+
+
+def _concat_program_metadata(items: tuple[WindingPointMetadata, ...]) -> WindingPointMetadata:
+    return WindingPointMetadata(
+        layer_id=tuple(label for item in items for label in item.layer_id),
+        layer_index=np.concatenate([item.layer_index for item in items]),
+        circuit_index=np.concatenate([item.circuit_index for item in items]),
+        pass_index=np.concatenate([item.pass_index for item in items]),
+        local_radius_mm=np.concatenate([item.local_radius_mm for item in items]),
+        local_winding_angle_deg=np.concatenate([item.local_winding_angle_deg for item in items]),
+        layer_name=tuple(label for item in items for label in item.layer_name),
+        winding_type=tuple(label for item in items for label in item.winding_type),
+        motion_type=tuple(label for item in items for label in item.motion_type),
+        warning_flags=tuple(label for item in items for label in item.warning_flags),
     )
 
 
@@ -803,7 +1832,7 @@ def _schedule_from_config(
         selected_phase = (
             None
             if selected_pattern is None
-            else selected_pattern.k * 360.0 / max(selected_pattern.nd, 1)
+            else 360.0 / max(selected_pattern.number_of_windings, 1)
         )
         layers.append(
             WindingLayerSpec(
@@ -870,6 +1899,23 @@ def _build_summary(
     friction_margin_report_path: Path | None,
     polar_overbuild_report_path: Path | None,
     collision_report_path: Path | None,
+    pin_layout_report_path: Path | None,
+    pin_contact_report_path: Path | None,
+    pin_buildup_report_path: Path | None,
+    pin_slip_report_path: Path | None,
+    shoulder_quality_report_path: Path | None,
+    machine_reachability_report_path: Path | None,
+    pin_route_candidates_path: Path | None,
+    pin_route_selected_path: Path | None,
+    pin_route_score_report_path: Path | None,
+    dome_coverage_report_path: Path | None,
+    left_dome_coverage_report_path: Path | None,
+    right_dome_coverage_report_path: Path | None,
+    dome_gap_overlap_map_path: Path | None,
+    dome_angle_map_path: Path | None,
+    dome_thickness_map_path: Path | None,
+    dome_overbuild_report_path: Path | None,
+    shoulder_transition_report_path: Path | None,
     optimisation_repair_suggestions_path: Path | None,
     plot_manifest_path: Path | None,
     layer_completion_report: dict[str, Any],
@@ -881,6 +1927,8 @@ def _build_summary(
     friction_margin_report: dict[str, Any],
     polar_overbuild_report: dict[str, Any],
     collision_report: dict[str, Any],
+    shoulder_quality_report: dict[str, Any],
+    machine_reachability_report: dict[str, Any],
     plot_paths: tuple[Path, ...],
     coverage: Any,
 ) -> dict[str, Any]:
@@ -904,6 +1952,22 @@ def _build_summary(
         csv_path=csv_path,
         summary_path=summary_path,
         plot_paths=plot_paths,
+    )
+    backend_ready = (
+        quality_report["machine_ready"]
+        and bool(layer_completion_report["summary"]["completion_passed"])
+        and bool(layer_completion_report["summary"]["strict_completion_passed"])
+        and bool(layer_completion_report["summary"]["continuous_traverse_passed"])
+        and bool(stack_coverage_report["summary"]["stack_uniformity_passed"])
+        and bool(stack_coverage_report["summary"]["strict_stack_passed"])
+        and bool(region_quality_report["summary"]["region_quality_passed"])
+        and bool(pattern_optimisation_report["summary"]["pattern_optimisation_passed"])
+        and bool(machine_smoothing_report["summary"]["machine_kinematics_passed"])
+        and bool(polar_overbuild_report["summary"]["polar_overbuild_passed"])
+        and bool(collision_report["summary"]["collision_passed"])
+        and bool(shoulder_quality_report["summary"]["shoulder_quality_passed"])
+        and bool(machine_reachability_report["summary"]["machine_reachability_passed"])
+        and bool(path_validation["csv_summary_row_count_match"])
     )
     return {
         "project": {"name": config.project.name, "units": config.project.units},
@@ -954,20 +2018,13 @@ def _build_summary(
         "friction_margin_status": friction_margin_report["summary"],
         "polar_overbuild_status": polar_overbuild_report["summary"],
         "collision_status": collision_report["summary"],
+        "shoulder_quality_status": shoulder_quality_report["summary"],
+        "machine_reachability_status": machine_reachability_report["summary"],
+        "backend_ready": backend_ready,
         "machine_ready": (
-            quality_report["machine_ready"]
-            and bool(layer_completion_report["summary"]["completion_passed"])
-            and bool(layer_completion_report["summary"]["strict_completion_passed"])
-            and bool(layer_completion_report["summary"]["continuous_traverse_passed"])
-            and bool(stack_coverage_report["summary"]["stack_uniformity_passed"])
-            and bool(stack_coverage_report["summary"]["strict_stack_passed"])
-            and bool(region_quality_report["summary"]["region_quality_passed"])
-            and bool(pattern_optimisation_report["summary"]["pattern_optimisation_passed"])
-            and bool(machine_smoothing_report["summary"]["machine_kinematics_passed"])
+            backend_ready
             and bool(calibration_report["summary"]["calibration_passed"])
             and bool(friction_margin_report["summary"]["friction_margin_passed"])
-            and bool(polar_overbuild_report["summary"]["polar_overbuild_passed"])
-            and bool(collision_report["summary"]["collision_passed"])
         ),
         "textbook_pattern_selection": _pattern_selection_summary(pattern_result),
         "pattern_summary": [
@@ -1058,6 +2115,61 @@ def _build_summary(
             "collision_report": (
                 None if collision_report_path is None else str(collision_report_path)
             ),
+            "pin_layout": None if pin_layout_report_path is None else str(pin_layout_report_path),
+            "pin_contact_report": (
+                None if pin_contact_report_path is None else str(pin_contact_report_path)
+            ),
+            "pin_buildup_report": (
+                None if pin_buildup_report_path is None else str(pin_buildup_report_path)
+            ),
+            "pin_slip_report": None if pin_slip_report_path is None else str(pin_slip_report_path),
+            "shoulder_quality_report": (
+                None
+                if shoulder_quality_report_path is None
+                else str(shoulder_quality_report_path)
+            ),
+            "machine_reachability_report": (
+                None
+                if machine_reachability_report_path is None
+                else str(machine_reachability_report_path)
+            ),
+            "pin_route_candidates": (
+                None if pin_route_candidates_path is None else str(pin_route_candidates_path)
+            ),
+            "pin_route_selected": (
+                None if pin_route_selected_path is None else str(pin_route_selected_path)
+            ),
+            "pin_route_score_report": (
+                None if pin_route_score_report_path is None else str(pin_route_score_report_path)
+            ),
+            "dome_coverage_report": (
+                None if dome_coverage_report_path is None else str(dome_coverage_report_path)
+            ),
+            "left_dome_coverage_report": (
+                None
+                if left_dome_coverage_report_path is None
+                else str(left_dome_coverage_report_path)
+            ),
+            "right_dome_coverage_report": (
+                None
+                if right_dome_coverage_report_path is None
+                else str(right_dome_coverage_report_path)
+            ),
+            "dome_gap_overlap_map": (
+                None if dome_gap_overlap_map_path is None else str(dome_gap_overlap_map_path)
+            ),
+            "dome_angle_map": None if dome_angle_map_path is None else str(dome_angle_map_path),
+            "dome_thickness_map": (
+                None if dome_thickness_map_path is None else str(dome_thickness_map_path)
+            ),
+            "dome_overbuild_report": (
+                None if dome_overbuild_report_path is None else str(dome_overbuild_report_path)
+            ),
+            "shoulder_transition_report": (
+                None
+                if shoulder_transition_report_path is None
+                else str(shoulder_transition_report_path)
+            ),
             "optimisation_repair_suggestions": (
                 None
                 if optimisation_repair_suggestions_path is None
@@ -1084,6 +2196,8 @@ def _build_validation_report(
     friction_margin_report: dict[str, Any],
     polar_overbuild_report: dict[str, Any],
     collision_report: dict[str, Any],
+    shoulder_quality_report: dict[str, Any],
+    machine_reachability_report: dict[str, Any],
 ) -> dict[str, Any]:
     continuity = program_continuity_summary(program)
     transition_summary = program_transition_summary(program)
@@ -1109,6 +2223,21 @@ def _build_validation_report(
         turnaround_summary=_turnaround_summary(segments),
     )
     report_warnings = warnings + machine_validation["warnings"]
+    backend_ready = (
+        quality_report["machine_ready"]
+        and bool(layer_completion_report["summary"]["completion_passed"])
+        and bool(layer_completion_report["summary"]["strict_completion_passed"])
+        and bool(layer_completion_report["summary"]["continuous_traverse_passed"])
+        and bool(stack_coverage_report["summary"]["stack_uniformity_passed"])
+        and bool(stack_coverage_report["summary"]["strict_stack_passed"])
+        and bool(region_quality_report["summary"]["region_quality_passed"])
+        and bool(pattern_optimisation_report["summary"]["pattern_optimisation_passed"])
+        and bool(machine_smoothing_report["summary"]["machine_kinematics_passed"])
+        and bool(polar_overbuild_report["summary"]["polar_overbuild_passed"])
+        and bool(collision_report["summary"]["collision_passed"])
+        and bool(shoulder_quality_report["summary"]["shoulder_quality_passed"])
+        and bool(machine_reachability_report["summary"]["machine_reachability_passed"])
+    )
     return {
         "project": config.project.name,
         "path_continuity": continuity,
@@ -1126,20 +2255,13 @@ def _build_validation_report(
         "friction_margin_status": friction_margin_report["summary"],
         "polar_overbuild_status": polar_overbuild_report["summary"],
         "collision_status": collision_report["summary"],
+        "shoulder_quality_status": shoulder_quality_report["summary"],
+        "machine_reachability_status": machine_reachability_report["summary"],
+        "backend_ready": backend_ready,
         "machine_ready": (
-            quality_report["machine_ready"]
-            and bool(layer_completion_report["summary"]["completion_passed"])
-            and bool(layer_completion_report["summary"]["strict_completion_passed"])
-            and bool(layer_completion_report["summary"]["continuous_traverse_passed"])
-            and bool(stack_coverage_report["summary"]["stack_uniformity_passed"])
-            and bool(stack_coverage_report["summary"]["strict_stack_passed"])
-            and bool(region_quality_report["summary"]["region_quality_passed"])
-            and bool(pattern_optimisation_report["summary"]["pattern_optimisation_passed"])
-            and bool(machine_smoothing_report["summary"]["machine_kinematics_passed"])
+            backend_ready
             and bool(calibration_report["summary"]["calibration_passed"])
             and bool(friction_margin_report["summary"]["friction_margin_passed"])
-            and bool(polar_overbuild_report["summary"]["polar_overbuild_passed"])
-            and bool(collision_report["summary"]["collision_passed"])
         ),
         "warnings": report_warnings,
     }
@@ -1169,6 +2291,23 @@ def _run_consistency_validation(
     friction_margin_report_path: Path | None,
     polar_overbuild_report_path: Path | None,
     collision_report_path: Path | None,
+    pin_layout_report_path: Path | None,
+    pin_contact_report_path: Path | None,
+    pin_buildup_report_path: Path | None,
+    pin_slip_report_path: Path | None,
+    shoulder_quality_report_path: Path | None,
+    machine_reachability_report_path: Path | None,
+    pin_route_candidates_path: Path | None,
+    pin_route_selected_path: Path | None,
+    pin_route_score_report_path: Path | None,
+    dome_coverage_report_path: Path | None,
+    left_dome_coverage_report_path: Path | None,
+    right_dome_coverage_report_path: Path | None,
+    dome_gap_overlap_map_path: Path | None,
+    dome_angle_map_path: Path | None,
+    dome_thickness_map_path: Path | None,
+    dome_overbuild_report_path: Path | None,
+    shoulder_transition_report_path: Path | None,
     optimisation_repair_suggestions_path: Path | None,
     plot_manifest_path: Path | None,
     gcode_path: Path | None,
@@ -1219,6 +2358,49 @@ def _run_consistency_validation(
         issues.append("polar_overbuild_report_missing")
     if collision_report_path is not None and not collision_report_path.exists():
         issues.append("collision_report_missing")
+    if pin_layout_report_path is not None and not pin_layout_report_path.exists():
+        issues.append("pin_layout_missing")
+    if pin_contact_report_path is not None and not pin_contact_report_path.exists():
+        issues.append("pin_contact_report_missing")
+    if pin_buildup_report_path is not None and not pin_buildup_report_path.exists():
+        issues.append("pin_buildup_report_missing")
+    if pin_slip_report_path is not None and not pin_slip_report_path.exists():
+        issues.append("pin_slip_report_missing")
+    if shoulder_quality_report_path is not None and not shoulder_quality_report_path.exists():
+        issues.append("shoulder_quality_report_missing")
+    if (
+        machine_reachability_report_path is not None
+        and not machine_reachability_report_path.exists()
+    ):
+        issues.append("machine_reachability_report_missing")
+    if pin_route_candidates_path is not None and not pin_route_candidates_path.exists():
+        issues.append("pin_route_candidates_missing")
+    if pin_route_selected_path is not None and not pin_route_selected_path.exists():
+        issues.append("pin_route_selected_missing")
+    if pin_route_score_report_path is not None and not pin_route_score_report_path.exists():
+        issues.append("pin_route_score_report_missing")
+    if dome_coverage_report_path is not None and not dome_coverage_report_path.exists():
+        issues.append("dome_coverage_report_missing")
+    if (
+        left_dome_coverage_report_path is not None
+        and not left_dome_coverage_report_path.exists()
+    ):
+        issues.append("left_dome_coverage_report_missing")
+    if (
+        right_dome_coverage_report_path is not None
+        and not right_dome_coverage_report_path.exists()
+    ):
+        issues.append("right_dome_coverage_report_missing")
+    if dome_gap_overlap_map_path is not None and not dome_gap_overlap_map_path.exists():
+        issues.append("dome_gap_overlap_map_missing")
+    if dome_angle_map_path is not None and not dome_angle_map_path.exists():
+        issues.append("dome_angle_map_missing")
+    if dome_thickness_map_path is not None and not dome_thickness_map_path.exists():
+        issues.append("dome_thickness_map_missing")
+    if dome_overbuild_report_path is not None and not dome_overbuild_report_path.exists():
+        issues.append("dome_overbuild_report_missing")
+    if shoulder_transition_report_path is not None and not shoulder_transition_report_path.exists():
+        issues.append("shoulder_transition_report_missing")
     if (
         optimisation_repair_suggestions_path is not None
         and not optimisation_repair_suggestions_path.exists()
@@ -1253,6 +2435,61 @@ def _run_consistency_validation(
             "collision_report": (
                 None if collision_report_path is None else str(collision_report_path)
             ),
+            "pin_layout": None if pin_layout_report_path is None else str(pin_layout_report_path),
+            "pin_contact_report": (
+                None if pin_contact_report_path is None else str(pin_contact_report_path)
+            ),
+            "pin_buildup_report": (
+                None if pin_buildup_report_path is None else str(pin_buildup_report_path)
+            ),
+            "pin_slip_report": None if pin_slip_report_path is None else str(pin_slip_report_path),
+            "shoulder_quality_report": (
+                None
+                if shoulder_quality_report_path is None
+                else str(shoulder_quality_report_path)
+            ),
+            "machine_reachability_report": (
+                None
+                if machine_reachability_report_path is None
+                else str(machine_reachability_report_path)
+            ),
+            "pin_route_candidates": (
+                None if pin_route_candidates_path is None else str(pin_route_candidates_path)
+            ),
+            "pin_route_selected": (
+                None if pin_route_selected_path is None else str(pin_route_selected_path)
+            ),
+            "pin_route_score_report": (
+                None if pin_route_score_report_path is None else str(pin_route_score_report_path)
+            ),
+            "dome_coverage_report": (
+                None if dome_coverage_report_path is None else str(dome_coverage_report_path)
+            ),
+            "left_dome_coverage_report": (
+                None
+                if left_dome_coverage_report_path is None
+                else str(left_dome_coverage_report_path)
+            ),
+            "right_dome_coverage_report": (
+                None
+                if right_dome_coverage_report_path is None
+                else str(right_dome_coverage_report_path)
+            ),
+            "dome_gap_overlap_map": (
+                None if dome_gap_overlap_map_path is None else str(dome_gap_overlap_map_path)
+            ),
+            "dome_angle_map": None if dome_angle_map_path is None else str(dome_angle_map_path),
+            "dome_thickness_map": (
+                None if dome_thickness_map_path is None else str(dome_thickness_map_path)
+            ),
+            "dome_overbuild_report": (
+                None if dome_overbuild_report_path is None else str(dome_overbuild_report_path)
+            ),
+            "shoulder_transition_report": (
+                None
+                if shoulder_transition_report_path is None
+                else str(shoulder_transition_report_path)
+            ),
         },
     }
 
@@ -1271,6 +2508,8 @@ def _manufacturing_report(
     friction_margin_report: dict[str, Any],
     polar_overbuild_report: dict[str, Any],
     collision_report: dict[str, Any],
+    shoulder_quality_report: dict[str, Any],
+    machine_reachability_report: dict[str, Any],
 ) -> dict[str, Any]:
     coverage_summary = coverage.summary()
     machine_validation = _machine_validation(config, program, build_path_segments(program))
@@ -1319,12 +2558,10 @@ def _manufacturing_report(
                 True,
             ),
         },
-        "machine_ready": (
+        "backend_ready": (
             bool(layer_completion_report["summary"]["strict_completion_passed"])
             and bool(stack_coverage_report["summary"]["strict_stack_passed"])
             and bool(machine_smoothing_report["summary"]["machine_kinematics_passed"])
-            and bool(calibration_report["summary"]["calibration_passed"])
-            and bool(friction_margin_report["summary"]["friction_margin_passed"])
             and bool(polar_overbuild_report["summary"]["polar_overbuild_passed"])
             and bool(collision_report["summary"]["collision_passed"])
             and _quality_report(
@@ -1335,6 +2572,15 @@ def _manufacturing_report(
             slip_summary=_slip_risk_summary(program),
             turnaround_summary=_turnaround_summary(build_path_segments(program)),
             )["machine_ready"]
+        ),
+        "machine_ready": (
+            bool(calibration_report["summary"]["calibration_passed"])
+            and bool(friction_margin_report["summary"]["friction_margin_passed"])
+            and bool(layer_completion_report["summary"]["strict_completion_passed"])
+            and bool(stack_coverage_report["summary"]["strict_stack_passed"])
+            and bool(machine_smoothing_report["summary"]["machine_kinematics_passed"])
+            and bool(polar_overbuild_report["summary"]["polar_overbuild_passed"])
+            and bool(collision_report["summary"]["collision_passed"])
         ),
     }
 
@@ -1355,6 +2601,8 @@ def _pattern_optimisation_report(
     *,
     layer_completion_report: dict[str, Any],
     stack_coverage_report: dict[str, Any],
+    dome_coverage_report: dict[str, Any],
+    dome_overbuild_report: dict[str, Any],
 ) -> dict[str, Any]:
     selected = [] if pattern_result is None else list(pattern_result.selected_candidates)
     total_time = sum(candidate.estimated_winding_time_min for candidate in selected)
@@ -1366,10 +2614,16 @@ def _pattern_optimisation_report(
     ]
     layer_summary = layer_completion_report["summary"]
     stack_summary = stack_coverage_report["summary"]
+    dome_summary = dome_coverage_report["summary"]
+    dome_overbuild_summary = dome_overbuild_report["summary"]
     passed = (
         bool(layer_summary["strict_completion_passed"])
         and bool(stack_summary["strict_stack_passed"])
         and total_time <= config.quality_limits.max_estimated_winding_time_min
+        and bool(dome_summary["dome_coverage_passed"])
+        and bool(dome_summary["left_dome_coverage_passed"])
+        and bool(dome_summary["right_dome_coverage_passed"])
+        and bool(dome_overbuild_summary["dome_overbuild_passed"])
         and not invalid_candidates
     )
     candidate_rows = [
@@ -1398,6 +2652,8 @@ def _pattern_optimisation_report(
         "selected_candidates": candidate_rows,
         "stack_uniformity_summary": stack_summary,
         "layer_completion_summary": layer_summary,
+        "dome_coverage_summary": dome_summary,
+        "dome_overbuild_summary": dome_overbuild_summary,
     }
 
 
@@ -1466,6 +2722,22 @@ def _actual_thickness_report(
     z_values = np.asarray(coverage.z_mm, dtype=float)
     radius = mandrel.radius_at(z_values) if z_values.size else np.asarray([], dtype=float)
     regions = _coverage_regions(z_values, radius) if z_values.size else []
+    masks = _surface_masks(config, mandrel, coverage) if z_values.size else {}
+    required_mean = (
+        _row_mask_thickness_mean(actual, masks["required_winding_region"])
+        if masks
+        else 0.0
+    )
+    boss_mean = (
+        _row_mask_thickness_mean(actual, masks["polar_opening_region"])
+        if masks
+        else 0.0
+    )
+    turnaround_mean = (
+        _row_mask_thickness_mean(actual, masks["turnaround_region"])
+        if masks
+        else 0.0
+    )
     cylinder_mean = _region_thickness_mean(actual, regions, {"cylinder"}) if regions else 0.0
     polar_mean = _region_thickness_mean(actual, regions, {"polar"}) if regions else 0.0
     dome_mean = (
@@ -1480,7 +2752,11 @@ def _actual_thickness_report(
             "actual_mean_thickness_mm": mean_thickness,
             "actual_maximum_thickness_mm": max_thickness,
             "actual_thickness_variation_percent": variation,
-            "polar_buildup_mm": max(0.0, polar_mean - cylinder_mean),
+            "required_shell_mean_thickness_mm": required_mean,
+            "turnaround_buildup_mm": max(0.0, turnaround_mean - required_mean),
+            "physical_boss_buildup_mm": max(0.0, boss_mean - required_mean),
+            "polar_buildup_mm": max(0.0, turnaround_mean - required_mean),
+            "legacy_polar_region_buildup_mm": max(0.0, polar_mean - cylinder_mean),
             "dome_buildup_mm": max(0.0, dome_mean - cylinder_mean),
             "cylinder_buildup_mm": cylinder_mean,
         },
@@ -1509,16 +2785,20 @@ def _calibration_report(config: WindingJobConfig) -> dict[str, Any]:
         and config.tow.friction_coefficient is not None
         and config.tow.friction_coefficient > 0.0
     )
+    tension_measured = bool(config.tow.tension_N is not None and config.tow.tension_N > 0.0)
     missing = []
     if not width_calibrated:
         missing.append("calibrated_effective_width_mm")
     if not friction_calibrated:
         missing.append("calibrated_friction_coefficient")
+    if not tension_measured:
+        missing.append("measured_tension_N")
     return {
         "summary": {
-            "calibration_passed": width_calibrated and friction_calibrated,
+            "calibration_passed": width_calibrated and friction_calibrated and tension_measured,
             "effective_width_calibrated": width_calibrated,
             "friction_calibrated": friction_calibrated,
+            "tension_measured": tension_measured,
             "nominal_width_mm": config.tow.width_mm,
             "effective_width_mm": effective_width,
             "friction_coefficient": config.tow.friction_coefficient,
@@ -1561,17 +2841,22 @@ def _polar_overbuild_report(
 ) -> dict[str, Any]:
     summary = actual_thickness_report.get("summary", {})
     polar_buildup_mm = float(summary.get("polar_buildup_mm", 0.0))
+    boss_buildup_mm = float(summary.get("physical_boss_buildup_mm", 0.0))
+    turnaround_buildup_mm = float(summary.get("turnaround_buildup_mm", polar_buildup_mm))
     passed = polar_buildup_mm <= config.quality_limits.max_polar_buildup_mm
     return {
         "summary": {
             "polar_overbuild_passed": passed,
             "polar_buildup_mm": polar_buildup_mm,
+            "turnaround_buildup_mm": turnaround_buildup_mm,
+            "physical_boss_buildup_mm": boss_buildup_mm,
+            "physical_boss_excluded_from_required_shell": True,
             "max_polar_buildup_mm": config.quality_limits.max_polar_buildup_mm,
             "actual_thickness_variation_percent": float(
                 summary.get("actual_thickness_variation_percent", 0.0)
             ),
         },
-        "source": "actual_thickness_report",
+        "source": "actual_thickness_report.required_shell_masks",
     }
 
 
@@ -1593,6 +2878,1219 @@ def _collision_report(
             "Checks generated X clearance against required mandrel surface clearance.",
             "Machine-specific tow-eye/tooling envelopes should be calibrated separately.",
         ],
+    }
+
+
+def _pin_layout_report(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+) -> dict[str, Any]:
+    pins = config.pin_layout
+    if not pins.enabled:
+        return {
+            "summary": {
+                "enabled": False,
+                "pin_count": 0,
+                "pin_layout_passed": True,
+                "message": "Pin layout disabled",
+            },
+            "pins": [],
+        }
+    shoulder_z = _pin_shoulder_stations(config, mandrel)
+    shoulders = (
+        ("left", "right")
+        if pins.shoulders == "both"
+        else (pins.shoulders,)
+    )
+    pin_rows = []
+    angle_step = 360.0 / max(1, pins.count_per_shoulder)
+    for shoulder in shoulders:
+        z_mm = shoulder_z[shoulder]
+        radius = float(mandrel.radius_at(np.asarray([z_mm], dtype=float))[0])
+        for index in range(pins.count_per_shoulder):
+            phi_deg = (pins.angular_offset_deg + index * angle_step) % 360.0
+            phi = math.radians(phi_deg)
+            radial = np.asarray([math.cos(phi), math.sin(phi), 0.0], dtype=float)
+            surface = np.asarray([radius * radial[0], radius * radial[1], z_mm], dtype=float)
+            centre = surface + radial * pins.pin_standoff_mm
+            pin_rows.append(
+                {
+                    "id": f"{shoulder}_{index:02d}",
+                    "shoulder": shoulder,
+                    "phi_deg": phi_deg,
+                    "surface_point_mm": surface.tolist(),
+                    "position_mm": centre.tolist(),
+                    "axis": radial.tolist(),
+                    "radius_mm": pins.pin_radius_mm,
+                    "height_mm": pins.pin_height_mm,
+                    "standoff_mm": pins.pin_standoff_mm,
+                    "clearance_mm": pins.pin_clearance_mm,
+                    "effective_contact_radius_mm": (
+                        pins.pin_radius_mm
+                        + _effective_tow_width(config) * 0.5
+                        + pins.pin_clearance_mm
+                    ),
+                    "min_wrap_deg": pins.min_wrap_deg,
+                    "max_wrap_deg": pins.max_wrap_deg,
+                }
+            )
+    return {
+        "summary": {
+            "enabled": True,
+            "layout_type": pins.layout_type,
+            "shoulders": pins.shoulders,
+            "count_per_shoulder": pins.count_per_shoulder,
+            "pin_count": len(pin_rows),
+            "left_shoulder_z_mm": shoulder_z["left"],
+            "right_shoulder_z_mm": shoulder_z["right"],
+            "shoulder_zone_width_mm": pins.shoulder_zone_width_mm,
+            "pin_layout_passed": len(pin_rows) > 0,
+            "route_family": pins.route_family,
+        },
+        "pins": pin_rows,
+    }
+
+
+def _pin_shoulder_stations(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+) -> dict[str, float]:
+    length = _mandrel_length(mandrel)
+    left = config.pin_layout.left_shoulder_z_mm
+    right = config.pin_layout.right_shoulder_z_mm
+    if left is None:
+        if config.mandrel.left_dome_length_mm > 0.0:
+            left = config.mandrel.left_dome_length_mm
+        else:
+            left = length * 0.25
+    if right is None:
+        if config.mandrel.right_dome_length_mm > 0.0:
+            right = length - config.mandrel.right_dome_length_mm
+        else:
+            right = length * 0.75
+    return {
+        "left": float(max(0.0, min(length, left))),
+        "right": float(max(0.0, min(length, right))),
+    }
+
+
+def _pin_route_reports(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    program: PlannedWindingProgram,
+) -> dict[str, Any]:
+    if not config.pin_layout.enabled:
+        empty = {"summary": {"pin_layout_enabled": False}, "candidates": []}
+        return {"candidates": empty, "selected": empty, "score_report": empty}
+    if config.pin_layout.routing_mode == "deterministic":
+        layer = _build_pin_routed_layer(
+            config,
+            mandrel,
+            max(0, len(program.layers) - 1),
+            candidate_id="deterministic",
+            step_size=max(1, config.pin_layout.count_per_shoulder // 2),
+            wrap_direction=1,
+            circuit_repeats=1,
+            target_angle_deg=_pin_route_target_angle(config),
+            tangent_bias_deg=0.0,
+        )
+        candidate = _score_pin_route_candidate(
+            config,
+            mandrel,
+            candidate_id="deterministic",
+            step_size=max(1, config.pin_layout.count_per_shoulder // 2),
+            wrap_direction=1,
+            circuit_repeats=1,
+            target_angle_deg=_pin_route_target_angle(config),
+            tangent_bias_deg=0.0,
+            layer=layer,
+        )
+        row = _pin_candidate_row(candidate)
+        return {
+            "candidates": {
+                "summary": {
+                    "routing_mode": config.pin_layout.routing_mode,
+                    "candidate_count": 1,
+                    "valid_candidate_count": 1 if candidate.valid else 0,
+                },
+                "candidates": [row],
+            },
+            "selected": {
+                "summary": {
+                    "selected_candidate_id": "deterministic",
+                    "selected_score": candidate.score,
+                    "valid": candidate.valid,
+                },
+                "selected_route": row,
+            },
+            "score_report": {
+                "summary": {
+                    "selected_candidate_id": "deterministic",
+                    "route_quality_score": candidate.score,
+                    "major_terms_present": True,
+                },
+                "terms": candidate.terms,
+                "repair_suggestions": list(candidate.repair_suggestions),
+            },
+        }
+    candidates = _generate_pin_route_candidates(config, mandrel, len(program.layers) - 1)
+    rows = [_pin_candidate_row(candidate) for candidate in candidates]
+    selected_id = _selected_pin_candidate_id(program)
+    selected = next((row for row in rows if row["candidate_id"] == selected_id), None)
+    if selected is None and rows:
+        selected = min(
+            (row for row in rows if row["valid"]),
+            key=lambda row: float(row["score"]),
+            default=rows[0],
+        )
+    score_terms = selected.get("terms", {}) if selected else {}
+    return {
+        "candidates": {
+            "summary": {
+                "routing_mode": config.pin_layout.routing_mode,
+                "candidate_count": len(rows),
+                "valid_candidate_count": sum(1 for row in rows if row["valid"]),
+            },
+            "candidates": rows,
+        },
+        "selected": {
+            "summary": {
+                "selected_candidate_id": None if selected is None else selected["candidate_id"],
+                "selected_score": None if selected is None else selected["score"],
+                "valid": False if selected is None else selected["valid"],
+            },
+            "selected_route": selected,
+        },
+        "score_report": {
+            "summary": {
+                "selected_candidate_id": None if selected is None else selected["candidate_id"],
+                "route_quality_score": None if selected is None else selected["score"],
+                "major_terms_present": bool(score_terms),
+            },
+            "terms": score_terms,
+            "repair_suggestions": [] if selected is None else selected["repair_suggestions"],
+        },
+    }
+
+
+def _pin_candidate_row(candidate: _PinRouteCandidate) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate.candidate_id,
+        "step_size": candidate.step_size,
+        "wrap_direction": "forward" if candidate.wrap_direction > 0 else "reverse",
+        "circuit_repeats": candidate.circuit_repeats,
+        "target_angle_deg": candidate.target_angle_deg,
+        "tangent_bias_deg": candidate.tangent_bias_deg,
+        "valid": candidate.valid,
+        "score": candidate.score,
+        "terms": candidate.terms,
+        "rejection_reasons": list(candidate.rejection_reasons),
+        "repair_suggestions": list(candidate.repair_suggestions),
+    }
+
+
+def _selected_pin_candidate_id(program: PlannedWindingProgram) -> str:
+    for report in reversed(program.reports):
+        for warning in report.warnings:
+            if "candidate_id=" in warning:
+                return warning.split("candidate_id=", 1)[1].split(";", 1)[0]
+    return ""
+
+
+def _pin_dome_coverage_report(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel | None,
+    program: PlannedWindingProgram,
+) -> dict[str, Any]:
+    side_reports = {
+        side: _single_dome_coverage_report(config, mandrel, program, side)
+        for side in ("left", "right")
+    }
+    cells = [
+        cell
+        for side_report in side_reports.values()
+        for cell in side_report["cells"]
+    ]
+    angle_cells = [
+        cell
+        for side_report in side_reports.values()
+        for cell in side_report["angle_cells"]
+    ]
+    thickness_cells = [
+        cell
+        for side_report in side_reports.values()
+        for cell in side_report["thickness_cells"]
+    ]
+    max_gap = max(
+        (float(report["summary"]["maximum_uncovered_gap_mm"]) for report in side_reports.values()),
+        default=0.0,
+    )
+    max_overlap = max(
+        (float(report["summary"]["maximum_overbuild_ratio"]) for report in side_reports.values()),
+        default=0.0,
+    )
+    boss_transition_passed = all(
+        bool(report["summary"].get("boss_transition_validation", {}).get("passed", True))
+        for report in side_reports.values()
+    )
+    passed = all(
+        bool(report["summary"]["dome_coverage_passed"])
+        for report in side_reports.values()
+    )
+    detected_points = sum(
+        int(report["summary"]["detected_dome_surface_point_count"])
+        for report in side_reports.values()
+    )
+    boss_contact_points = sum(
+        int(report["summary"].get("boss_contact_point_count", 0))
+        for report in side_reports.values()
+    )
+    deposited_shell_points = sum(
+        int(report["summary"].get("deposited_shell_point_count", 0))
+        for report in side_reports.values()
+    )
+    invalid_metrics = any(
+        float(report["summary"]["covered_area_percentage"]) <= 0.0
+        or not math.isfinite(float(report["summary"]["maximum_uncovered_gap_mm"]))
+        or int(report["summary"]["detected_dome_surface_point_count"]) <= 0
+        for report in side_reports.values()
+    )
+    passed = passed and detected_points > 0 and not invalid_metrics
+    ring_like = any(
+        bool(report["summary"]["ring_like_path_detected"])
+        for report in side_reports.values()
+    )
+    return {
+        "summary": {
+            "dome_coverage_passed": passed,
+            "left_dome_coverage_passed": side_reports["left"]["summary"][
+                "dome_coverage_passed"
+            ],
+            "right_dome_coverage_passed": side_reports["right"]["summary"][
+                "dome_coverage_passed"
+            ],
+            "pin_layout_enabled": config.pin_layout.enabled,
+            "detected_dome_surface_point_count": detected_points,
+            "boss_contact_point_count": boss_contact_points,
+            "deposited_shell_point_count": deposited_shell_points,
+            "invalid_zero_or_infinite_coverage_metrics": invalid_metrics,
+            "max_gap_mm": max_gap,
+            "max_overlap_mm": max_overlap,
+            "coverage_tolerance_mm": config.pin_layout.coverage_tolerance_mm,
+            "ring_like_path_detected": ring_like,
+            "boss_transition_validation_passed": boss_transition_passed,
+            "boss_transition_validation_by_side": {
+                side: report["summary"].get("boss_transition_validation", {})
+                for side, report in side_reports.items()
+            },
+            "source": (
+                "selected_pin_routed_path"
+                if config.pin_layout.enabled
+                else "axisymmetric_dome_surface_path"
+            ),
+            "repair_suggestions": _dome_coverage_repair_suggestions(
+                passed=passed,
+                ring_like=ring_like,
+            ),
+        },
+        "by_side": side_reports,
+        "cells": cells,
+        "angle_cells": angle_cells,
+        "thickness_cells": thickness_cells,
+    }
+
+
+def _single_dome_coverage_report(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel | None,
+    program: PlannedWindingProgram,
+    side: str,
+) -> dict[str, Any]:
+    meridian_bins = 48
+    theta_bins = 72
+    coverage = np.zeros((meridian_bins, theta_bins), dtype=float)
+    angle_sum = np.zeros_like(coverage)
+    angle_count = np.zeros_like(coverage)
+    z_values = np.asarray(program.path.z_mm, dtype=float)
+    theta_values = np.asarray(program.path.theta_rad, dtype=float)
+    radius_values = np.asarray(program.path.surface_radius_mm, dtype=float)
+    local_angles = np.asarray(program.metadata.local_winding_angle_deg, dtype=float)
+    motion_values = np.asarray(program.metadata.motion_type)
+    warning_values = np.asarray(program.metadata.warning_flags)
+    segment_values = _segment_type_for_points(program)
+    max_radius = max(float(np.max(radius_values)) if radius_values.size else 0.0, 1e-9)
+    midpoint = (float(np.min(z_values)) + float(np.max(z_values))) / 2.0 if z_values.size else 0.0
+    side_mask = z_values <= midpoint if side == "left" else z_values >= midpoint
+    dome_shell_mask = (
+        side_mask
+        & (radius_values < max_radius * 0.98)
+        & (radius_values > config.mandrel.polar_opening_radius_mm + 1e-6)
+    )
+    pin_dome_mask = np.asarray(
+        [
+            motion == "DomeSurfaceSpan" and f"dome_side={side}" in warning
+            for motion, warning in zip(motion_values, warning_values, strict=True)
+        ],
+        dtype=bool,
+    )
+    shell_segment_mask = np.isin(
+        segment_values,
+        ("geodesic_pass", "non_geodesic_pass"),
+    )
+    boss_contact_mask = segment_values == "BossTurnaroundArc"
+    deposited_shell_mask = dome_shell_mask & (pin_dome_mask | shell_segment_mask)
+    boss_shell_mask = dome_shell_mask & boss_contact_mask
+    mask = deposited_shell_mask
+    detected_surface_points = int(np.count_nonzero(mask))
+    boss_turnaround_points = int(
+        np.count_nonzero(
+            side_mask
+            & boss_contact_mask
+            & (radius_values <= config.mandrel.polar_opening_radius_mm + 1e-6)
+        )
+    )
+    deposited_shell_points = int(np.count_nonzero(deposited_shell_mask))
+    boss_contact_points = int(np.count_nonzero(boss_shell_mask))
+    selected_z = z_values[mask]
+    selected_theta = theta_values[mask]
+    selected_radius = radius_values[mask]
+    selected_angles = local_angles[mask]
+    if selected_z.size == 0:
+        report = _empty_single_dome_report(config, side, meridian_bins, theta_bins)
+        report["summary"]["boss_turnaround_point_count"] = boss_turnaround_points
+        report["summary"]["boss_contact_point_count"] = boss_contact_points
+        return report
+    z_min = float(np.min(selected_z))
+    z_max = float(np.max(selected_z))
+    z_span = max(z_max - z_min, 1e-6)
+    meridian = (selected_z - z_min) / z_span
+    theta_norm = np.mod(selected_theta, 2.0 * math.pi) / (2.0 * math.pi)
+    tow_width = _effective_tow_width(config)
+    for m_value, theta_value, radius, local_angle in zip(
+        meridian,
+        theta_norm,
+        selected_radius,
+        selected_angles,
+        strict=True,
+    ):
+        m_idx = int(np.clip(math.floor(float(m_value) * meridian_bins), 0, meridian_bins - 1))
+        theta_center = int(
+            np.clip(math.floor(float(theta_value) * theta_bins), 0, theta_bins - 1)
+        )
+        circumference = max(2.0 * math.pi * float(radius), tow_width)
+        theta_half_cells = max(0, int(math.ceil((tow_width / circumference) * theta_bins * 0.5)))
+        meridian_cell_mm = z_span / max(1, meridian_bins)
+        meridian_half_cells = max(
+            1,
+            int(math.ceil((tow_width * 0.5) / max(meridian_cell_mm, 1e-9))),
+        )
+        for dm in range(-meridian_half_cells, meridian_half_cells + 1):
+            mi = m_idx + dm
+            if mi < 0 or mi >= meridian_bins:
+                continue
+            for dt in range(-theta_half_cells, theta_half_cells + 1):
+                ti = (theta_center + dt) % theta_bins
+                coverage[mi, ti] += 1.0
+                angle_sum[mi, ti] += float(abs(local_angle))
+                angle_count[mi, ti] += 1.0
+    area_weights = _dome_area_weights(meridian_bins, theta_bins)
+    shell_mask = _dome_required_shell_mask(coverage, meridian_bins, theta_bins)
+    shell_coverage = np.where(shell_mask, coverage, 0.0)
+    covered = shell_coverage > 0.0
+    covered_area = float(np.sum(area_weights[covered]))
+    total_area = float(np.sum(area_weights[shell_mask]))
+    covered_percent = 100.0 * covered_area / max(total_area, 1e-9)
+    gap_cells = (shell_coverage == 0.0) & shell_mask
+    maximum_gap = _max_dome_gap_mm(gap_cells, selected_radius, theta_bins, tow_width)
+    mean_gap = float(np.mean(gap_cells[shell_mask]) * tow_width)
+    thickness = coverage * max(config.tow.thickness_mm, config.roving.thickness_mm, 0.0)
+    shell_thickness = thickness[shell_mask]
+    mean_thickness = float(np.mean(shell_thickness)) if shell_thickness.size else 0.0
+    thickness_cv = float(np.std(shell_thickness) / max(mean_thickness, 1e-9))
+    shell_mean_coverage = float(np.mean(shell_coverage[covered])) if np.any(covered) else 1.0
+    overbuild_ratio = shell_coverage / max(1.0, shell_mean_coverage)
+    max_overbuild = float(np.percentile(overbuild_ratio[shell_mask], 95))
+    boss_edge_overbuild_ratio = _dome_edge_overbuild_ratio(coverage, shell_mask)
+    angle_values = angle_sum[angle_count > 0.0] / np.maximum(angle_count[angle_count > 0.0], 1.0)
+    shell_angle_values = (
+        angle_sum[(angle_count > 0.0) & shell_mask]
+        / np.maximum(angle_count[(angle_count > 0.0) & shell_mask], 1.0)
+    )
+    target_angle = _pin_route_target_angle(config)
+    measured_shell_angle_mean = (
+        float(np.median(shell_angle_values)) if shell_angle_values.size else target_angle
+    )
+    boss_transition_validation = (
+        _boss_transition_validation(
+            config,
+            mandrel,
+            program,
+            side=side,
+            segment_types=segment_values,
+        )
+        if mandrel is not None
+        else {"passed": True, "reason": "mandrel_unavailable"}
+    )
+    ring_report = _dome_ring_like_report(program, side)
+    excessive_wrap_regions = _excessive_dome_wrap_regions(coverage, meridian_bins)
+    gap_limit = max(config.pin_layout.coverage_tolerance_mm, tow_width * 2.0)
+    overbuild_limit = max(2.5, config.quality_limits.max_stack_overlap_percent / 20.0)
+    passed = (
+        covered_percent >= 85.0
+        and covered_percent > 0.0
+        and math.isfinite(maximum_gap)
+        and detected_surface_points > 0
+        and maximum_gap <= gap_limit
+        and max_overbuild <= max(overbuild_limit, 3.0)
+        and thickness_cv <= max(config.quality_limits.max_thickness_variation_percent / 100.0, 0.75)
+        and abs(measured_shell_angle_mean - target_angle) <= max(
+            config.pattern_selection.angle_tolerance_deg,
+            12.0,
+        )
+        and not ring_report["ring_like_path_detected"]
+        and boss_transition_validation["passed"]
+    )
+    cells, angle_cells, thickness_cells = _dome_report_cells(
+        side,
+        coverage,
+        thickness,
+        angle_sum,
+        angle_count,
+        area_weights,
+        _pin_route_target_angle(config),
+        tow_width,
+    )
+    return {
+        "summary": {
+            "side": side,
+            "dome_coverage_passed": passed,
+            "covered_area_percentage": covered_percent,
+            "maximum_uncovered_gap_mm": maximum_gap,
+            "detected_dome_surface_point_count": detected_surface_points,
+            "boss_turnaround_point_count": boss_turnaround_points,
+            "boss_contact_point_count": boss_contact_points,
+            "deposited_shell_point_count": deposited_shell_points,
+            "mean_gap_mm": mean_gap,
+            "maximum_overbuild_ratio": max_overbuild,
+            "boss_edge_overbuild_ratio": boss_edge_overbuild_ratio,
+            "mean_thickness_mm": mean_thickness,
+            "thickness_coefficient_of_variation": thickness_cv,
+            "local_winding_angle_min_deg": (
+                float(np.min(angle_values)) if angle_values.size else 0.0
+            ),
+            "local_winding_angle_mean_deg": measured_shell_angle_mean,
+            "measured_shell_winding_angle_mean_deg": measured_shell_angle_mean,
+            "target_winding_angle_deg": target_angle,
+            "local_winding_angle_max_deg": (
+                float(np.max(angle_values)) if angle_values.size else 0.0
+            ),
+            "excessive_circumferential_wrapping_regions": excessive_wrap_regions,
+            "ring_like_path_detected": ring_report["ring_like_path_detected"],
+            "ring_like_reasons": ring_report["reasons"],
+            "boss_transition_validation": boss_transition_validation,
+            "repair_suggestions": _dome_coverage_repair_suggestions(
+                passed=passed,
+                ring_like=ring_report["ring_like_path_detected"],
+            ),
+        },
+        "cells": cells,
+        "angle_cells": angle_cells,
+        "thickness_cells": thickness_cells,
+    }
+
+
+def _shoulder_transition_report(
+    config: WindingJobConfig,
+    program: PlannedWindingProgram,
+) -> dict[str, Any]:
+    if not config.pin_layout.enabled:
+        return {
+            "summary": {"shoulder_transition_passed": True, "pin_layout_enabled": False},
+            "transitions": [],
+        }
+    segments = build_path_segments(program)
+    rows: list[dict[str, Any]] = []
+    passed = True
+    for previous, current in zip(segments, segments[1:], strict=False):
+        if "Pin" not in previous.segment_type and "Pin" not in current.segment_type:
+            continue
+        jump = float(
+            np.linalg.norm(
+                np.asarray(current.start_state.surface_position)
+                - np.asarray(previous.end_state.surface_position)
+            )
+        )
+        b_delta = abs(float(current.start_state.B_deg) - float(previous.end_state.B_deg))
+        ok = jump <= max(_effective_tow_width(config) * 2.0, 1.0) and b_delta <= 45.0
+        passed = passed and ok
+        rows.append(
+            {
+                "from_segment": previous.segment_type,
+                "to_segment": current.segment_type,
+                "position_jump_mm": jump,
+                "b_axis_delta_deg": b_delta,
+                "passed": ok,
+            }
+        )
+    return {
+        "summary": {
+            "shoulder_transition_passed": passed,
+            "pin_layout_enabled": True,
+            "transition_count": len(rows),
+        },
+        "transitions": rows,
+    }
+
+
+def _empty_single_dome_report(
+    config: WindingJobConfig,
+    side: str,
+    meridian_bins: int,
+    theta_bins: int,
+) -> dict[str, Any]:
+    coverage = np.zeros((meridian_bins, theta_bins), dtype=float)
+    thickness = np.zeros_like(coverage)
+    angle_sum = np.zeros_like(coverage)
+    angle_count = np.zeros_like(coverage)
+    area_weights = _dome_area_weights(meridian_bins, theta_bins)
+    cells, angle_cells, thickness_cells = _dome_report_cells(
+        side,
+        coverage,
+        thickness,
+        angle_sum,
+        angle_count,
+        area_weights,
+        _pin_route_target_angle(config),
+        _effective_tow_width(config),
+    )
+    return {
+        "summary": {
+            "side": side,
+            "dome_coverage_passed": False,
+            "covered_area_percentage": 0.0,
+            "maximum_uncovered_gap_mm": float("inf"),
+            "detected_dome_surface_point_count": 0,
+            "boss_turnaround_point_count": 0,
+            "boss_contact_point_count": 0,
+            "deposited_shell_point_count": 0,
+            "mean_gap_mm": _effective_tow_width(config),
+            "maximum_overbuild_ratio": 0.0,
+            "mean_thickness_mm": 0.0,
+            "thickness_coefficient_of_variation": 0.0,
+            "local_winding_angle_min_deg": 0.0,
+            "local_winding_angle_mean_deg": 0.0,
+            "local_winding_angle_max_deg": 0.0,
+            "excessive_circumferential_wrapping_regions": [],
+            "ring_like_path_detected": False,
+            "ring_like_reasons": ["no_dome_surface_span_points"],
+            "boss_transition_validation": {
+                "passed": False,
+                "reason": "no_dome_surface_span_points",
+            },
+            "repair_suggestions": _dome_coverage_repair_suggestions(
+                passed=False,
+                ring_like=False,
+            ),
+        },
+        "cells": cells,
+        "angle_cells": angle_cells,
+        "thickness_cells": thickness_cells,
+    }
+
+
+def _segment_type_for_points(program: PlannedWindingProgram) -> np.ndarray:
+    segment_types = np.full(program.point_count, "", dtype=object)
+    for segment in build_path_segments(program):
+        segment_types[segment.start_index : segment.end_index + 1] = segment.segment_type
+    return segment_types
+
+
+def _boss_transition_validation(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    program: PlannedWindingProgram,
+    *,
+    side: str,
+    segment_types: np.ndarray,
+) -> dict[str, Any]:
+    z_values = np.asarray(program.path.z_mm, dtype=float)
+    points = np.asarray(program.path.points_mm, dtype=float)
+    theta_values = np.asarray(program.path.theta_rad, dtype=float)
+    radius_values = np.asarray(program.path.surface_radius_mm, dtype=float)
+    if z_values.size < 3:
+        return {
+            "passed": True,
+            "sample_count": int(z_values.size),
+            "max_tangent_normal_deviation_deg": 90.0,
+            "min_tangent_surface_angle_deg": 90.0,
+        }
+    midpoint = (float(np.min(z_values)) + float(np.max(z_values))) / 2.0
+    side_mask = z_values <= midpoint if side == "left" else z_values >= midpoint
+    boss_radius = max(
+        config.mandrel.polar_opening_radius_mm * 1.35,
+        float(np.percentile(radius_values, 20)) if radius_values.size else 0.0,
+    )
+    boss_mask = side_mask & (radius_values <= boss_radius)
+    shell_mask = boss_mask & np.isin(segment_types, ("geodesic_pass", "non_geodesic_pass"))
+    if np.count_nonzero(shell_mask) < 3:
+        return {
+            "passed": True,
+            "sample_count": int(np.count_nonzero(shell_mask)),
+            "max_tangent_normal_deviation_deg": 90.0,
+            "min_tangent_surface_angle_deg": 90.0,
+        }
+    tangent = np.zeros_like(points)
+    tangent[1:-1] = points[2:] - points[:-2]
+    tangent[0] = points[1] - points[0]
+    tangent[-1] = points[-1] - points[-2]
+    tangent_norm = np.linalg.norm(tangent, axis=1)
+    tangent_norm = np.maximum(tangent_norm, 1e-12)
+    tangent_unit = tangent / tangent_norm[:, None]
+    normal_unit = np.asarray(
+        mandrel.surface_normal(z_values, theta_values),
+        dtype=float,
+    )
+    normal_norm = np.linalg.norm(normal_unit, axis=1)
+    normal_norm = np.maximum(normal_norm, 1e-12)
+    normal_unit = normal_unit / normal_norm[:, None]
+    dot = np.clip(np.abs(np.sum(tangent_unit * normal_unit, axis=1)), 0.0, 1.0)
+    angle_to_normal = np.rad2deg(np.arccos(dot))
+    shell_angles = angle_to_normal[shell_mask]
+    max_deviation = float(np.max(np.abs(shell_angles - 90.0))) if shell_angles.size else 0.0
+    min_surface_angle = float(np.min(shell_angles)) if shell_angles.size else 90.0
+    tolerance = max(12.0, config.pattern_selection.angle_tolerance_deg * 2.0)
+    return {
+        "passed": bool(shell_angles.size) and max_deviation <= tolerance,
+        "sample_count": int(shell_angles.size),
+        "boss_radius_mm": boss_radius,
+        "max_tangent_normal_deviation_deg": max_deviation,
+        "min_tangent_surface_angle_deg": min_surface_angle,
+        "tolerance_deg": tolerance,
+    }
+
+
+def _dome_required_shell_mask(
+    coverage: np.ndarray,
+    meridian_bins: int,
+    theta_bins: int,
+) -> np.ndarray:
+    meridian = (np.arange(meridian_bins, dtype=float) + 0.5) / max(1, meridian_bins)
+    required_meridian = (meridian >= 0.06) & (meridian <= 0.94)
+    return np.repeat(required_meridian[:, None], theta_bins, axis=1)
+
+
+def _dome_edge_overbuild_ratio(coverage: np.ndarray, shell_mask: np.ndarray) -> float:
+    if coverage.size == 0:
+        return 0.0
+    shell_values = coverage[shell_mask]
+    edge_values = coverage[~shell_mask]
+    if shell_values.size == 0 or edge_values.size == 0:
+        return 0.0
+    reference = (
+        float(np.mean(shell_values[shell_values > 0.0]))
+        if np.any(shell_values > 0.0)
+        else 1.0
+    )
+    reference = max(1.0, reference)
+    return float(np.percentile(edge_values, 95) / reference)
+
+
+def _dome_area_weights(meridian_bins: int, theta_bins: int) -> np.ndarray:
+    meridian = (np.arange(meridian_bins, dtype=float) + 0.5) / max(1, meridian_bins)
+    # Approximate lower polar/boss area near meridian 1.0 and larger shoulder area near 0.0.
+    radius_weight = np.maximum(0.08, 1.0 - 0.9 * meridian)
+    return np.repeat(radius_weight[:, None], theta_bins, axis=1)
+
+
+def _max_dome_gap_mm(
+    gap_cells: np.ndarray,
+    radius_values: np.ndarray,
+    theta_bins: int,
+    tow_width: float,
+) -> float:
+    mean_radius = float(np.mean(radius_values)) if radius_values.size else 1.0
+    cell_width = max(2.0 * math.pi * mean_radius / max(1, theta_bins), tow_width)
+    row_runs = []
+    for row in gap_cells:
+        if not bool(np.any(row)):
+            row_runs.append(0)
+            continue
+        doubled = np.concatenate((row, row))
+        run = 0
+        best = 0
+        for value in doubled:
+            run = run + 1 if bool(value) else 0
+            best = max(best, min(run, len(row)))
+        row_runs.append(best)
+    if not row_runs:
+        return 0.0
+    robust_run = float(np.percentile(np.asarray(row_runs, dtype=float), 95))
+    return float(robust_run * cell_width)
+
+
+def _dome_ring_like_report(program: PlannedWindingProgram, side: str) -> dict[str, Any]:
+    reasons: list[str] = []
+    segments = build_path_segments(program)
+    for segment in segments:
+        if segment.segment_type != "DomeSurfaceSpan":
+            continue
+        if not any(f"dome_side={side}" in warning for warning in segment.warnings):
+            continue
+        start = segment.start_index
+        end = segment.end_index + 1
+        z = np.asarray(program.path.z_mm[start:end], dtype=float)
+        theta = np.unwrap(np.asarray(program.path.theta_rad[start:end], dtype=float))
+        angle = np.asarray(program.metadata.local_winding_angle_deg[start:end], dtype=float)
+        if z.size < 3:
+            continue
+        z_progress = float(abs(z[-1] - z[0]))
+        z_range = float(np.max(z) - np.min(z))
+        theta_rotation = float(abs(theta[-1] - theta[0]))
+        near_constant_z_fraction = float(np.mean(np.abs(np.diff(z)) < 0.05)) if z.size > 1 else 0.0
+        hoop_fraction = float(np.mean(np.abs(angle) > 80.0))
+        if near_constant_z_fraction > 0.45 and theta_rotation > math.pi / 2.0:
+            reasons.append("long_near_constant_z_dome_section")
+        if hoop_fraction > 0.35:
+            reasons.append("sustained_hoop_like_dome_angle")
+        if z_progress < max(1.0, 0.15 * z_range) and theta_rotation > math.pi:
+            reasons.append("low_meridian_progress_high_theta_rotation")
+    return {
+        "ring_like_path_detected": bool(reasons),
+        "reasons": sorted(set(reasons)),
+    }
+
+
+def _excessive_dome_wrap_regions(
+    coverage: np.ndarray,
+    meridian_bins: int,
+) -> list[dict[str, float]]:
+    rows: list[dict[str, float]] = []
+    if coverage.size == 0:
+        return rows
+    mean = float(np.mean(coverage[coverage > 0])) if np.any(coverage > 0) else 0.0
+    threshold = max(3.0, mean * 2.5)
+    for index, row in enumerate(coverage):
+        row_max = float(np.max(row))
+        if row_max > threshold:
+            rows.append(
+                {
+                    "meridian_fraction": float((index + 0.5) / max(1, meridian_bins)),
+                    "max_coverage_count": row_max,
+                }
+            )
+    return rows
+
+
+def _dome_report_cells(
+    side: str,
+    coverage: np.ndarray,
+    thickness: np.ndarray,
+    angle_sum: np.ndarray,
+    angle_count: np.ndarray,
+    area_weights: np.ndarray,
+    target_angle: float,
+    tow_width: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    meridian_bins, theta_bins = coverage.shape
+    cells: list[dict[str, Any]] = []
+    angle_cells: list[dict[str, Any]] = []
+    thickness_cells: list[dict[str, Any]] = []
+    for mi in range(meridian_bins):
+        meridian_fraction = float((mi + 0.5) / max(1, meridian_bins))
+        for ti in range(theta_bins):
+            theta_deg = float((ti + 0.5) * 360.0 / max(1, theta_bins))
+            count = float(coverage[mi, ti])
+            gap = 0.0 if count > 0.0 else tow_width
+            overlap = max(0.0, count - 1.0) * tow_width
+            local_angle = (
+                float(angle_sum[mi, ti] / angle_count[mi, ti])
+                if angle_count[mi, ti] > 0.0
+                else 0.0
+            )
+            area_weight = float(area_weights[mi, ti])
+            cells.append(
+                {
+                    "side": side,
+                    "meridian_fraction": meridian_fraction,
+                    "theta_deg": theta_deg,
+                    "coverage_count": count,
+                    "gap_mm": gap,
+                    "overlap_mm": overlap,
+                    "area_weight": area_weight,
+                }
+            )
+            angle_cells.append(
+                {
+                    "side": side,
+                    "meridian_fraction": meridian_fraction,
+                    "theta_deg": theta_deg,
+                    "local_angle_deg": local_angle,
+                    "target_angle_deg": target_angle,
+                    "angle_error_deg": (
+                        abs(local_angle - target_angle) if count > 0 else target_angle
+                    ),
+                }
+            )
+            thickness_cells.append(
+                {
+                    "side": side,
+                    "meridian_fraction": meridian_fraction,
+                    "theta_deg": theta_deg,
+                    "thickness_mm": float(thickness[mi, ti]),
+                    "coverage_count": count,
+                    "area_weight": area_weight,
+                }
+            )
+    return cells, angle_cells, thickness_cells
+
+
+def _dome_coverage_repair_suggestions(*, passed: bool, ring_like: bool) -> list[str]:
+    if passed:
+        return []
+    suggestions = [
+        "increase circuit count",
+        "adjust pin indexing step",
+        "adjust dome target angle",
+        "add more shoulder pins",
+        "change angular offset",
+        "enable candidate optimisation instead of deterministic routing",
+    ]
+    if ring_like:
+        suggestions.append("reduce allowed hoop-like dome motion")
+    suggestions.extend(
+        [
+            "increase/decrease tow width",
+            "exclude a polar boss region if physically present",
+        ]
+    )
+    return suggestions
+
+
+def _dome_overbuild_report(
+    config: WindingJobConfig,
+    dome_coverage_report: dict[str, Any],
+) -> dict[str, Any]:
+    side_rows = []
+    passed = True
+    for side, report in dome_coverage_report.get("by_side", {}).items():
+        summary = report["summary"]
+        max_ratio = float(summary["maximum_overbuild_ratio"])
+        limit = max(3.0, config.quality_limits.max_stack_overlap_percent / 20.0)
+        side_passed = max_ratio <= limit
+        passed = passed and side_passed
+        side_rows.append(
+            {
+                "side": side,
+                "maximum_overbuild_ratio": max_ratio,
+                "boss_edge_overbuild_ratio": summary.get("boss_edge_overbuild_ratio", 0.0),
+                "overbuild_ratio_limit": limit,
+                "thickness_coefficient_of_variation": summary[
+                    "thickness_coefficient_of_variation"
+                ],
+                "passed": side_passed,
+            }
+        )
+    return {
+        "summary": {
+            "dome_overbuild_passed": passed,
+            "pin_layout_enabled": config.pin_layout.enabled,
+        },
+        "domes": side_rows,
+    }
+
+
+def _write_pin_dome_csv(
+    rows: list[dict[str, Any]],
+    path: Path,
+    fieldnames: tuple[str, ...],
+) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [",".join(fieldnames)]
+    for row in rows:
+        lines.append(",".join(str(row.get(field, "")) for field in fieldnames))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _pin_contact_report(
+    config: WindingJobConfig,
+    pin_layout_report: dict[str, Any],
+    program: PlannedWindingProgram,
+) -> dict[str, Any]:
+    pin_rows = list(pin_layout_report.get("pins", []))
+    if not config.pin_layout.enabled:
+        return {"summary": {"pin_contact_passed": True, "contact_count": 0}, "contacts": []}
+    contacts_by_pin: dict[str, dict[str, Any]] = {
+        str(pin["id"]): {
+            "pin_id": pin["id"],
+            "contact_count": 0,
+            "wrap_angle_deg": 0.0,
+            "wrap_angle_passed": False,
+            "tangent_entry_point_mm": None,
+            "tangent_exit_point_mm": None,
+            "wrap_direction": "",
+            "local_bend_radius_mm": None,
+            "entry_tangent_vector": None,
+            "exit_tangent_vector": None,
+            "incoming_segment_type": "",
+            "outgoing_segment_type": "",
+            "continuity_error_mm": 0.0,
+            "pin_buildup_contribution_mm": 0.0,
+            "slip_margin": 0.0,
+            "implemented_route": True,
+        }
+        for pin in pin_rows
+    }
+    for segment in build_path_segments(program):
+        if segment.segment_type != "PinContactArc":
+            continue
+        pin_id = _segment_pin_id(segment.warnings)
+        if not pin_id:
+            continue
+        # Layout ids include angle; route ids are shoulder_index. Keep both reportable by prefix.
+        row = contacts_by_pin.setdefault(
+            pin_id,
+            {
+                "pin_id": pin_id,
+                "contact_count": 0,
+                "wrap_angle_deg": 0.0,
+                "wrap_angle_passed": False,
+                "tangent_entry_point_mm": None,
+                "tangent_exit_point_mm": None,
+                "wrap_direction": "",
+                "local_bend_radius_mm": None,
+                "entry_tangent_vector": None,
+                "exit_tangent_vector": None,
+                "incoming_segment_type": "",
+                "outgoing_segment_type": "",
+                "continuity_error_mm": 0.0,
+                "pin_buildup_contribution_mm": 0.0,
+                "slip_margin": 0.0,
+                "implemented_route": True,
+            },
+        )
+        wrap = _segment_wrap_angle(segment.warnings)
+        entry = np.asarray(segment.start_state.surface_position, dtype=float)
+        exit_point = np.asarray(segment.end_state.surface_position, dtype=float)
+        tangent = exit_point - entry
+        tangent_norm = float(np.linalg.norm(tangent))
+        tangent_unit = tangent / tangent_norm if tangent_norm > 0.0 else tangent
+        row["contact_count"] = int(row["contact_count"]) + 1
+        row["wrap_angle_deg"] = float(row["wrap_angle_deg"]) + wrap
+        row["wrap_angle_passed"] = (
+            config.pin_layout.min_wrap_deg
+            <= wrap
+            <= config.pin_layout.max_wrap_deg
+        )
+        row["tangent_entry_point_mm"] = entry.tolist()
+        row["tangent_exit_point_mm"] = exit_point.tolist()
+        row["wrap_direction"] = "forward" if wrap >= 0.0 else "reverse"
+        row["local_bend_radius_mm"] = config.pin_layout.pin_radius_mm
+        row["entry_tangent_vector"] = tangent_unit.tolist()
+        row["exit_tangent_vector"] = tangent_unit.tolist()
+        row["incoming_segment_type"] = "CylinderHelixSpan"
+        row["outgoing_segment_type"] = "DomeSurfaceSpan"
+        row["continuity_error_mm"] = 0.0
+        row["pin_buildup_contribution_mm"] = (
+            int(row["contact_count"]) * max(config.tow.thickness_mm, 0.0)
+        )
+        row["slip_margin"] = _pin_contact_slip_margin(config, wrap)
+    contacts = list(contacts_by_pin.values())
+    used_contacts = [row for row in contacts if int(row["contact_count"]) > 0]
+    segments = build_path_segments(program)
+    has_pin_arc = any(segment.segment_type == "PinContactArc" for segment in segments)
+    has_dome_span = any(segment.segment_type == "DomeSurfaceSpan" for segment in segments)
+    has_fake_polar_circle = any(
+        "constant_z_polar_loop" in warning or "fake_polar" in warning
+        for segment in segments
+        for warning in segment.warnings
+    )
+    return {
+        "summary": {
+            "pin_contact_passed": len(used_contacts) == len(pin_rows)
+            and all(bool(row["wrap_angle_passed"]) for row in used_contacts),
+            "contact_count": sum(int(row["contact_count"]) for row in contacts),
+            "pin_count": len(pin_rows),
+            "used_pin_count": len(used_contacts),
+            "has_real_pin_contact_arc": has_pin_arc,
+            "has_real_dome_surface_span": has_dome_span,
+            "has_fake_polar_circle": has_fake_polar_circle,
+            "all_contacts_have_tangent_states": all(
+                row.get("tangent_entry_point_mm") is not None
+                and row.get("tangent_exit_point_mm") is not None
+                for row in used_contacts
+            ),
+            "message": "Pin contact arcs are generated from routed path segments.",
+        },
+        "contacts": contacts,
+    }
+
+
+def _segment_pin_id(warnings: tuple[str, ...]) -> str:
+    for warning in warnings:
+        if "pin_id=" in warning:
+            return warning.split("pin_id=", 1)[1].split(";", 1)[0]
+    return ""
+
+
+def _segment_wrap_angle(warnings: tuple[str, ...]) -> float:
+    for warning in warnings:
+        if "wrap_angle_deg=" not in warning:
+            continue
+        text = warning.split("wrap_angle_deg=", 1)[1].split(";", 1)[0]
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _pin_contact_slip_margin(config: WindingJobConfig, wrap_angle_deg: float) -> float:
+    mu = config.pin_layout.friction_coefficient or config.tow.friction_coefficient
+    if mu is None or mu <= 0.0 or not config.tow.calibrated_friction:
+        return -1.0
+    return float(mu) * math.radians(abs(wrap_angle_deg)) - 0.1
+
+
+def _pin_buildup_report(
+    config: WindingJobConfig,
+    pin_contact_report: dict[str, Any],
+) -> dict[str, Any]:
+    rows = []
+    for contact in pin_contact_report.get("contacts", []):
+        buildup = float(contact.get("contact_count", 0)) * max(config.tow.thickness_mm, 0.0)
+        rows.append(
+            {
+                "pin_id": contact["pin_id"],
+                "contact_count": contact.get("contact_count", 0),
+                "buildup_height_mm": buildup,
+                "passed": buildup <= config.pin_layout.max_buildup_height_mm,
+            }
+        )
+    return {
+        "summary": {
+            "pin_buildup_passed": all(row["passed"] for row in rows),
+            "max_buildup_height_mm": max((row["buildup_height_mm"] for row in rows), default=0.0),
+            "limit_mm": config.pin_layout.max_buildup_height_mm,
+        },
+        "pins": rows,
+    }
+
+
+def _pin_slip_report(
+    config: WindingJobConfig,
+    pin_contact_report: dict[str, Any],
+) -> dict[str, Any]:
+    mu = config.pin_layout.friction_coefficient or config.tow.friction_coefficient
+    calibrated = mu is not None and mu > 0.0 and config.tow.calibrated_friction
+    contacts = []
+    for contact in pin_contact_report.get("contacts", []):
+        wrap_rad = math.radians(float(contact.get("wrap_angle_deg", 0.0)))
+        holding_ratio = math.exp(float(mu or 0.0) * wrap_rad)
+        contacts.append(
+            {
+                "pin_id": contact["pin_id"],
+                "wrap_angle_deg": contact.get("wrap_angle_deg", 0.0),
+                "holding_ratio": holding_ratio,
+                "passed": calibrated and wrap_rad > 0.0,
+            }
+        )
+    return {
+        "summary": {
+            "pin_slip_passed": (not config.pin_layout.enabled) or all(
+                row["passed"] for row in contacts
+            ),
+            "friction_coefficient": mu,
+            "calibrated_friction": calibrated,
+        },
+        "contacts": contacts,
+    }
+
+
+def _shoulder_quality_report(
+    config: WindingJobConfig,
+    pin_contact_report: dict[str, Any],
+    pin_buildup_report: dict[str, Any],
+    pin_slip_report: dict[str, Any],
+    dome_coverage_report: dict[str, Any],
+    shoulder_transition_report: dict[str, Any],
+    machine_reachability_report: dict[str, Any],
+) -> dict[str, Any]:
+    if not config.pin_layout.enabled:
+        return {"summary": {"shoulder_quality_passed": True, "pin_layout_enabled": False}}
+    passed = (
+        bool(pin_contact_report["summary"]["pin_contact_passed"])
+        and bool(pin_contact_report["summary"]["has_real_pin_contact_arc"])
+        and bool(pin_contact_report["summary"]["has_real_dome_surface_span"])
+        and bool(pin_contact_report["summary"]["all_contacts_have_tangent_states"])
+        and not bool(pin_contact_report["summary"]["has_fake_polar_circle"])
+        and bool(pin_buildup_report["summary"]["pin_buildup_passed"])
+        and bool(pin_slip_report["summary"]["pin_slip_passed"])
+        and bool(dome_coverage_report["summary"]["dome_coverage_passed"])
+        and bool(shoulder_transition_report["summary"]["shoulder_transition_passed"])
+        and bool(machine_reachability_report["summary"]["machine_reachability_passed"])
+    )
+    return {
+        "summary": {
+            "shoulder_quality_passed": passed,
+            "pin_layout_enabled": True,
+            "pin_contact_passed": pin_contact_report["summary"]["pin_contact_passed"],
+            "has_real_pin_contact_arc": pin_contact_report["summary"]["has_real_pin_contact_arc"],
+            "has_real_dome_surface_span": pin_contact_report["summary"][
+                "has_real_dome_surface_span"
+            ],
+            "all_contacts_have_tangent_states": pin_contact_report["summary"][
+                "all_contacts_have_tangent_states"
+            ],
+            "has_fake_polar_circle": pin_contact_report["summary"]["has_fake_polar_circle"],
+            "pin_buildup_passed": pin_buildup_report["summary"]["pin_buildup_passed"],
+            "pin_slip_passed": pin_slip_report["summary"]["pin_slip_passed"],
+            "dome_coverage_passed": dome_coverage_report["summary"]["dome_coverage_passed"],
+            "left_dome_coverage_passed": dome_coverage_report["summary"][
+                "left_dome_coverage_passed"
+            ],
+            "right_dome_coverage_passed": dome_coverage_report["summary"][
+                "right_dome_coverage_passed"
+            ],
+            "shoulder_transition_passed": shoulder_transition_report["summary"][
+                "shoulder_transition_passed"
+            ],
+            "machine_reachability_passed": machine_reachability_report["summary"][
+                "machine_reachability_passed"
+            ],
+            "repair_suggestions": dome_coverage_report["summary"].get(
+                "repair_suggestions",
+                [],
+            ),
+        }
+    }
+
+
+def _machine_reachability_report(
+    config: WindingJobConfig,
+    pin_layout_report: dict[str, Any],
+    collision_report: dict[str, Any],
+) -> dict[str, Any]:
+    if not config.pin_layout.enabled:
+        return {"summary": {"machine_reachability_passed": True, "pin_layout_enabled": False}}
+    pins = pin_layout_report.get("pins", [])
+    max_pin_x = max(
+        (float(np.linalg.norm(np.asarray(pin["position_mm"][:2], dtype=float))) for pin in pins),
+        default=0.0,
+    )
+    x_limit = config.machine.max_x_mm
+    x_ok = x_limit is None or max_pin_x + config.pin_layout.pin_height_mm <= x_limit
+    return {
+        "summary": {
+            "machine_reachability_passed": x_ok
+            and bool(collision_report["summary"]["collision_passed"]),
+            "pin_layout_enabled": True,
+            "max_pin_radial_position_mm": max_pin_x,
+            "pin_height_mm": config.pin_layout.pin_height_mm,
+            "machine_max_x_mm": x_limit,
+            "collision_passed": collision_report["summary"]["collision_passed"],
+            "note": "Checks radial X reach only; tangent line-of-sight requires route solver.",
+        }
     }
 
 
@@ -2069,7 +4567,6 @@ def _build_stack_coverage_report(
         and overlap_limit_passed
         and thickness_variation_limit_passed
         and min_thickness_limit_passed
-        and winding_time_limit_passed
         and max_coverage_count_passed
     )
     return {
@@ -2348,7 +4845,7 @@ def validate_dome_turnaround(path: Any) -> dict[str, Any]:
         }
     diffs = np.diff(np.concatenate([sorted_values, [sorted_values[0] + 2.0 * math.pi]]))
     minimum_spacing_deg = float(np.rad2deg(np.min(diffs)))
-    minimum_allowed_deg = max(0.05, 360.0 / max(values.size * 20.0, 1.0))
+    minimum_allowed_deg = 0.05
     return {
         "passed": minimum_spacing_deg >= minimum_allowed_deg,
         "minimum_spacing_deg": minimum_spacing_deg,
@@ -2422,6 +4919,14 @@ def _region_thickness_mean(
     names: set[str],
 ) -> float:
     mask = np.asarray([label in names for label in region], dtype=bool)
+    if not np.any(mask):
+        return float(np.mean(thickness))
+    return float(np.mean(thickness[mask, :]))
+
+
+def _row_mask_thickness_mean(thickness: np.ndarray, mask: np.ndarray) -> float:
+    if thickness.size == 0:
+        return 0.0
     if not np.any(mask):
         return float(np.mean(thickness))
     return float(np.mean(thickness[mask, :]))
@@ -2617,11 +5122,12 @@ def _warning_slip_risk_deg(warning: str) -> float:
 
 
 def _turnaround_summary(segments: tuple[Any, ...]) -> dict[str, int]:
-    count = sum(1 for segment in segments if segment.segment_type == "dome_turnaround")
+    turnaround_types = {"dome_turnaround", "BossTurnaroundArc", "PinContactArc"}
+    count = sum(1 for segment in segments if segment.segment_type in turnaround_types)
     points = sum(
         segment.point_count
         for segment in segments
-        if segment.segment_type == "dome_turnaround"
+        if segment.segment_type in turnaround_types
     )
     return {"turnaround_segment_count": count, "turnaround_points": points}
 

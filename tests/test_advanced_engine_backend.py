@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -136,6 +138,16 @@ def test_domed_pressure_vessel_config_generates() -> None:
     assert result.coverage_grid_path is not None and result.coverage_grid_path.exists()
     assert result.summary["mandrel"]["type"] == "cylinder_with_elliptical_domes"
     assert result.summary["continuity"]["continuous_machine_path"] is True
+    assert result.summary["path_validation"]["csv_summary_row_count_match"] is True
+    assert result.summary["stack_uniformity_status"]["stack_uniformity_passed"] is True
+    assert (
+        result.summary["pattern_optimisation_status"]["pattern_optimisation_passed"]
+        is True
+    )
+    assert result.summary["backend_ready"] is True
+    assert result.summary["machine_ready"] is False
+    assert result.summary["calibration_status"]["calibration_passed"] is False
+    assert result.summary["friction_margin_status"]["friction_margin_passed"] is False
 
 
 def test_unwrapped_a_axis_no_reset_on_domed_job() -> None:
@@ -160,7 +172,7 @@ def test_path_segments_have_tow_and_process_state() -> None:
     assert {segment["process_state"] for segment in segments} >= {"winding", "transition"}
 
 
-def test_dome_turnaround_segment_exists_and_validation_checks_limits() -> None:
+def test_dome_paths_do_not_insert_hoop_like_turnaround_rings() -> None:
     result = generate_winding_job(
         load_winding_config("examples/demo_domed_pressure_vessel.yaml"),
         make_plots=False,
@@ -168,10 +180,108 @@ def test_dome_turnaround_segment_exists_and_validation_checks_limits() -> None:
     report = json.loads(result.validation_report_path.read_text(encoding="utf-8"))
     segment_types = {segment.segment_type for segment in build_path_segments(result.program)}
 
-    assert "dome_turnaround" in segment_types
+    assert "dome_turnaround" not in segment_types
+    assert "BossTurnaroundArc" in segment_types
     assert report["machine_validation_summary"]["axis_velocity_limits_checked"] is True
     assert report["machine_validation_summary"]["axis_acceleration_limits_checked"] is True
     assert report["turnaround_summary"]["turnaround_segment_count"] > 0
+
+
+def test_domed_paths_stay_on_mandrel_surface_and_export_phase_debug() -> None:
+    result = generate_winding_job(
+        load_winding_config("examples/demo_domed_pressure_vessel.yaml"),
+        make_plots=False,
+    )
+
+    radius_from_xy = np.hypot(result.program.path.x_mm, result.program.path.y_mm)
+    expected_radius = result.mandrel.radius_at(result.program.path.z_mm)
+    radial_offset = radius_from_xy - expected_radius
+    assert float(np.min(radial_offset)) >= -1e-6
+    assert float(np.max(radial_offset)) <= 0.75 + 1e-6
+
+    assert result.csv_path is not None
+    with result.csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+        assert reader.fieldnames is not None
+        assert {"winding_index", "phase_angle_deg", "circuit_index"} <= set(
+            reader.fieldnames
+        )
+    assert len(rows) == result.program.point_count
+    assert all(None not in row for row in rows)
+    assert result.summary["path_validation"]["csv_summary_row_count_match"] is True
+
+
+def test_dome_coverage_and_polar_reports_must_pass_dedicated_gates() -> None:
+    result = generate_winding_job(
+        load_winding_config("examples/demo_domed_pressure_vessel.yaml"),
+        make_plots=False,
+    )
+
+    assert result.dome_coverage_report_path is not None
+    dome = json.loads(result.dome_coverage_report_path.read_text(encoding="utf-8"))
+    assert dome["summary"]["pin_layout_enabled"] is False
+    assert dome["summary"]["source"] == "axisymmetric_dome_surface_path"
+    assert dome["summary"]["detected_dome_surface_point_count"] > 0
+    assert result.summary["region_quality_status"]["region_quality_passed"] is True
+    assert dome["summary"]["dome_coverage_passed"] is True
+    assert dome["summary"]["left_dome_coverage_passed"] is True
+    assert dome["summary"]["right_dome_coverage_passed"] is True
+    assert dome["summary"]["invalid_zero_or_infinite_coverage_metrics"] is False
+    assert result.summary["backend_ready"] is True
+    assert result.summary["machine_ready"] is False
+
+    assert result.left_dome_coverage_report_path is not None
+    assert result.right_dome_coverage_report_path is not None
+    left = json.loads(result.left_dome_coverage_report_path.read_text(encoding="utf-8"))
+    right = json.loads(result.right_dome_coverage_report_path.read_text(encoding="utf-8"))
+    for report in (left, right):
+        summary = report["summary"]
+        assert summary["local_winding_angle_mean_deg"] == pytest.approx(
+            summary["measured_shell_winding_angle_mean_deg"]
+        )
+        assert summary["boss_transition_validation"]["passed"] is True
+        assert summary["boss_contact_point_count"] >= 0
+        assert summary["deposited_shell_point_count"] > 0
+        assert abs(
+            summary["local_winding_angle_mean_deg"]
+            - summary["target_winding_angle_deg"]
+        ) <= 12.0
+
+    assert result.polar_overbuild_report_path is not None
+    polar = json.loads(result.polar_overbuild_report_path.read_text(encoding="utf-8"))
+    assert polar["summary"]["polar_overbuild_passed"] is True
+    assert polar["summary"]["physical_boss_excluded_from_required_shell"] is True
+    assert polar["summary"]["physical_boss_buildup_mm"] > polar["summary"]["polar_buildup_mm"]
+
+
+def test_domed_job_exports_boss_specific_diagnostics(tmp_path: Path) -> None:
+    config = load_winding_config("examples/demo_domed_pressure_vessel.yaml")
+    config = replace(
+        config,
+        output=replace(config.output, directory=tmp_path / "out"),
+        plot=replace(
+            config.plot,
+            enabled=True,
+            save=True,
+            show=False,
+            modes=("unwrapped", "three_d"),
+        ),
+    )
+
+    result = generate_winding_job(config)
+
+    assert any(path.name == "dome_shell_only_unwrapped.png" for path in result.plot_paths)
+    assert any(path.name == "dome_boss_contact_unwrapped.png" for path in result.plot_paths)
+    assert any(path.name == "dome_transition_moves_unwrapped.png" for path in result.plot_paths)
+    assert any(path.name == "dome_boss_closeup_left.png" for path in result.plot_paths)
+    assert any(path.name == "dome_boss_closeup_right.png" for path in result.plot_paths)
+    assert result.dome_coverage_report_path is not None
+    dome = json.loads(result.dome_coverage_report_path.read_text(encoding="utf-8"))
+    assert dome["summary"]["boss_transition_validation_passed"] is True
+    assert dome["summary"]["boss_transition_validation_by_side"]["left"]["passed"] is True
+    assert dome["summary"]["boss_transition_validation_by_side"]["right"]["passed"] is True
+    assert dome["summary"]["boss_contact_point_count"] >= 0
 
 
 def _write_config(tmp_path: Path) -> Path:

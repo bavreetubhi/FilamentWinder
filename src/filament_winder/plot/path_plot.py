@@ -165,6 +165,172 @@ def plot_layer_diagnostics(
     return tuple(paths), {"plots": manifest}
 
 
+def plot_dome_coverage_maps(
+    dome_coverage_report: dict[str, Any],
+    output_dir: Path,
+) -> tuple[Path, ...]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for side in ("left", "right"):
+        cells = [
+            cell
+            for cell in dome_coverage_report.get("cells", [])
+            if cell.get("side") == side
+        ]
+        if not cells:
+            continue
+        gap_values = _dome_cell_grid(cells, "gap_mm")
+        overlap_values = _dome_cell_grid(cells, "overlap_mm")
+        gap_path = output_dir / f"{side}_dome_gap_map.png"
+        overlap_path = output_dir / f"{side}_dome_overlap_map.png"
+        _write_heatmap_png(gap_path, gap_values)
+        _write_heatmap_png(overlap_path, overlap_values)
+        paths.extend([gap_path, overlap_path])
+    return tuple(paths)
+
+
+def plot_dome_motion_diagnostics(
+    config: WindingJobConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    program: PlannedWindingProgram,
+    output_dir: Path,
+) -> tuple[Path, ...]:
+    if not config.plot.save:
+        return ()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    color_map = {
+        f"{index + 1:02d}-{_safe_id(layer.name)}": _parse_color(layer.colour)
+        for index, layer in enumerate(config.layers)
+    }
+    plots: list[Path] = []
+
+    shell_types = {"geodesic_pass", "non_geodesic_pass", "wind"}
+    boss_types = {"BossTurnaroundArc"}
+    transition_types = {"transition", "PinTransition", "FreeSpan", "PinContactArc"}
+
+    shell_path = output_dir / "dome_shell_only_unwrapped.png"
+    _write_unwrapped_png(
+        shell_path,
+        mandrel,
+        program,
+        color_map,
+        motion_types_filter=shell_types,
+    )
+    plots.append(shell_path)
+
+    boss_path = output_dir / "dome_boss_contact_unwrapped.png"
+    _write_unwrapped_png(
+        boss_path,
+        mandrel,
+        program,
+        color_map,
+        motion_types_filter=boss_types,
+    )
+    plots.append(boss_path)
+
+    transition_path = output_dir / "dome_transition_moves_unwrapped.png"
+    _write_unwrapped_png(
+        transition_path,
+        mandrel,
+        program,
+        color_map,
+        motion_types_filter=transition_types,
+    )
+    plots.append(transition_path)
+
+    boss_closeup_left = output_dir / "dome_boss_closeup_left.png"
+    boss_closeup_right = output_dir / "dome_boss_closeup_right.png"
+    _write_boss_closeup_png(
+        boss_closeup_left,
+        mandrel,
+        program,
+        color_map,
+        side="left",
+        motion_types_filter=shell_types | boss_types,
+    )
+    _write_boss_closeup_png(
+        boss_closeup_right,
+        mandrel,
+        program,
+        color_map,
+        side="right",
+        motion_types_filter=shell_types | boss_types,
+    )
+    plots.extend([boss_closeup_left, boss_closeup_right])
+    return tuple(plots)
+
+
+def _dome_cell_grid(cells: list[dict[str, Any]], field: str) -> np.ndarray:
+    meridian_values = sorted({float(cell["meridian_fraction"]) for cell in cells})
+    theta_values = sorted({float(cell["theta_deg"]) for cell in cells})
+    meridian_index = {value: index for index, value in enumerate(meridian_values)}
+    theta_index = {value: index for index, value in enumerate(theta_values)}
+    grid = np.zeros((len(meridian_values), len(theta_values)), dtype=float)
+    for cell in cells:
+        grid[
+            meridian_index[float(cell["meridian_fraction"])],
+            theta_index[float(cell["theta_deg"])],
+        ] = float(cell.get(field, 0.0))
+    return grid
+
+
+def _write_boss_closeup_png(
+    path: Path,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    program: PlannedWindingProgram,
+    color_map: dict[str, Rgb],
+    *,
+    side: str,
+    motion_types_filter: set[str],
+) -> None:
+    width, height = 1200, 720
+    margin_left, margin_right = 70, 28
+    margin_top, margin_bottom = 34, 58
+    image = _new_image(width, height, (250, 252, 255))
+    z = program.path.z_mm
+    radius = program.path.surface_radius_mm
+    motion_types = np.asarray(program.metadata.motion_type)
+    z_min = _start_z(mandrel)
+    z_max = _end_z(mandrel)
+    z_mid = (z_min + z_max) / 2.0
+    if side == "left":
+        window = z <= z_mid
+        x_min = z_min
+        x_max = z_min + max((z_max - z_min) * 0.35, 1e-9)
+    else:
+        window = z >= z_mid
+        x_min = z_max - max((z_max - z_min) * 0.35, 1e-9)
+        x_max = z_max
+    if not np.any(window):
+        _write_png(path, image)
+        return
+    z_sel = z[window]
+    r_sel = radius[window]
+    motion_sel = motion_types[window]
+    layer_ids = tuple(program.metadata.layer_id[i] for i, keep in enumerate(window) if keep)
+    x_pixels = margin_left + ((z_sel - x_min) / max(x_max - x_min, 1e-9)) * (
+        width - margin_left - margin_right
+    )
+    y_pixels = (
+        height
+        - margin_bottom
+        - (r_sel / max(float(np.max(radius)), 1e-9)) * (height - margin_top - margin_bottom)
+    )
+    _draw_axes(image, margin_left, margin_top, width - margin_right, height - margin_bottom)
+    _draw_grid(image, margin_left, margin_top, width - margin_right, height - margin_bottom)
+    _draw_layered_polyline(
+        image,
+        x_pixels,
+        y_pixels,
+        layer_ids,
+        color_map,
+        motion_types=tuple(motion_sel),
+        motion_types_filter=motion_types_filter,
+        layer_filter=None,
+    )
+    _write_png(path, image)
+
+
 def _write_unwrapped_png(
     path: Path,
     mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
@@ -174,6 +340,7 @@ def _write_unwrapped_png(
     debug_passes: bool = False,
     debug_transitions: bool = False,
     layer_filter: str | None = None,
+    motion_types_filter: set[str] | None = None,
 ) -> None:
     width, height = 1200, 720
     margin_left, margin_right = 70, 28
@@ -201,6 +368,7 @@ def _write_unwrapped_png(
         motion_types=program.metadata.motion_type,
         debug_transitions=debug_transitions,
         layer_filter=layer_filter,
+        motion_types_filter=motion_types_filter,
     )
     if debug_passes:
         _draw_pass_markers(image, x_pixels, y_pixels, tuple(program.metadata.pass_index))
@@ -393,12 +561,21 @@ def _draw_layered_polyline(
     motion_types: tuple[str, ...] | None = None,
     debug_transitions: bool = False,
     layer_filter: str | None = None,
+    motion_types_filter: set[str] | None = None,
 ) -> None:
     for index in range(1, len(x_values)):
         if layer_ids[index] != layer_ids[index - 1]:
             continue
         if layer_filter is not None and layer_ids[index] != layer_filter:
             continue
+        if motion_types_filter is not None:
+            if motion_types is None:
+                continue
+            if (
+                motion_types[index] not in motion_types_filter
+                and motion_types[index - 1] not in motion_types_filter
+            ):
+                continue
         is_transition = (
             motion_types is not None
             and (motion_types[index] == "transition" or motion_types[index - 1] == "transition")

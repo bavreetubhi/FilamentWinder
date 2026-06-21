@@ -399,6 +399,7 @@ def graph_to_config_mapping(
     machine = _node_settings(graph, scoped_ids, "machine_backend", "machine_config")
     mandrel = _node_settings(graph, scoped_ids, "mandrel_backend", "mandrel_profile")
     tow = _node_settings(graph, scoped_ids, "tow_backend", "material_tow")
+    pins = _node_settings(graph, scoped_ids, "pin_layout_backend")
     layer_stack = _node_settings(graph, scoped_ids, "layer_stack_backend", "layer_stack")
     pattern = _node_settings(graph, scoped_ids, "pattern_optimisation_backend")
     coverage = _node_settings(graph, scoped_ids, "coverage_mode")
@@ -506,6 +507,7 @@ def graph_to_config_mapping(
             ),
             "paired_layer_coverage": bool(coverage.get("paired_layer_coverage", True)),
         },
+        "pin_layout": _pin_layout_mapping(pins),
         "layers": layers,
         "coverage": {
             "z_cells": int(coverage.get("z_cells", 160)),
@@ -554,6 +556,8 @@ def _backend_checks(result: WindingJobResult, *, path_ok: bool) -> dict[str, boo
     optimisation_status = summary.get("pattern_optimisation_status", {})
     polar_status = summary.get("polar_overbuild_status", {})
     collision_status = summary.get("collision_status", {})
+    shoulder_status = summary.get("shoulder_quality_status", {})
+    reachability_status = summary.get("machine_reachability_status", {})
     return {
         "Config": True,
         "Pattern optimisation": bool(
@@ -584,6 +588,14 @@ def _backend_checks(result: WindingJobResult, *, path_ok: bool) -> dict[str, boo
         "Collision": bool(
             isinstance(collision_status, dict) and collision_status.get("collision_passed", True)
         ),
+        "Shoulder pins": bool(
+            isinstance(shoulder_status, dict)
+            and shoulder_status.get("shoulder_quality_passed", True)
+        ),
+        "Machine reachability": bool(
+            isinstance(reachability_status, dict)
+            and reachability_status.get("machine_reachability_passed", True)
+        ),
         "Exports": _required_exports_exist(result),
     }
 
@@ -596,6 +608,8 @@ def _backend_check_log(
 ) -> str:
     lines = ["Backend Check", "-------------"]
     lines.extend(f"{label}: {'PASS' if passed else 'FAIL'}" for label, passed in checks.items())
+    backend_ready = bool(result.summary.get("backend_ready", overall_ready))
+    lines.append(f"Backend-ready: {str(backend_ready).lower()}")
     lines.append(f"Machine-ready: {str(machine_ready).lower()}")
     lines.append(f"Overall backend-ready: {str(overall_ready).lower()}")
     lines.append(f"Output: {result.config.output.directory}")
@@ -613,6 +627,23 @@ def _required_exports_exist(result: WindingJobResult) -> bool:
         result.friction_margin_report_path,
         result.polar_overbuild_report_path,
         result.collision_report_path,
+        result.pin_layout_report_path,
+        result.pin_contact_report_path,
+        result.pin_buildup_report_path,
+        result.pin_slip_report_path,
+        result.shoulder_quality_report_path,
+        result.machine_reachability_report_path,
+        result.pin_route_candidates_path,
+        result.pin_route_selected_path,
+        result.pin_route_score_report_path,
+        result.dome_coverage_report_path,
+        result.left_dome_coverage_report_path,
+        result.right_dome_coverage_report_path,
+        result.dome_gap_overlap_map_path,
+        result.dome_angle_map_path,
+        result.dome_thickness_map_path,
+        result.dome_overbuild_report_path,
+        result.shoulder_transition_report_path,
         result.machine_smoothing_report_path,
         result.pattern_optimisation_report_path,
         result.candidate_pair_report_path,
@@ -641,6 +672,23 @@ def _report_paths(result: WindingJobResult) -> dict[str, Path]:
         "friction_margin_report": result.friction_margin_report_path,
         "polar_overbuild_report": result.polar_overbuild_report_path,
         "collision_report": result.collision_report_path,
+        "pin_layout": result.pin_layout_report_path,
+        "pin_contact_report": result.pin_contact_report_path,
+        "pin_buildup_report": result.pin_buildup_report_path,
+        "pin_slip_report": result.pin_slip_report_path,
+        "shoulder_quality_report": result.shoulder_quality_report_path,
+        "machine_reachability_report": result.machine_reachability_report_path,
+        "pin_route_candidates": result.pin_route_candidates_path,
+        "pin_route_selected": result.pin_route_selected_path,
+        "pin_route_score_report": result.pin_route_score_report_path,
+        "dome_coverage_report": result.dome_coverage_report_path,
+        "left_dome_coverage_report": result.left_dome_coverage_report_path,
+        "right_dome_coverage_report": result.right_dome_coverage_report_path,
+        "dome_gap_overlap_map": result.dome_gap_overlap_map_path,
+        "dome_angle_map": result.dome_angle_map_path,
+        "dome_thickness_map": result.dome_thickness_map_path,
+        "dome_overbuild_report": result.dome_overbuild_report_path,
+        "shoulder_transition_report": result.shoulder_transition_report_path,
         "machine_smoothing_report": result.machine_smoothing_report_path,
         "pattern_optimisation_report": result.pattern_optimisation_report_path,
         "candidate_pair_report": result.candidate_pair_report_path,
@@ -665,6 +713,23 @@ def _candidate_report_paths(directory: Path) -> tuple[Path, ...]:
         "friction_margin_report.json",
         "polar_overbuild_report.json",
         "collision_report.json",
+        "pin_layout.json",
+        "pin_contact_report.json",
+        "pin_buildup_report.json",
+        "pin_slip_report.json",
+        "shoulder_quality_report.json",
+        "machine_reachability_report.json",
+        "pin_route_candidates.json",
+        "pin_route_selected.json",
+        "pin_route_score_report.json",
+        "dome_coverage_report.json",
+        "left_dome_coverage_report.json",
+        "right_dome_coverage_report.json",
+        "dome_gap_overlap_map.csv",
+        "dome_angle_map.csv",
+        "dome_thickness_map.csv",
+        "dome_overbuild_report.json",
+        "shoulder_transition_report.json",
         "machine_smoothing_report.json",
         "pattern_optimisation_report.json",
         "candidate_pair_report.json",
@@ -927,6 +992,41 @@ def _mandrel_mapping(mandrel: Mapping[str, Any]) -> dict[str, Any]:
         "samples": int(mandrel.get("samples", 0) or 0),
         "mesh_points_z": int(mandrel.get("mesh_points_z", 240)),
         "mesh_points_theta": int(mandrel.get("mesh_points_theta", 180)),
+    }
+
+
+def _pin_layout_mapping(pins: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "enabled": bool(pins.get("enabled", False)),
+        "type": str(pins.get("layout_type", pins.get("type", "shoulder_cross"))),
+        "shoulders": str(pins.get("shoulders", "both")),
+        "count_per_shoulder": int(_float_or_default(pins.get("count_per_shoulder"), 4.0)),
+        "angular_offset_deg": float(pins.get("angular_offset_deg", 0.0) or 0.0),
+        "left_shoulder_z_mm": pins.get("left_shoulder_z_mm"),
+        "right_shoulder_z_mm": pins.get("right_shoulder_z_mm"),
+        "shoulder_zone_width_mm": float(pins.get("shoulder_zone_width_mm", 60.0)),
+        "pin_radius_mm": float(pins.get("pin_radius_mm", 4.0)),
+        "pin_height_mm": float(pins.get("pin_height_mm", 25.0)),
+        "pin_standoff_mm": float(pins.get("pin_standoff_mm", 2.0)),
+        "pin_clearance_mm": float(pins.get("pin_clearance_mm", 0.5)),
+        "min_wrap_deg": float(pins.get("min_wrap_deg", 120.0)),
+        "max_wrap_deg": float(pins.get("max_wrap_deg", 270.0)),
+        "max_buildup_height_mm": float(pins.get("max_buildup_height_mm", 8.0)),
+        "max_contact_balance_ratio": float(pins.get("max_contact_balance_ratio", 1.25)),
+        "friction_coefficient": pins.get("friction_coefficient"),
+        "min_bend_radius_mm": pins.get("min_bend_radius_mm"),
+        "route_family": str(pins.get("route_family", "shoulder_cross_reinforcement")),
+        "routing_mode": str(pins.get("routing_mode", "deterministic")),
+        "candidate_count": int(_float_or_default(pins.get("candidate_count"), 192.0)),
+        "route_step_size": int(_float_or_default(pins.get("route_step_size"), 0.0)),
+        "wrap_direction": str(pins.get("wrap_direction", "both")),
+        "target_dome_angle_min_deg": float(
+            pins.get("target_dome_angle_min_deg", 25.0) or 25.0
+        ),
+        "target_dome_angle_max_deg": float(
+            pins.get("target_dome_angle_max_deg", 55.0) or 55.0
+        ),
+        "coverage_tolerance_mm": float(pins.get("coverage_tolerance_mm", 6.0) or 6.0),
     }
 
 

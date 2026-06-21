@@ -1078,6 +1078,42 @@ def _backend_node_registry() -> dict[str, NodeTypeDefinition]:
                 "tow_band_model": "rectangular_surface_band",
             },
         ),
+        "pin_layout_backend": NodeTypeDefinition(
+            type_id="pin_layout_backend",
+            label="Pin Layout",
+            category="Mandrel",
+            color="#8f6241",
+            inputs=(NodeSocketDefinition("mandrel", "mandrel", required=False),),
+            outputs=(NodeSocketDefinition("any", "any"),),
+            default_settings={
+                "enabled": False,
+                "layout_type": "shoulder_cross",
+                "shoulders": "both",
+                "count_per_shoulder": 4,
+                "angular_offset_deg": 0.0,
+                "left_shoulder_z_mm": "",
+                "right_shoulder_z_mm": "",
+                "shoulder_zone_width_mm": 60.0,
+                "pin_radius_mm": 4.0,
+                "pin_height_mm": 25.0,
+                "pin_standoff_mm": 2.0,
+                "pin_clearance_mm": 0.5,
+                "min_wrap_deg": 120.0,
+                "max_wrap_deg": 270.0,
+                "max_buildup_height_mm": 8.0,
+                "max_contact_balance_ratio": 1.25,
+                "friction_coefficient": "",
+                "min_bend_radius_mm": "",
+                "route_family": "shoulder_cross_reinforcement",
+                "routing_mode": "deterministic",
+                "candidate_count": 192,
+                "route_step_size": 0,
+                "wrap_direction": "both",
+                "target_dome_angle_min_deg": 25.0,
+                "target_dome_angle_max_deg": 55.0,
+                "coverage_tolerance_mm": 6.0,
+            },
+        ),
         "pattern_optimisation_backend": NodeTypeDefinition(
             type_id="pattern_optimisation_backend",
             label="Pattern Optimisation",
@@ -1323,6 +1359,7 @@ def default_backend_winding_graph() -> NodeGraphState:
     machine = graph.add_node("machine_backend", registry, x=380.0, y=60.0)
     mandrel = graph.add_node("mandrel_backend", registry, x=720.0, y=60.0)
     tow = graph.add_node("tow_backend", registry, x=1060.0, y=60.0)
+    pins = graph.add_node("pin_layout_backend", registry, x=720.0, y=440.0)
     hoop_layer = graph.add_node("layer_backend", registry, x=1400.0, y=-160.0)
     hoop_layer.settings.update(
         {
@@ -1372,6 +1409,7 @@ def default_backend_winding_graph() -> NodeGraphState:
     graph.add_link(project.id, "project_config", machine.id, "project_config", registry)
     graph.add_link(machine.id, "machine_config", mandrel.id, "machine_config", registry)
     graph.add_link(mandrel.id, "mandrel", tow.id, "mandrel", registry)
+    graph.add_link(mandrel.id, "mandrel", pins.id, "mandrel", registry)
     graph.add_link(tow.id, "tow", hoop_layer.id, "material", registry)
     graph.add_link(tow.id, "tow", helical_layer.id, "material", registry)
     graph.add_link(tow.id, "tow", polar_layer.id, "material", registry)

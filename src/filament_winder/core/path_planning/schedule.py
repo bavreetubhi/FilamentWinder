@@ -17,10 +17,7 @@ from filament_winder.core.kinematics.four_axis import (
 )
 from filament_winder.core.path_planning.geodesic import (
     ControlledAnglePathConfig,
-    Direction,
-    GeodesicPathConfig,
     generate_controlled_angle_path,
-    generate_geodesic_path,
 )
 from filament_winder.core.path_planning.helical import (
     HelicalPathConfig,
@@ -1056,39 +1053,109 @@ def _plan_axisymmetric_geodesic_layer(
     theta_offset_rad: float,
 ) -> tuple[SurfacePath, WindingPatternReport, tuple[str, ...]]:
     start_z, end_z = _axisymmetric_turnaround_z_bounds(mandrel, spec)
-    circuits = _axisymmetric_pass_count(mandrel, spec)
-    phase_offset = 360.0 / circuits if spec.phase_offset_deg is None else spec.phase_offset_deg
+    selected_legs = _even_axisymmetric_lane_count(mandrel, spec)
+    circuits = max(1, selected_legs // 2)
+    phase_offset = (
+        360.0 / selected_legs if spec.phase_offset_deg is None else spec.phase_offset_deg
+    )
     chunks = []
     warnings: list[str] = []
-    for pass_number in range(circuits):
-        direction: Direction = "positive" if pass_number % 2 == 0 else "negative"
-        path, diagnostics = generate_geodesic_path(
+    motion_chunks: list[tuple[str, ...]] = []
+    current_start_theta = theta_offset_rad
+    for circuit_number in range(circuits):
+        start_theta = current_start_theta
+        forward_path, forward_diagnostics = generate_controlled_angle_path(
             mandrel,
-            GeodesicPathConfig(
-                initial_angle_deg=abs(spec.target_angle_deg),
+            ControlledAnglePathConfig(
+                target_angle_deg=abs(spec.target_angle_deg),
                 tow_width_mm=spec.tow_width_mm,
                 start_z_mm=start_z,
                 end_z_mm=end_z,
-                start_theta_rad=theta_offset_rad + math.radians(pass_number * phase_offset),
-                direction=direction,
-                turnaround_radius_mm=spec.turnaround_radius_mm,
+                start_theta_rad=start_theta,
+                direction="positive",
+                allowed_angle_error_deg=90.0,
+                high_slip_risk_deg=90.0,
                 point_count=spec.point_count,
             ),
         )
-        chunks.append(_with_pass_index(path, pass_number))
-        warnings.extend(diagnostics.warning_flags)
+        forward_path = _densify_surface_path(
+            mandrel,
+            forward_path,
+            max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
+        )
+        return_start_theta = float(forward_path.theta_rad[-1]) + math.radians(phase_offset)
+        return_path, return_diagnostics = generate_controlled_angle_path(
+            mandrel,
+            ControlledAnglePathConfig(
+                target_angle_deg=abs(spec.target_angle_deg),
+                tow_width_mm=spec.tow_width_mm,
+                start_z_mm=start_z,
+                end_z_mm=end_z,
+                start_theta_rad=return_start_theta,
+                direction="negative",
+                allowed_angle_error_deg=90.0,
+                high_slip_risk_deg=90.0,
+                point_count=spec.point_count,
+            ),
+        )
+        return_path = _densify_surface_path(
+            mandrel,
+            return_path,
+            max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
+        )
+        end_turnaround = _constant_z_turnaround_arc(
+            mandrel,
+            z_mm=float(forward_path.z_mm[-1]),
+            start_theta_rad=float(forward_path.theta_rad[-1]),
+            end_theta_rad=return_start_theta,
+            tow_width_mm=spec.tow_width_mm,
+            winding_angle_deg=abs(spec.target_angle_deg),
+            point_count=spec.turnaround_points,
+        )
+        chunks.append(_with_pass_index(forward_path, circuit_number * 2))
+        chunks.append(_with_pass_index(_drop_first_point(end_turnaround), circuit_number * 2))
+        return_path = _drop_first_point(return_path)
+        chunks.append(_with_pass_index(return_path, circuit_number * 2 + 1))
+        motion_chunks.append(tuple("wind" for _ in range(forward_path.point_count)))
+        motion_chunks.append(
+            tuple(
+                "BossTurnaroundArc"
+                for _ in range(max(end_turnaround.point_count - 1, 0))
+            )
+        )
+        motion_chunks.append(tuple("wind" for _ in range(return_path.point_count)))
+        next_start_theta = current_start_theta + math.radians(2.0 * phase_offset)
+        if circuit_number < circuits - 1:
+            start_turnaround = _constant_z_turnaround_arc(
+                mandrel,
+                z_mm=float(return_path.z_mm[-1]),
+                start_theta_rad=float(return_path.theta_rad[-1]),
+                end_theta_rad=next_start_theta,
+                tow_width_mm=spec.tow_width_mm,
+                winding_angle_deg=abs(spec.target_angle_deg),
+                point_count=spec.turnaround_points,
+            )
+            chunks.append(
+                _with_pass_index(_drop_first_point(start_turnaround), circuit_number * 2 + 1)
+            )
+            motion_chunks.append(
+                tuple(
+                    "BossTurnaroundArc"
+                    for _ in range(max(start_turnaround.point_count - 1, 0))
+                )
+            )
+            current_start_theta = float(start_turnaround.theta_rad[-1])
+        warnings.extend(forward_diagnostics.warning_flags)
+        warnings.extend(return_diagnostics.warning_flags)
     path = _concatenate_surface_paths(chunks)
     path = _apply_direction(mandrel, path, spec.direction, abs(spec.target_angle_deg))
-    path, motion_type = _insert_pass_transitions(
-        mandrel,
-        path,
-        point_count=spec.transition_points,
-    )
+    motion_type = tuple(label for chunk in motion_chunks for label in chunk)
     report = _axisymmetric_report(
         mandrel,
         spec,
         path,
         circuits=circuits,
+        winding_lanes=selected_legs,
         warnings=tuple(sorted(set(warnings))),
     )
     return path, report, motion_type
@@ -1100,38 +1167,105 @@ def _plan_axisymmetric_non_geodesic_layer(
     theta_offset_rad: float,
 ) -> tuple[SurfacePath, WindingPatternReport, tuple[str, ...]]:
     start_z, end_z = _axisymmetric_turnaround_z_bounds(mandrel, spec)
-    circuits = _axisymmetric_pass_count(mandrel, spec)
-    phase_offset = 360.0 / circuits if spec.phase_offset_deg is None else spec.phase_offset_deg
+    selected_legs = _even_axisymmetric_lane_count(mandrel, spec)
+    circuits = max(1, selected_legs // 2)
+    phase_offset = (
+        360.0 / selected_legs if spec.phase_offset_deg is None else spec.phase_offset_deg
+    )
     chunks = []
     warnings: list[str] = []
-    for pass_number in range(circuits):
-        direction: Direction = "positive" if pass_number % 2 == 0 else "negative"
-        path, diagnostics = generate_controlled_angle_path(
+    motion_chunks: list[tuple[str, ...]] = []
+    current_start_theta = theta_offset_rad
+    for circuit_number in range(circuits):
+        start_theta = current_start_theta
+        forward_path, forward_diagnostics = generate_controlled_angle_path(
             mandrel,
             ControlledAnglePathConfig(
                 target_angle_deg=abs(spec.target_angle_deg),
                 tow_width_mm=spec.tow_width_mm,
                 start_z_mm=start_z,
                 end_z_mm=end_z,
-                start_theta_rad=theta_offset_rad + math.radians(pass_number * phase_offset),
-                direction=direction,
+                start_theta_rad=start_theta,
+                direction="positive",
                 point_count=spec.point_count,
             ),
         )
-        chunks.append(_with_pass_index(path, pass_number))
-        warnings.extend(diagnostics.warning_flags)
+        forward_path = _densify_surface_path(
+            mandrel,
+            forward_path,
+            max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
+        )
+        return_start_theta = float(forward_path.theta_rad[-1]) + math.radians(phase_offset)
+        return_path, return_diagnostics = generate_controlled_angle_path(
+            mandrel,
+            ControlledAnglePathConfig(
+                target_angle_deg=abs(spec.target_angle_deg),
+                tow_width_mm=spec.tow_width_mm,
+                start_z_mm=start_z,
+                end_z_mm=end_z,
+                start_theta_rad=return_start_theta,
+                direction="negative",
+                point_count=spec.point_count,
+            ),
+        )
+        return_path = _densify_surface_path(
+            mandrel,
+            return_path,
+            max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
+        )
+        end_turnaround = _constant_z_turnaround_arc(
+            mandrel,
+            z_mm=float(forward_path.z_mm[-1]),
+            start_theta_rad=float(forward_path.theta_rad[-1]),
+            end_theta_rad=return_start_theta,
+            tow_width_mm=spec.tow_width_mm,
+            winding_angle_deg=abs(spec.target_angle_deg),
+            point_count=spec.turnaround_points,
+        )
+        chunks.append(_with_pass_index(forward_path, circuit_number * 2))
+        chunks.append(_with_pass_index(_drop_first_point(end_turnaround), circuit_number * 2))
+        return_path = _drop_first_point(return_path)
+        chunks.append(_with_pass_index(return_path, circuit_number * 2 + 1))
+        motion_chunks.append(tuple("wind" for _ in range(forward_path.point_count)))
+        motion_chunks.append(
+            tuple(
+                "BossTurnaroundArc"
+                for _ in range(max(end_turnaround.point_count - 1, 0))
+            )
+        )
+        motion_chunks.append(tuple("wind" for _ in range(return_path.point_count)))
+        next_start_theta = current_start_theta + math.radians(2.0 * phase_offset)
+        if circuit_number < circuits - 1:
+            start_turnaround = _constant_z_turnaround_arc(
+                mandrel,
+                z_mm=float(return_path.z_mm[-1]),
+                start_theta_rad=float(return_path.theta_rad[-1]),
+                end_theta_rad=next_start_theta,
+                tow_width_mm=spec.tow_width_mm,
+                winding_angle_deg=abs(spec.target_angle_deg),
+                point_count=spec.turnaround_points,
+            )
+            chunks.append(
+                _with_pass_index(_drop_first_point(start_turnaround), circuit_number * 2 + 1)
+            )
+            motion_chunks.append(
+                tuple(
+                    "BossTurnaroundArc"
+                    for _ in range(max(start_turnaround.point_count - 1, 0))
+                )
+            )
+            current_start_theta = float(start_turnaround.theta_rad[-1])
+        warnings.extend(forward_diagnostics.warning_flags)
+        warnings.extend(return_diagnostics.warning_flags)
     path = _concatenate_surface_paths(chunks)
     path = _apply_direction(mandrel, path, spec.direction, abs(spec.target_angle_deg))
-    path, motion_type = _insert_pass_transitions(
-        mandrel,
-        path,
-        point_count=spec.transition_points,
-    )
+    motion_type = tuple(label for chunk in motion_chunks for label in chunk)
     report = _axisymmetric_report(
         mandrel,
         spec,
         path,
         circuits=circuits,
+        winding_lanes=selected_legs,
         warnings=tuple(sorted(set(warnings))),
     )
     return path, report, motion_type
@@ -1500,6 +1634,97 @@ def _concatenate_surface_paths(paths: list[SurfacePath]) -> SurfacePath:
     )
 
 
+def _drop_first_point(path: SurfacePath) -> SurfacePath:
+    if path.point_count <= 1:
+        return path
+    return SurfacePath(
+        z_mm=path.z_mm[1:],
+        theta_rad=path.theta_rad[1:],
+        x_mm=path.x_mm[1:],
+        y_mm=path.y_mm[1:],
+        winding_angle_deg=path.winding_angle_deg,
+        tow_width_mm=path.tow_width_mm,
+        pass_index=(
+            np.asarray(path.pass_index, dtype=int)[1:]
+            if path.pass_index is not None
+            else None
+        ),
+        tow_eye_angle_deg=(
+            path.tow_eye_angle_deg[1:] if path.tow_eye_angle_deg is not None else None
+        ),
+    )
+
+
+def _constant_z_turnaround_arc(
+    mandrel: MandrelLike,
+    *,
+    z_mm: float,
+    start_theta_rad: float,
+    end_theta_rad: float,
+    tow_width_mm: float,
+    winding_angle_deg: float,
+    point_count: int,
+) -> SurfacePath:
+    count = max(3, min(int(point_count), 8))
+    end_theta_rad = start_theta_rad + _unwrap_delta(start_theta_rad, end_theta_rad)
+    theta_rad = np.linspace(start_theta_rad, end_theta_rad, count)
+    z_values = np.full(theta_rad.shape, z_mm, dtype=float)
+    points = mandrel.surface_points(z_values, theta_rad)
+    return SurfacePath(
+        z_mm=z_values,
+        theta_rad=theta_rad,
+        x_mm=points[:, 0],
+        y_mm=points[:, 1],
+        winding_angle_deg=winding_angle_deg,
+        tow_width_mm=tow_width_mm,
+        pass_index=np.zeros(theta_rad.shape, dtype=int),
+        tow_eye_angle_deg=np.full(theta_rad.shape, 90.0, dtype=float),
+    )
+
+
+def _densify_surface_path(
+    mandrel: MandrelLike,
+    path: SurfacePath,
+    *,
+    max_segment_length_mm: float,
+) -> SurfacePath:
+    if path.point_count < 2 or max_segment_length_mm <= 0.0:
+        return path
+    segment_lengths = np.linalg.norm(np.diff(path.points_mm, axis=0), axis=1)
+    if not np.any(segment_lengths > max_segment_length_mm):
+        return path
+    cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+    total = float(cumulative[-1])
+    if total <= 1e-9:
+        return path
+    sample_count = int(math.ceil(total / max_segment_length_mm)) + 1
+    target = np.linspace(0.0, total, sample_count)
+    theta_unwrapped = np.unwrap(path.theta_rad)
+    z_mm = np.interp(target, cumulative, path.z_mm)
+    theta_rad = np.interp(target, cumulative, theta_unwrapped)
+    points = mandrel.surface_points(z_mm, theta_rad)
+    tow_eye = (
+        None
+        if path.tow_eye_angle_deg is None
+        else np.interp(target, cumulative, path.tow_eye_angle_deg)
+    )
+    pass_index = (
+        None
+        if path.pass_index is None
+        else np.rint(np.interp(target, cumulative, path.pass_index)).astype(int)
+    )
+    return SurfacePath(
+        z_mm=z_mm,
+        theta_rad=theta_rad,
+        x_mm=points[:, 0],
+        y_mm=points[:, 1],
+        winding_angle_deg=path.winding_angle_deg,
+        tow_width_mm=path.tow_width_mm,
+        pass_index=pass_index,
+        tow_eye_angle_deg=tow_eye,
+    )
+
+
 def _concatenate_metadata(metadata: list[WindingPointMetadata]) -> WindingPointMetadata:
     if not metadata:
         raise ValueError("cannot concatenate empty metadata")
@@ -1737,16 +1962,28 @@ def _axisymmetric_pass_count(
     return coverage_passes
 
 
+def _even_axisymmetric_lane_count(
+    mandrel: AxisymmetricProfileMandrel,
+    spec: WindingLayerSpec,
+) -> int:
+    lane_count = max(1, _axisymmetric_pass_count(mandrel, spec))
+    if lane_count % 2:
+        lane_count += 1
+    return max(2, lane_count)
+
+
 def _axisymmetric_report(
     mandrel: AxisymmetricProfileMandrel,
     spec: WindingLayerSpec,
     path: SurfacePath,
     *,
     circuits: int,
+    winding_lanes: int | None = None,
     warnings: tuple[str, ...],
 ) -> WindingPatternReport:
+    effective_lanes = max(winding_lanes or circuits, 1)
     circumference = 2.0 * math.pi * max(mandrel.max_radius_mm, 1e-9)
-    tow_spacing = circumference / max(circuits, 1)
+    tow_spacing = circumference / effective_lanes
     gap_mm = max(tow_spacing - spec.tow_width_mm, 0.0)
     overlap_mm = max(spec.tow_width_mm - tow_spacing, 0.0)
     all_warnings = tuple(sorted(set(warnings + _pattern_warnings(
@@ -1763,9 +2000,9 @@ def _axisymmetric_report(
         target_angle_deg=spec.target_angle_deg,
         actual_angle_deg=_signed_angle(spec.direction, abs(spec.target_angle_deg)),
         angle_error_deg=0.0,
-        circuits=circuits,
+        circuits=effective_lanes,
         starts=circuits,
-        angular_shift_deg=360.0 / max(circuits, 1),
+        angular_shift_deg=360.0 / effective_lanes,
         tow_spacing_mm=tow_spacing,
         coverage_percent=spec.tow_width_mm / tow_spacing * 100.0,
         gap_mm=gap_mm,

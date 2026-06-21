@@ -1043,6 +1043,8 @@ def _run_backend_check(args: argparse.Namespace) -> int:
     optimisation_status = summary.get("pattern_optimisation_status", {})
     polar_status = summary.get("polar_overbuild_status", {})
     collision_status = summary.get("collision_status", {})
+    shoulder_status = summary.get("shoulder_quality_status", {})
+    reachability_status = summary.get("machine_reachability_status", {})
     checks = {
         "Config": config_ok,
         "Pattern optimisation": bool(
@@ -1076,6 +1078,14 @@ def _run_backend_check(args: argparse.Namespace) -> int:
         "Collision": bool(
             isinstance(collision_status, dict) and collision_status.get("collision_passed", True)
         ),
+        "Shoulder pins": bool(
+            isinstance(shoulder_status, dict)
+            and shoulder_status.get("shoulder_quality_passed", True)
+        ),
+        "Machine reachability": bool(
+            isinstance(reachability_status, dict)
+            and reachability_status.get("machine_reachability_passed", True)
+        ),
         "Exports": exports_ok,
     }
     overall = all(checks.values())
@@ -1083,6 +1093,7 @@ def _run_backend_check(args: argparse.Namespace) -> int:
     print("-------------")
     for label, passed in checks.items():
         print(f"{label}: {'PASS' if passed else 'FAIL'}")
+    print(f"Backend-ready: {str(bool(summary.get('backend_ready', overall))).lower()}")
     print(f"Machine-ready: {str(bool(summary.get('machine_ready'))).lower()}")
     print(f"Overall backend-ready: {str(overall).lower()}")
     return 0 if overall else 1
@@ -1099,6 +1110,12 @@ def _backend_required_exports_exist(result: object) -> bool:
         getattr(result, "friction_margin_report_path", None),
         getattr(result, "polar_overbuild_report_path", None),
         getattr(result, "collision_report_path", None),
+        getattr(result, "pin_layout_report_path", None),
+        getattr(result, "pin_contact_report_path", None),
+        getattr(result, "pin_buildup_report_path", None),
+        getattr(result, "pin_slip_report_path", None),
+        getattr(result, "shoulder_quality_report_path", None),
+        getattr(result, "machine_reachability_report_path", None),
         getattr(result, "machine_smoothing_report_path", None),
         getattr(result, "pattern_optimisation_report_path", None),
         getattr(result, "candidate_pair_report_path", None),
@@ -1141,6 +1158,7 @@ def _format_manufacturing_status(summary: dict[str, object]) -> str:
     hoop_pass = isinstance(layer_status, dict) and bool(
         layer_status.get("continuous_traverse_passed", True)
     )
+    backend_ready = bool(summary.get("backend_ready"))
     machine_ready = bool(summary.get("machine_ready"))
     return (
         "\nManufacturing Readiness\n"
@@ -1152,6 +1170,7 @@ def _format_manufacturing_status(summary: dict[str, object]) -> str:
         f"Region quality: {'PASS' if region_pass else 'FAIL'}\n"
         f"Pattern optimisation: {'PASS' if optimisation_pass else 'FAIL'}\n"
         f"Machine kinematics: {'PASS' if machine_pass else 'FAIL'}\n"
+        f"Backend-ready: {str(backend_ready).lower()}\n"
         f"Overall machine-ready: {str(machine_ready).lower()}"
     )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import os
 from pathlib import Path
 
 import numpy as np
@@ -23,10 +24,17 @@ def export_motion_table_csv(motion_table: MachineMotionTable, output_path: str |
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = ["index", "A_deg", "X_mm", "Z_mm", "B_deg"]
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+    tmp_path = _tmp_csv_path(path)
+    with tmp_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=fieldnames,
+            lineterminator="\n",
+            extrasaction="raise",
+        )
         writer.writeheader()
         writer.writerows(motion_table.rows())
+    os.replace(tmp_path, path)
     return path
 
 
@@ -67,8 +75,14 @@ def export_winding_csv(
                 "slip_risk",
             ]
         )
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+    tmp_path = _tmp_csv_path(path)
+    with tmp_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=fieldnames,
+            lineterminator="\n",
+            extrasaction="raise",
+        )
         writer.writeheader()
         pass_index = (
             np.zeros(surface_path.point_count, dtype=int)
@@ -103,6 +117,7 @@ def export_winding_csv(
                     }
                 )
             writer.writerow(row)
+    os.replace(tmp_path, path)
     return path
 
 
@@ -123,11 +138,15 @@ def export_winding_program_csv(
         "motion_type",
         "segment_id",
         "segment_type",
+        "pin_id",
+        "region",
         "tow_state",
         "process_state",
         "circuit_index",
+        "winding_index",
         "pass_id",
         "pass_index",
+        "phase_angle_deg",
         "point_role",
         "winding_type",
         "time_s",
@@ -167,8 +186,14 @@ def export_winding_program_csv(
         "curvature_radius_mm",
         "slip_risk",
     ]
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+    tmp_path = _tmp_csv_path(path)
+    with tmp_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=fieldnames,
+            lineterminator="\n",
+            extrasaction="raise",
+        )
         writer.writeheader()
         time_s = _program_time_s(program)
         surface_speed = _surface_speed_mm_min(program, time_s)
@@ -181,23 +206,28 @@ def export_winding_program_csv(
         theta_mod_rad = np.mod(program.path.theta_rad, 2.0 * np.pi)
         for index in range(program.point_count):
             segment_id, segment_type, point_role, tow_state, process_state = point_segments[index]
+            warning_flags = program.metadata.warning_flags[index]
             writer.writerow(
                 {
                     "index": index,
-                    "layer_id": program.metadata.layer_id[index],
+                    "layer_id": _csv_text(program.metadata.layer_id[index]),
                     "layer_index": int(program.metadata.layer_index[index]),
-                    "layer_name": program.metadata.layer_name[index],
-                    "layer_type": program.metadata.winding_type[index],
-                    "motion_type": program.metadata.motion_type[index],
-                    "segment_id": segment_id,
-                    "segment_type": segment_type,
-                    "tow_state": tow_state,
-                    "process_state": process_state,
+                    "layer_name": _csv_text(program.metadata.layer_name[index]),
+                    "layer_type": _csv_text(program.metadata.winding_type[index]),
+                    "motion_type": _csv_text(program.metadata.motion_type[index]),
+                    "segment_id": _csv_text(segment_id),
+                    "segment_type": _csv_text(segment_type),
+                    "pin_id": _pin_id_from_warning(warning_flags),
+                    "region": _region_from_point(segment_type, warning_flags),
+                    "tow_state": _csv_text(tow_state),
+                    "process_state": _csv_text(process_state),
                     "circuit_index": int(program.metadata.circuit_index[index]),
+                    "winding_index": int(program.metadata.pass_index[index]),
                     "pass_id": int(program.metadata.pass_index[index]),
                     "pass_index": int(program.metadata.pass_index[index]),
-                    "point_role": point_role,
-                    "winding_type": program.metadata.winding_type[index],
+                    "phase_angle_deg": float(np.rad2deg(theta_mod_rad[index])),
+                    "point_role": _csv_text(point_role),
+                    "winding_type": _csv_text(program.metadata.winding_type[index]),
                     "time_s": float(time_s[index]),
                     "z_mm": float(program.path.z_mm[index]),
                     "r_mm": float(program.metadata.local_radius_mm[index]),
@@ -234,7 +264,7 @@ def export_winding_program_csv(
                         program.metadata.warning_flags[index]
                     ),
                     "coverage_count": 0,
-                    "warning_flags": program.metadata.warning_flags[index],
+                    "warning_flags": _csv_text(warning_flags),
                     "curvature_1_per_mm": float(
                         program.feed_schedule.curvature_1_per_mm[index]
                     ),
@@ -244,7 +274,16 @@ def export_winding_program_csv(
                     "slip_risk": float(program.feed_schedule.slip_risk[index]),
                 }
             )
+    os.replace(tmp_path, path)
     return path
+
+
+def _csv_text(value: object) -> str:
+    return str(value).replace("\r", " ").replace("\n", " ").strip()
+
+
+def _tmp_csv_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.{os.getpid()}.tmp")
 
 
 def _program_time_s(program: PlannedWindingProgram) -> np.ndarray:
@@ -304,6 +343,24 @@ def _velocity(values: np.ndarray, time_s: np.ndarray) -> np.ndarray:
 
 def _csv_finite(value: float) -> float:
     return float(value) if np.isfinite(value) else 1.0e12
+
+
+def _pin_id_from_warning(warning: str) -> str:
+    if "pin_id=" not in warning:
+        return ""
+    return warning.split("pin_id=", 1)[1].split(";", 1)[0]
+
+
+def _region_from_point(segment_type: str, warning: str) -> str:
+    if segment_type == "PinContactArc":
+        return "shoulder_pin"
+    if "dome_side=left" in warning:
+        return "left_dome"
+    if "dome_side=right" in warning:
+        return "right_dome"
+    if segment_type == "CylinderHelixSpan":
+        return "cylinder"
+    return ""
 
 
 def _warning_slip_risk_deg(warning: str) -> float:

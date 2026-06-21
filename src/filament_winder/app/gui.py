@@ -6,6 +6,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import math
 import sys
 import time
 import traceback
@@ -274,6 +275,10 @@ class _PreviewWindow:
         self._task_total_steps = 0
         self._task_completed_steps = 0
         self._task_name = ""
+        self._task_progress_ticks = 0
+        self._task_progress_timer = qt_core.QTimer()
+        self._task_progress_timer.setInterval(500)
+        self._task_progress_timer.timeout.connect(self._tick_task_progress)
         self._node_zoom = 1.0
         self._node_panning = False
         self._node_pan_last_pos: Any | None = None
@@ -1023,6 +1028,13 @@ class _PreviewWindow:
             "Run + Export",
             lambda: self._execute_node_graph(execute_exports=True),
         )
+        update_everything = qt_widgets.QPushButton("Update Everything")
+        update_everything.setToolTip("Rebuild config, paths, reports, plots, CSV, and G-code.")
+        self._connect_safe_button(
+            update_everything,
+            "Update Everything",
+            self._update_everything,
+        )
         optimize_pattern = qt_widgets.QPushButton("Optimize Pattern")
         self._connect_safe_button(optimize_pattern, "Optimise Pattern", self._optimize_pattern)
         toolbar.addWidget(add_nodes)
@@ -1053,6 +1065,7 @@ class _PreviewWindow:
         toolbar.addWidget(run_branch)
         toolbar.addWidget(run_graph)
         toolbar.addWidget(export_graph)
+        toolbar.addWidget(update_everything)
         toolbar.addWidget(optimize_pattern)
         toolbar_scroll = qt_widgets.QScrollArea()
         toolbar_scroll.setObjectName("nodeToolbarScroll")
@@ -1410,6 +1423,7 @@ class _PreviewWindow:
         self._task_started_at = time.monotonic()
         self._task_total_steps = max(0, int(total_steps))
         self._task_completed_steps = 0
+        self._task_progress_ticks = 0
         self._task_name = name
         if not hasattr(self, "task_progress"):
             return
@@ -1417,7 +1431,20 @@ class _PreviewWindow:
             self.task_progress.setRange(0, self._task_total_steps)
             self.task_progress.setValue(0)
         else:
-            self.task_progress.setRange(0, 0)
+            self.task_progress.setRange(0, 100)
+            self.task_progress.setValue(3)
+        if hasattr(self, "_task_progress_timer"):
+            self._task_progress_timer.start()
+        self._update_task_progress_label()
+
+    def _tick_task_progress(self) -> None:
+        if not self._backend_busy and not self._task_name:
+            return
+        self._task_progress_ticks += 1
+        if hasattr(self, "task_progress") and not self._task_total_steps:
+            current = self.task_progress.value()
+            next_value = min(95, max(current + 1, int(8 + self._task_progress_ticks * 1.5)))
+            self.task_progress.setValue(next_value)
         self._update_task_progress_label()
 
     def _update_task_progress(self, completed_steps: int | None = None) -> None:
@@ -1435,16 +1462,22 @@ class _PreviewWindow:
         self._update_task_progress_label()
 
     def _finish_task_progress(self, message: str = "Complete") -> None:
+        if hasattr(self, "_task_progress_timer"):
+            self._task_progress_timer.stop()
         if hasattr(self, "task_progress"):
             self.task_progress.setRange(0, 100)
             self.task_progress.setValue(100)
         self._update_task_progress_label(done_message=message)
+        self._task_name = ""
 
     def _fail_task_progress(self, message: str = "Failed") -> None:
+        if hasattr(self, "_task_progress_timer"):
+            self._task_progress_timer.stop()
         if hasattr(self, "task_progress"):
             self.task_progress.setRange(0, 100)
             self.task_progress.setValue(0)
         self._update_task_progress_label(done_message=message)
+        self._task_name = ""
 
     def _update_task_progress_label(self, *, done_message: str | None = None) -> None:
         if not hasattr(self, "task_time_label"):
@@ -1468,7 +1501,10 @@ class _PreviewWindow:
         elif self._task_total_steps:
             self.task_time_label.setText(f"{task_name}: 0/{self._task_total_steps}")
         else:
-            self.task_time_label.setText(f"{task_name}: {elapsed:.1f}s elapsed")
+            percent = self.task_progress.value() if hasattr(self, "task_progress") else 0
+            self.task_time_label.setText(
+                f"{task_name}: running {elapsed:.1f}s elapsed, progress {percent}%"
+            )
 
     def _log_graph_event(self, message: str) -> None:
         self._logger.info(message)
@@ -2239,6 +2275,22 @@ class _PreviewWindow:
                 "require_gcd_clean_pattern",
             ),
             "coverage_mode": ("stack_level_full_coverage", "paired_layer_coverage"),
+            "pin_layout_backend": (
+                "enabled",
+                "routing_mode",
+                "candidate_count",
+                "route_step_size",
+                "wrap_direction",
+                "count_per_shoulder",
+                "angular_offset_deg",
+                "pin_radius_mm",
+                "pin_height_mm",
+                "pin_standoff_mm",
+                "shoulder_zone_width_mm",
+                "target_dome_angle_min_deg",
+                "target_dome_angle_max_deg",
+                "coverage_tolerance_mm",
+            ),
             "plot_backend": ("enabled", "output_directory"),
             "csv_backend_export": ("enabled",),
             "gcode_backend_export": ("enabled",),
@@ -3335,6 +3387,7 @@ class _PreviewWindow:
             "tow_backend": "tow and material settings",
             "layer_stack_backend": "backend layer stack",
             "layer_backend": "angle-driven layer definition",
+            "pin_layout_backend": "symmetric shoulder cross-pin layout",
             "hoop_layer": "single hoop layer definition",
             "geodesic_layer": "single geodesic dome layer definition",
             "non_geodesic_layer": "single controlled non-geodesic layer definition",
@@ -3783,6 +3836,7 @@ class _PreviewWindow:
             "layer_stack_backend",
             "pattern_optimisation_backend",
             "coverage_mode",
+            "pin_layout_backend",
             "validation_backend",
             "backend_check",
             "plot_backend",
@@ -3887,6 +3941,20 @@ class _PreviewWindow:
     def _run_backend_generate(self) -> None:
         self._start_backend_service_worker("generate")
 
+    def _update_everything(self) -> None:
+        self._set_node_status("Updating everything from current node settings...")
+        self._last_backend_check = None
+        self._last_loaded_reports = None
+        self._last_loaded_plots = None
+        self._current_plot_path = None
+        if hasattr(self, "backend_report_panel"):
+            self.backend_report_panel.clear()
+        if hasattr(self, "node_debug_log"):
+            self.node_debug_log.appendPlainText("Update Everything: stale artifacts cleared")
+        # Keep the current mandrel viewport visible while the backend job runs.
+        # The finished callback redraws it from the updated node graph/config.
+        self._start_backend_service_worker("generate")
+
     def _run_backend_csv_export(self) -> None:
         self._start_backend_service_worker("export_csv")
 
@@ -3982,6 +4050,8 @@ class _PreviewWindow:
             self._set_node_status(f"Backend check complete: {status}")
             if payload.traceback_text:
                 self.node_debug_log.appendPlainText(payload.traceback_text)
+            if operation == "generate":
+                self._render_from_node()
         elif isinstance(payload, Path):
             self._mark_backend_nodes_passed(f"Wrote {payload}")
             self._set_node_status(f"{operation.replace('_', ' ').title()} complete: {payload}")
@@ -4284,6 +4354,54 @@ class _PreviewWindow:
         self.status.setText(
             f"Mode: node graph\nLayers: {len(program.layers)}\nPoints: {program.point_count}"
         )
+
+    def _render_pin_layout_visuals(self, config: WindingJobConfig, mandrel: Any) -> None:
+        pins = config.pin_layout
+        if not pins.enabled:
+            return
+        pin_rows = self._pin_layout_points(config, mandrel)
+        if not pin_rows:
+            return
+        scene = self._vispy_scene
+        for start, end in pin_rows:
+            display = orient_points_for_horizontal_view(
+                np.asarray([start, end], dtype=float),
+                length_mm=mandrel.length_mm,
+            )
+            self._visuals.append(
+                scene.visuals.Line(
+                    pos=display,
+                    color=(1.0, 0.82, 0.18, 1.0),
+                    width=max(2.0, float(pins.pin_radius_mm)),
+                    parent=self.view.scene,
+                )
+            )
+            self._visuals[-1].set_gl_state("opaque", depth_test=True)
+
+    def _pin_layout_points(self, config: WindingJobConfig, mandrel: Any) -> list[tuple[Any, Any]]:
+        pins = config.pin_layout
+        length = float(mandrel.length_mm)
+        left = pins.left_shoulder_z_mm
+        right = pins.right_shoulder_z_mm
+        if left is None:
+            left = config.mandrel.left_dome_length_mm or length * 0.25
+        if right is None:
+            right = length - (config.mandrel.right_dome_length_mm or length * 0.25)
+        shoulders = ("left", "right") if pins.shoulders == "both" else (pins.shoulders,)
+        z_by_shoulder = {"left": float(left), "right": float(right)}
+        rows = []
+        step = 360.0 / max(1, int(pins.count_per_shoulder))
+        for shoulder in shoulders:
+            z_mm = max(0.0, min(length, z_by_shoulder[shoulder]))
+            radius = float(mandrel.radius_at(np.asarray([z_mm], dtype=float))[0])
+            for index in range(max(1, int(pins.count_per_shoulder))):
+                phi = math.radians((float(pins.angular_offset_deg) + index * step) % 360.0)
+                radial = np.asarray([math.cos(phi), math.sin(phi), 0.0], dtype=float)
+                surface = np.asarray([radius * radial[0], radius * radial[1], z_mm], dtype=float)
+                start = surface + radial * float(pins.pin_standoff_mm)
+                end = start + radial * float(pins.pin_height_mm)
+                rows.append((start, end))
+        return rows
 
     def _node_double_spin(self, source: Any) -> Any:
         spin = self._double_spin(
@@ -4904,6 +5022,7 @@ class _PreviewWindow:
             )
         )
         self._visuals[-1].set_gl_state("opaque", depth_test=True, cull_face=False)
+        self._render_pin_layout_visuals(config, mandrel)
         colors = (
             (0.10, 0.58, 1.0, 1.0),
             (1.0, 0.52, 0.12, 1.0),

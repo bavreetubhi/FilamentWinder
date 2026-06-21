@@ -131,7 +131,11 @@ def _make_segment(
         start_state=_state_at(program, time_s, start_index),
         end_state=_state_at(program, time_s, end_index),
         tow_state="on",
-        process_state="transition" if motion_type == "transition" else "winding",
+        process_state=(
+            "transition"
+            if motion_type in {"transition", "PinTransition", "FreeSpan", "BossTurnaroundArc"}
+            else "winding"
+        ),
         warnings=_segment_warnings(program, start_index, end_index),
     )
 
@@ -164,6 +168,16 @@ def _segment_type(
     z_mm: np.ndarray,
     theta_rad: np.ndarray,
 ) -> str:
+    if motion_type in {
+        "SurfaceSpan",
+        "CylinderHelixSpan",
+        "DomeSurfaceSpan",
+        "PinContactArc",
+        "PinTransition",
+        "FreeSpan",
+        "BossTurnaroundArc",
+    }:
+        return motion_type
     if motion_type == "transition":
         if layer_type in {"geodesic", "non_geodesic"}:
             return "dome_turnaround"

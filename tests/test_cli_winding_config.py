@@ -224,6 +224,62 @@ def test_polar_layer_placeholder_does_not_crash(tmp_path: Path) -> None:
     assert result.polar_overbuild_report_path.exists()
 
 
+def test_shoulder_cross_pin_routing_exports_real_segments(tmp_path: Path) -> None:
+    config_path = _write_pin_config(tmp_path)
+    result = generate_winding_job(load_winding_config(config_path))
+
+    assert result.csv_path is not None
+    assert result.segments_path is not None
+    segments = json.loads(result.segments_path.read_text(encoding="utf-8"))
+    segment_types = {row["segment_type"] for row in segments}
+    assert "PinContactArc" in segment_types
+    assert "DomeSurfaceSpan" in segment_types
+    assert "phase_reposition" not in segment_types
+    assert result.summary["shoulder_quality_status"]["shoulder_quality_passed"] is False
+    assert result.summary["shoulder_quality_status"]["dome_coverage_passed"] is True
+    assert result.left_dome_coverage_report_path is not None
+    assert result.right_dome_coverage_report_path is not None
+    assert result.dome_thickness_map_path is not None
+    assert result.dome_overbuild_report_path is not None
+
+    with result.csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert any(row["segment_type"] == "PinContactArc" and row["pin_id"] for row in rows)
+    assert any(row["segment_type"] == "DomeSurfaceSpan" for row in rows)
+
+
+def test_pin_routing_mode_deterministic_keeps_current_behavior(tmp_path: Path) -> None:
+    config_path = _write_pin_config(tmp_path, routing_mode="deterministic")
+    result = generate_winding_job(load_winding_config(config_path))
+
+    assert result.pin_route_selected_path is not None
+    selected = json.loads(result.pin_route_selected_path.read_text(encoding="utf-8"))
+    assert selected["summary"]["selected_candidate_id"] == "deterministic"
+    assert result.summary["shoulder_quality_status"]["has_real_pin_contact_arc"] is True
+    assert result.summary["shoulder_quality_status"]["has_real_dome_surface_span"] is True
+    assert result.summary["shoulder_quality_status"]["dome_coverage_passed"] is True
+
+
+def test_pin_routing_mode_optimise_candidates_exports_score_reports(tmp_path: Path) -> None:
+    config_path = _write_pin_config(tmp_path, routing_mode="optimise_candidates")
+
+    result = generate_winding_job(load_winding_config(config_path))
+
+    assert result.pin_route_score_report_path is not None
+    assert result.pin_route_score_report_path.exists()
+    assert result.summary["shoulder_quality_status"]["dome_coverage_passed"] is True
+
+
+def test_pin_route_invalid_candidates_are_rejected_with_reasons(tmp_path: Path) -> None:
+    config_path = _write_pin_config(
+        tmp_path,
+        routing_mode="optimise_candidates",
+        max_x_mm=60.0,
+    )
+    with pytest.raises(ValueError, match="no valid shoulder cross-pin route"):
+        generate_winding_job(load_winding_config(config_path))
+
+
 def test_cli_validate_and_generate_commands_run(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -371,6 +427,91 @@ plot:
   modes: [unwrapped, three_d, debug_passes, debug_transitions]
   include_2d_unwrapped: true
   include_3d_path: true
+""",
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def _write_pin_config(
+    tmp_path: Path,
+    *,
+    routing_mode: str = "deterministic",
+    pin_radius_mm: float = 5.0,
+    min_bend_radius_mm: float = 4.0,
+    max_x_mm: float = 250.0,
+    coverage_tolerance_mm: float = 100.0,
+) -> Path:
+    output_dir = (tmp_path / "pin_out").as_posix()
+    config_path = tmp_path / "pin_stack.yaml"
+    config_path.write_text(
+        f"""project:
+  name: pin_stack
+  units: mm
+
+machine:
+  axis_order: [A, X, Z, B]
+  clearance_mm: 15
+  max_x_mm: {max_x_mm}
+
+mandrel:
+  type: cylinder_with_elliptical_domes
+  cylinder_length_mm: 500
+  cylinder_radius_mm: 80
+  left_dome_length_mm: 120
+  right_dome_length_mm: 120
+  polar_opening_radius_mm: 0
+
+tow:
+  tow_id: carbon
+  name: carbon
+  width_mm: 6.0
+  effective_width_mm: 6.0
+  calibrated_effective_width: true
+  thickness_mm: 0.25
+  min_bend_radius_mm: 4.0
+  friction_coefficient: 0.35
+  calibrated_friction: true
+
+pin_layout:
+  enabled: true
+  type: shoulder_cross
+  shoulders: both
+  count_per_shoulder: 4
+  routing_mode: {routing_mode}
+  candidate_count: 192
+  route_step_size: 0
+  wrap_direction: both
+  target_dome_angle_min_deg: 25
+  target_dome_angle_max_deg: 55
+  coverage_tolerance_mm: {coverage_tolerance_mm}
+  pin_radius_mm: {pin_radius_mm}
+  pin_height_mm: 20.0
+  pin_standoff_mm: 3.0
+  min_bend_radius_mm: {min_bend_radius_mm}
+  friction_coefficient: 0.35
+
+layers:
+  - name: helical_dome
+    enabled: true
+    type: geodesic
+    winding_angle_deg: 45
+    passes: auto
+    coverage_target: 0.5
+    start_z_mm: 0
+    end_z_mm: 740
+    points: 120
+
+output:
+  directory: "{output_dir}"
+  csv: true
+  summary_json: true
+  segments_json: true
+  gcode: true
+  coverage_grid: true
+
+plot:
+  enabled: false
 """,
         encoding="utf-8",
     )
