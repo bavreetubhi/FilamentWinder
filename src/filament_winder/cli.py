@@ -532,6 +532,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=180,
         help="Coverage grid samples around theta",
     )
+    preview.add_argument(
+        "--debug-gui",
+        action="store_true",
+        help="Enable extra GUI logging and Qt exception safety hooks",
+    )
     preview.set_defaults(func=_run_preview)
     return parser
 
@@ -1036,6 +1041,8 @@ def _run_backend_check(args: argparse.Namespace) -> int:
     region_status = summary.get("region_quality_status", {})
     machine_status = summary.get("machine_smoothing_status", {})
     optimisation_status = summary.get("pattern_optimisation_status", {})
+    polar_status = summary.get("polar_overbuild_status", {})
+    collision_status = summary.get("collision_status", {})
     checks = {
         "Config": config_ok,
         "Pattern optimisation": bool(
@@ -1063,13 +1070,20 @@ def _run_backend_check(args: argparse.Namespace) -> int:
             isinstance(machine_status, dict)
             and machine_status.get("machine_kinematics_passed")
         ),
+        "Polar overbuild report": bool(
+            isinstance(polar_status, dict) and "polar_buildup_mm" in polar_status
+        ),
+        "Collision": bool(
+            isinstance(collision_status, dict) and collision_status.get("collision_passed", True)
+        ),
         "Exports": exports_ok,
     }
-    overall = bool(summary.get("machine_ready")) and all(checks.values())
+    overall = all(checks.values())
     print("Backend Check")
     print("-------------")
     for label, passed in checks.items():
         print(f"{label}: {'PASS' if passed else 'FAIL'}")
+    print(f"Machine-ready: {str(bool(summary.get('machine_ready'))).lower()}")
     print(f"Overall backend-ready: {str(overall).lower()}")
     return 0 if overall else 1
 
@@ -1081,6 +1095,10 @@ def _backend_required_exports_exist(result: object) -> bool:
         getattr(result, "layer_completion_report_path", None),
         getattr(result, "stack_coverage_report_path", None),
         getattr(result, "region_quality_report_path", None),
+        getattr(result, "calibration_report_path", None),
+        getattr(result, "friction_margin_report_path", None),
+        getattr(result, "polar_overbuild_report_path", None),
+        getattr(result, "collision_report_path", None),
         getattr(result, "machine_smoothing_report_path", None),
         getattr(result, "pattern_optimisation_report_path", None),
         getattr(result, "candidate_pair_report_path", None),
@@ -1408,8 +1426,9 @@ def _run_preview(args: argparse.Namespace) -> int:
                 config,
                 profile_config=profile_config,
                 initial_mode="profile-dome",
+                debug_gui=args.debug_gui,
             )
-        return launch_cylinder_preview(config)
+        return launch_cylinder_preview(config, debug_gui=args.debug_gui)
     except GuiDependencyError as exc:
         print(f"Preview unavailable: {exc}", file=sys.stderr)
         return 2

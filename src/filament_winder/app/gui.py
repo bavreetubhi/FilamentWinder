@@ -7,8 +7,10 @@ import importlib.util
 import json
 import logging
 import sys
+import time
 import traceback
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -63,7 +65,12 @@ from filament_winder.app.project_binding import (
     profile_config_from_project,
     project_from_preview_config,
 )
-from filament_winder.core.geometry import CylinderMandrel
+from filament_winder.config import WindingJobConfig
+from filament_winder.core.geometry import (
+    AxisymmetricProfileMandrel,
+    CylinderMandrel,
+    cylinder_with_domes_profile,
+)
 from filament_winder.core.path_planning import (
     CylinderPatternOptimizationRequest,
     WindingLayerSpec,
@@ -80,6 +87,8 @@ from filament_winder.io import (
 from filament_winder.project import load_project, save_project
 
 GUI_LOG_PATH = Path("logs/filament_winder_gui.log")
+_ORIGINAL_EXCEPTHOOK = sys.excepthook
+NODE_CANVAS_SCENE_RECT = (-10000.0, -6000.0, 20000.0, 12000.0)
 
 
 def _gui_logger() -> logging.Logger:
@@ -95,6 +104,37 @@ def _gui_logger() -> logging.Logger:
     logger.setLevel(logging.INFO)
     logger.propagate = False
     return logger
+
+
+def install_gui_exception_hook(logger: logging.Logger | None = None) -> None:
+    """Install a last-resort hook so uncaught GUI errors are logged."""
+
+    resolved_logger = _gui_logger() if logger is None else logger
+
+    def _hook(exc_type: type[BaseException], exc: BaseException, tb: Any) -> None:
+        resolved_logger.critical(
+            "Unhandled GUI exception\n%s",
+            "".join(traceback.format_exception(exc_type, exc, tb)),
+        )
+        _ORIGINAL_EXCEPTHOOK(exc_type, exc, tb)
+
+    sys.excepthook = _hook
+
+
+def _create_qapplication(qt_widgets: Any, argv: list[str], logger: logging.Logger) -> Any:
+    existing = qt_widgets.QApplication.instance()
+    if existing is not None:
+        return existing
+
+    class _SafeApplication(qt_widgets.QApplication):  # type: ignore[name-defined, misc, valid-type]
+        def notify(self, receiver: Any, event: Any) -> bool:  # noqa: N802
+            try:
+                return bool(super().notify(receiver, event))
+            except Exception:  # noqa: BLE001 - final GUI safety net
+                logger.critical("Unhandled Qt event exception\n%s", traceback.format_exc())
+                return False
+
+    return _SafeApplication(argv)
 
 
 class GuiDependencyError(RuntimeError):
@@ -117,6 +157,7 @@ def launch_cylinder_preview(
     *,
     profile_config: ProfileDomePreviewConfig | None = None,
     initial_mode: str = "cylinder",
+    debug_gui: bool = False,
 ) -> int:
     """Launch a live cylinder preview window."""
 
@@ -129,7 +170,11 @@ def launch_cylinder_preview(
         vispy_arcball,
         vispy_quaternion,
     ) = _load_gui_modules()
-    app = qt_widgets.QApplication.instance() or qt_widgets.QApplication(sys.argv[:1])
+    logger = _gui_logger()
+    if debug_gui:
+        logger.setLevel(logging.DEBUG)
+    install_gui_exception_hook(logger)
+    app = _create_qapplication(qt_widgets, sys.argv[:1], logger)
     window = _PreviewWindow(
         qt_widgets,
         qt_core,
@@ -187,6 +232,7 @@ class _PreviewWindow:
         self._logger.info("Application startup")
         self._backend_service = BackendService()
         self._backend_busy = False
+        self._closing = False
         self._safe_buttons: list[Any] = []
         self._last_backend_check: BackendCheckResult | None = None
         self._last_loaded_reports: LoadedReportSet | None = None
@@ -204,7 +250,19 @@ class _PreviewWindow:
         self._socket_items: dict[tuple[str, str, str], Any] = {}
         self._node_link_items: list[Any] = []
         self._node_group_items: list[Any] = []
+        self._retired_node_scenes: list[Any] = []
+        self._node_inline_widgets: list[Any] = []
         self._refreshing_node_links = False
+        self._node_link_refresh_queued = False
+        self._node_position_sync_queued = False
+        self._redrawing_node_graph = False
+        self._applying_node_selection = False
+        self._node_setting_render_pending = False
+        self._node_graph_redraw_queued = False
+        self._queued_node_selection: tuple[str, ...] = ()
+        self._queued_link_selection: tuple[str, ...] = ()
+        self._selected_node_id_cache: tuple[str, ...] = ()
+        self._selected_link_id_cache: tuple[str, ...] = ()
         self._node_socket_drag: dict[str, str] | None = None
         self._node_temp_link_item: Any | None = None
         self._node_highlight_socket: Any | None = None
@@ -212,6 +270,10 @@ class _PreviewWindow:
         self._viewport_node_context: str | None = None
         self._node_thread_pool = qt_core.QThreadPool.globalInstance()
         self._node_workers: list[Any] = []
+        self._task_started_at: float | None = None
+        self._task_total_steps = 0
+        self._task_completed_steps = 0
+        self._task_name = ""
         self._node_zoom = 1.0
         self._node_panning = False
         self._node_pan_last_pos: Any | None = None
@@ -219,7 +281,16 @@ class _PreviewWindow:
         self._node_suppress_context_menu = False
         self._node_space_down = False
 
-        self.widget = qt_widgets.QMainWindow()
+        class _PreviewMainWindow(qt_widgets.QMainWindow):  # type: ignore[name-defined, misc, valid-type]
+            def __init__(self, owner: _PreviewWindow) -> None:
+                super().__init__()
+                self._owner = owner
+
+            def closeEvent(self, event: Any) -> None:  # noqa: N802
+                self._owner._cleanup_node_scenes_for_close()
+                super().closeEvent(event)
+
+        self.widget = _PreviewMainWindow(self)
         self.widget.setWindowTitle("FilamentWinder Preview")
         self.widget.setStyleSheet(_modern_stylesheet())
         central = qt_widgets.QWidget()
@@ -374,8 +445,10 @@ class _PreviewWindow:
     def run_safe_action(self, action_name: str, callback: Callable[[], Any]) -> Any | None:
         """Run a GUI action without allowing exceptions to escape into Qt."""
 
+        selected_count = len(self._selected_node_ids()) if hasattr(self, "node_scene") else 0
         self._logger.info("Button clicked: %s", action_name)
-        self._logger.info("Action started: %s", action_name)
+        self._logger.info("Action started: %s selected_nodes=%s", action_name, selected_count)
+        self._append_gui_log(action_name, "started", f"selected_nodes={selected_count}")
         previous_status = self.status.text() if hasattr(self, "status") else ""
         self._set_gui_status(f"Running: {action_name}")
         try:
@@ -384,6 +457,7 @@ class _PreviewWindow:
             self.handle_gui_error(action_name, exc)
             return None
         self._logger.info("Action completed: %s", action_name)
+        self._append_gui_log(action_name, "complete", "")
         if hasattr(self, "status") and self.status.text() in {
             f"Running: {action_name}",
             previous_status,
@@ -409,7 +483,12 @@ class _PreviewWindow:
     def handle_gui_error(self, action_name: str, exc: BaseException) -> None:
         message = f"{action_name} failed: {exc}"
         self._logger.error("Action failed: %s\n%s", action_name, traceback.format_exc())
+        self._append_gui_log(action_name, "failed", str(exc), traceback.format_exc())
         self._set_gui_status(message)
+        for node_id in getattr(self._node_graph, "selected_node_ids", ()):
+            if node_id in self._node_graph.nodes:
+                self._node_graph.nodes[node_id].status = "failed"
+                self._node_graph.nodes[node_id].message = str(exc)
         if hasattr(self, "node_status"):
             self.node_status.setText(message)
         if hasattr(self, "node_status_log"):
@@ -417,6 +496,26 @@ class _PreviewWindow:
         if hasattr(self, "node_debug_log"):
             self.node_debug_log.appendPlainText(message)
             self.node_debug_log.appendPlainText(traceback.format_exc())
+        if hasattr(self, "node_scene"):
+            self._redraw_node_graph()
+
+    def _append_gui_log(
+        self,
+        action_name: str,
+        status: str,
+        message: str,
+        traceback_text: str = "",
+    ) -> None:
+        if not hasattr(self, "node_status_log"):
+            return
+        timestamp = self._qt_core.QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss")
+        self.node_status_log.appendPlainText(
+            f"{timestamp} | {action_name} | {status} | {message}".rstrip()
+        )
+        if traceback_text and hasattr(self, "node_debug_log"):
+            self.node_debug_log.appendPlainText(
+                f"{timestamp} | {action_name} | {status}\n{traceback_text}"
+            )
 
     def _set_gui_status(self, message: str) -> None:
         if hasattr(self, "status"):
@@ -446,8 +545,14 @@ class _PreviewWindow:
 
     def _set_backend_busy(self, busy: bool, message: str) -> None:
         self._backend_busy = busy
+        live_buttons = []
         for button in getattr(self, "_safe_buttons", []):
-            button.setEnabled(not busy)
+            try:
+                button.setEnabled(not busy)
+            except RuntimeError:
+                continue
+            live_buttons.append(button)
+        self._safe_buttons = live_buttons
         self._set_gui_status(message)
 
     def _build_controls(self, config: CylinderPreviewConfig) -> Any:
@@ -786,13 +891,17 @@ class _PreviewWindow:
 
         nodes_tab = self._build_node_workspace()
         tabs.addTab(self._scroll_tab(mode_group, project_group), "Setup")
-        tabs.addTab(nodes_tab, "Nodes")
         tabs.addTab(self._scroll_tab(winding_group, layer_group, profile_group), "Path")
         tabs.addTab(self._scroll_tab(pattern_group), "Pattern")
         tabs.addTab(self._scroll_tab(export_group), "Export")
-        tabs.setCurrentWidget(nodes_tab)
 
-        layout.addWidget(tabs, 1)
+        tabs.setVisible(False)
+        self._legacy_control_tabs = tabs
+        nodes_tab.setSizePolicy(
+            self._qt_widgets.QSizePolicy.Policy.Expanding,
+            self._qt_widgets.QSizePolicy.Policy.Expanding,
+        )
+        layout.addWidget(nodes_tab, 1)
         return panel
 
     def _build_node_workspace(self) -> Any:
@@ -803,7 +912,10 @@ class _PreviewWindow:
         container_layout.setContentsMargins(8, 8, 8, 8)
         container_layout.setSpacing(8)
 
-        toolbar = qt_widgets.QHBoxLayout()
+        toolbar_widget = qt_widgets.QWidget()
+        toolbar_widget.setObjectName("nodeToolbar")
+        toolbar = qt_widgets.QHBoxLayout(toolbar_widget)
+        toolbar.setContentsMargins(6, 6, 6, 6)
         toolbar.setSpacing(8)
         add_nodes = qt_widgets.QPushButton("Add Node")
         self._connect_safe_button(add_nodes, "Add Node", self._add_selected_node_type)
@@ -942,7 +1054,17 @@ class _PreviewWindow:
         toolbar.addWidget(run_graph)
         toolbar.addWidget(export_graph)
         toolbar.addWidget(optimize_pattern)
-        container_layout.addLayout(toolbar)
+        toolbar_scroll = qt_widgets.QScrollArea()
+        toolbar_scroll.setObjectName("nodeToolbarScroll")
+        toolbar_scroll.setWidgetResizable(True)
+        toolbar_scroll.setHorizontalScrollBarPolicy(
+            self._qt_core.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        toolbar_scroll.setVerticalScrollBarPolicy(self._qt_core.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        toolbar_scroll.setFrameShape(qt_widgets.QFrame.Shape.NoFrame)
+        toolbar_scroll.setMaximumHeight(52)
+        toolbar_scroll.setWidget(toolbar_widget)
+        container_layout.addWidget(toolbar_scroll)
 
         workspace_splitter = qt_widgets.QSplitter(self._qt_core.Qt.Orientation.Horizontal)
         workspace_splitter.setChildrenCollapsible(False)
@@ -953,9 +1075,8 @@ class _PreviewWindow:
         graph_layout.setSpacing(0)
 
         self.node_scene = qt_widgets.QGraphicsScene()
-        self.node_scene.setSceneRect(0.0, 0.0, 2200.0, 900.0)
-        self.node_scene.selectionChanged.connect(self._on_node_selection_changed)
-        self.node_scene.changed.connect(lambda _regions: self._refresh_node_links())
+        self.node_scene.setSceneRect(*NODE_CANVAS_SCENE_RECT)
+        self._connect_node_scene_signals(self.node_scene)
 
         class _NodeGraphicsView(qt_widgets.QGraphicsView):  # type: ignore[name-defined, misc, valid-type]
             def __init__(self, scene: Any, owner: _PreviewWindow) -> None:
@@ -998,6 +1119,10 @@ class _PreviewWindow:
         self.node_view.setMinimumHeight(240)
         self.node_view.setMinimumWidth(680)
         self.node_view.setRenderHint(self._qt_gui.QPainter.RenderHint.Antialiasing, True)
+        self.node_view.setViewportUpdateMode(
+            qt_widgets.QGraphicsView.ViewportUpdateMode.FullViewportUpdate
+        )
+        self.node_view.setCacheMode(qt_widgets.QGraphicsView.CacheModeFlag.CacheNone)
         self.node_view.setDragMode(qt_widgets.QGraphicsView.DragMode.RubberBandDrag)
         self.node_view.setTransformationAnchor(
             qt_widgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse
@@ -1005,7 +1130,12 @@ class _PreviewWindow:
         self.node_view.setContextMenuPolicy(
             self._qt_core.Qt.ContextMenuPolicy.CustomContextMenu
         )
-        self.node_view.customContextMenuRequested.connect(self._show_node_context_menu)
+        self.node_view.customContextMenuRequested.connect(
+            lambda pos: self.run_safe_action(
+                "Node Context Menu",
+                lambda: self._show_node_context_menu(pos),
+            )
+        )
         self._install_node_canvas_event_filter()
         self._install_node_shortcuts()
         graph_layout.addWidget(self.node_view, 1)
@@ -1043,7 +1173,9 @@ class _PreviewWindow:
         inspector_layout.setContentsMargins(8, 8, 8, 8)
         inspector_layout.setSpacing(8)
         self.node_inspector_name = qt_widgets.QLineEdit()
-        self.node_inspector_name.editingFinished.connect(self._apply_node_inspector)
+        self.node_inspector_name.editingFinished.connect(
+            lambda: self.run_safe_action("Apply Node Name", self._apply_node_inspector)
+        )
         self.node_inspector_type = qt_widgets.QLabel("No node selected")
         self.node_inspector_status = qt_widgets.QLabel("")
         self.node_inspector_form_widget = qt_widgets.QWidget()
@@ -1074,9 +1206,22 @@ class _PreviewWindow:
         status_layout.setSpacing(8)
         self.node_status = qt_widgets.QLabel("Graph ready")
         self.node_status.setWordWrap(True)
+        self.task_progress = qt_widgets.QProgressBar()
+        self.task_progress.setObjectName("taskProgress")
+        self.task_progress.setRange(0, 100)
+        self.task_progress.setValue(0)
+        self.task_progress.setTextVisible(False)
+        self.task_progress.setMaximumWidth(220)
+        self.task_time_label = qt_widgets.QLabel("Idle")
+        self.task_time_label.setObjectName("taskTimeLabel")
+        progress_layout = qt_widgets.QHBoxLayout()
+        progress_layout.setContentsMargins(0, 0, 0, 0)
+        progress_layout.addWidget(self.task_progress)
+        progress_layout.addWidget(self.task_time_label, 1)
         self.node_status_log = qt_widgets.QPlainTextEdit()
         self.node_status_log.setReadOnly(True)
         status_layout.addWidget(self.node_status)
+        status_layout.addLayout(progress_layout)
         status_layout.addWidget(self.node_status_log, 1)
 
         debug_panel = qt_widgets.QWidget()
@@ -1087,6 +1232,18 @@ class _PreviewWindow:
         self.node_debug_log = qt_widgets.QPlainTextEdit()
         self.node_debug_log.setReadOnly(True)
         self.node_debug_log.setPlaceholderText(f"Debug log: {GUI_LOG_PATH}")
+        debug_actions = qt_widgets.QHBoxLayout()
+        copy_log = qt_widgets.QPushButton("Copy Log")
+        self._connect_safe_button(copy_log, "Copy Log", self._copy_gui_log)
+        clear_log = qt_widgets.QPushButton("Clear Log")
+        self._connect_safe_button(clear_log, "Clear Log", self._clear_gui_log)
+        open_log = qt_widgets.QPushButton("Open Log File")
+        self._connect_safe_button(open_log, "Open Log File", self._open_gui_log_file)
+        debug_actions.addWidget(copy_log)
+        debug_actions.addWidget(clear_log)
+        debug_actions.addWidget(open_log)
+        debug_actions.addStretch(1)
+        debug_layout.addLayout(debug_actions)
         debug_layout.addWidget(self.node_debug_log, 1)
 
         reports_panel = qt_widgets.QWidget()
@@ -1107,7 +1264,10 @@ class _PreviewWindow:
         self.backend_report_summary.setWordWrap(True)
         self.report_list = qt_widgets.QListWidget()
         self.report_list.currentItemChanged.connect(
-            lambda current, _previous: self._show_report_item(current)
+            lambda current, _previous: self.run_safe_action(
+                "Open Report",
+                lambda: self._show_report_item(current),
+            )
         )
         self.report_detail = qt_widgets.QPlainTextEdit()
         self.report_detail.setReadOnly(True)
@@ -1134,7 +1294,10 @@ class _PreviewWindow:
         plot_actions.addStretch(1)
         self.plot_list = qt_widgets.QListWidget()
         self.plot_list.currentItemChanged.connect(
-            lambda current, _previous: self._show_plot_item(current)
+            lambda current, _previous: self.run_safe_action(
+                "Open Plot",
+                lambda: self._show_plot_item(current),
+            )
         )
         self.plot_preview = qt_widgets.QLabel("No plot selected")
         self.plot_preview.setAlignment(self._qt_core.Qt.AlignmentFlag.AlignCenter)
@@ -1243,6 +1406,70 @@ class _PreviewWindow:
         if hasattr(self, "node_status_log"):
             self.node_status_log.appendPlainText(message)
 
+    def _start_task_progress(self, name: str, *, total_steps: int = 0) -> None:
+        self._task_started_at = time.monotonic()
+        self._task_total_steps = max(0, int(total_steps))
+        self._task_completed_steps = 0
+        self._task_name = name
+        if not hasattr(self, "task_progress"):
+            return
+        if self._task_total_steps:
+            self.task_progress.setRange(0, self._task_total_steps)
+            self.task_progress.setValue(0)
+        else:
+            self.task_progress.setRange(0, 0)
+        self._update_task_progress_label()
+
+    def _update_task_progress(self, completed_steps: int | None = None) -> None:
+        if completed_steps is not None:
+            self._task_completed_steps = max(0, int(completed_steps))
+        elif self._task_total_steps:
+            self._task_completed_steps = min(
+                self._task_total_steps,
+                self._task_completed_steps + 1,
+            )
+        if hasattr(self, "task_progress") and self._task_total_steps:
+            self.task_progress.setValue(
+                min(self._task_completed_steps, self._task_total_steps)
+            )
+        self._update_task_progress_label()
+
+    def _finish_task_progress(self, message: str = "Complete") -> None:
+        if hasattr(self, "task_progress"):
+            self.task_progress.setRange(0, 100)
+            self.task_progress.setValue(100)
+        self._update_task_progress_label(done_message=message)
+
+    def _fail_task_progress(self, message: str = "Failed") -> None:
+        if hasattr(self, "task_progress"):
+            self.task_progress.setRange(0, 100)
+            self.task_progress.setValue(0)
+        self._update_task_progress_label(done_message=message)
+
+    def _update_task_progress_label(self, *, done_message: str | None = None) -> None:
+        if not hasattr(self, "task_time_label"):
+            return
+        elapsed = (
+            0.0
+            if self._task_started_at is None
+            else max(0.0, time.monotonic() - self._task_started_at)
+        )
+        task_name = self._task_name or "Task"
+        if done_message is not None:
+            self.task_time_label.setText(f"{task_name}: {done_message} in {elapsed:.1f}s")
+            return
+        if self._task_total_steps and self._task_completed_steps > 0:
+            per_step = elapsed / max(1, self._task_completed_steps)
+            remaining = max(0, self._task_total_steps - self._task_completed_steps) * per_step
+            self.task_time_label.setText(
+                f"{task_name}: {self._task_completed_steps}/{self._task_total_steps}, "
+                f"{elapsed:.1f}s elapsed, ~{remaining:.1f}s left"
+            )
+        elif self._task_total_steps:
+            self.task_time_label.setText(f"{task_name}: 0/{self._task_total_steps}")
+        else:
+            self.task_time_label.setText(f"{task_name}: {elapsed:.1f}s elapsed")
+
     def _log_graph_event(self, message: str) -> None:
         self._logger.info(message)
         if hasattr(self, "node_debug_log"):
@@ -1263,6 +1490,29 @@ class _PreviewWindow:
             self.node_debug_log.appendPlainText(full_message)
             if exc is not None:
                 self.node_debug_log.appendPlainText(traceback.format_exc())
+
+    def _copy_gui_log(self) -> None:
+        parts = []
+        if hasattr(self, "node_status_log"):
+            parts.append(self.node_status_log.toPlainText())
+        if hasattr(self, "node_debug_log"):
+            parts.append(self.node_debug_log.toPlainText())
+        self._qt_widgets.QApplication.clipboard().setText("\n\n".join(parts).strip())
+        self._set_node_status("GUI log copied to clipboard")
+
+    def _clear_gui_log(self) -> None:
+        if hasattr(self, "node_status_log"):
+            self.node_status_log.clear()
+        if hasattr(self, "node_debug_log"):
+            self.node_debug_log.clear()
+        self._set_node_status("GUI log panel cleared")
+
+    def _open_gui_log_file(self) -> None:
+        GUI_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        GUI_LOG_PATH.touch(exist_ok=True)
+        self._qt_gui.QDesktopServices.openUrl(
+            self._qt_core.QUrl.fromLocalFile(str(GUI_LOG_PATH.resolve()))
+        )
 
     def _safe_add_node(self, type_id: str, position: Any | None = None) -> str | None:
         before_node_ids = set(self._node_graph.nodes)
@@ -1322,7 +1572,11 @@ class _PreviewWindow:
                 self._owner = owner
 
             def eventFilter(self, obj: Any, event: Any) -> bool:  # noqa: N802
-                return bool(self._owner._node_canvas_event_filter(obj, event))
+                try:
+                    return bool(self._owner._node_canvas_event_filter(obj, event))
+                except Exception as exc:  # noqa: BLE001 - protects Qt event loop
+                    self._owner.handle_gui_error("Node Canvas Event", exc)
+                    return True
 
         self._node_canvas_event_filter_object = _NodeCanvasEventFilter(self)
         self.node_view.viewport().installEventFilter(self._node_canvas_event_filter_object)
@@ -1418,11 +1672,26 @@ class _PreviewWindow:
             self._update_socket_drag(event)
             return True
         if (
+            event_type == self._qt_core.QEvent.Type.MouseMove
+            and event.buttons() & self._qt_core.Qt.MouseButton.LeftButton
+            and self._selected_node_ids()
+        ):
+            self._schedule_node_link_refresh()
+            return False
+        if (
             event_type == self._qt_core.QEvent.Type.MouseButtonRelease
             and self._node_socket_drag is not None
         ):
             self._finish_socket_drag(event)
             return True
+        if (
+            event_type == self._qt_core.QEvent.Type.MouseButtonRelease
+            and event.button() == self._qt_core.Qt.MouseButton.LeftButton
+            and self._selected_node_ids()
+        ):
+            self._schedule_node_link_refresh()
+            self._schedule_node_position_sync()
+            return False
         return False
 
     def _handle_node_wheel(self, event: Any) -> bool:
@@ -1477,13 +1746,15 @@ class _PreviewWindow:
     def _begin_socket_drag(self, event: Any) -> bool:
         view_pos = self._event_view_pos(event)
         item = self._socket_item_at_view_pos(view_pos)
-        if item is None or item.data(4) != "output":
+        if item is None:
             return False
         node_id = str(item.data(2))
         socket_name = str(item.data(3))
+        side = str(item.data(4))
         self._node_socket_drag = {
-            "source_node_id": node_id,
-            "source_socket": socket_name,
+            "node_id": node_id,
+            "socket": socket_name,
+            "side": side,
         }
         start = item.sceneBoundingRect().center()
         path = self._node_link_path(start, start)
@@ -1491,7 +1762,7 @@ class _PreviewWindow:
         pen.setStyle(self._qt_core.Qt.PenStyle.DashLine)
         self._node_temp_link_item = self.node_scene.addPath(path, pen)
         self._node_temp_link_item.setZValue(100.0)
-        self._log_graph_event(f"Link creation started: {node_id}.{socket_name}")
+        self._log_graph_event(f"Link creation started: {node_id}.{socket_name} ({side})")
         event.accept()
         return True
 
@@ -1502,9 +1773,9 @@ class _PreviewWindow:
         scene_pos = self.node_view.mapToScene(view_pos)
         source_item = self._socket_items.get(
             (
-                self._node_socket_drag["source_node_id"],
-                self._node_socket_drag["source_socket"],
-                "output",
+                self._node_socket_drag["node_id"],
+                self._node_socket_drag["socket"],
+                self._node_socket_drag["side"],
             )
         )
         if source_item is None:
@@ -1520,19 +1791,17 @@ class _PreviewWindow:
         view_pos = self._event_view_pos(event)
         target_item = self._socket_item_at_view_pos(view_pos)
         if self._node_temp_link_item is not None:
-            self.node_scene.removeItem(self._node_temp_link_item)
+            with suppress(RuntimeError):
+                self.node_scene.removeItem(self._node_temp_link_item)
         self._node_temp_link_item = None
         self._reset_highlighted_socket()
         try:
-            if target_item is None or target_item.data(4) != "input":
-                raise ValueError("drop link on a compatible input socket")
-            self._node_graph.add_link(
-                self._node_socket_drag["source_node_id"],
-                self._node_socket_drag["source_socket"],
-                str(target_item.data(2)),
-                str(target_item.data(3)),
-                self._node_registry,
-            )
+            if target_item is None:
+                raise ValueError("drop link on a compatible socket")
+            link_args = self._link_args_from_socket_drag(target_item)
+            result = self._graph_controller().link_nodes(*link_args)
+            if not result.success:
+                raise ValueError(result.error or "link creation failed")
         except ValueError as exc:
             self._show_graph_error("Link creation failed", exc)
         else:
@@ -1542,27 +1811,48 @@ class _PreviewWindow:
         self._node_socket_drag = None
         event.accept()
 
+    def _link_args_from_socket_drag(self, target_item: Any) -> tuple[str, str, str, str]:
+        if self._node_socket_drag is None:
+            raise ValueError("no active link drag")
+        start_side = self._node_socket_drag["side"]
+        end_side = str(target_item.data(4))
+        start_node_id = self._node_socket_drag["node_id"]
+        start_socket = self._node_socket_drag["socket"]
+        end_node_id = str(target_item.data(2))
+        end_socket = str(target_item.data(3))
+        if start_side == "output" and end_side == "input":
+            return start_node_id, start_socket, end_node_id, end_socket
+        if start_side == "input" and end_side == "output":
+            return end_node_id, end_socket, start_node_id, start_socket
+        raise ValueError("drop link between an output socket and an input socket")
+
     def _socket_item_at_view_pos(self, view_pos: Any) -> Any | None:
-        item = self.node_view.itemAt(view_pos)
-        while item is not None:
-            if item.data(1) == "socket":
-                return item
-            item = item.parentItem()
+        candidates = [self.node_view.itemAt(view_pos)]
+        search_rect = self._qt_core.QRect(
+            int(view_pos.x()) - 8,
+            int(view_pos.y()) - 8,
+            16,
+            16,
+        )
+        candidates.extend(self.node_view.items(search_rect))
+        for candidate in candidates:
+            item = candidate
+            while item is not None:
+                if item.data(1) == "socket":
+                    return item
+                item = item.parentItem()
         return None
 
     def _highlight_socket_target(self, item: Any | None) -> None:
         if item is self._node_highlight_socket:
             return
         self._reset_highlighted_socket()
-        if item is None or item.data(4) != "input" or self._node_socket_drag is None:
+        if item is None or self._node_socket_drag is None:
             return
         self._node_highlight_socket = item
         try:
             self._node_graph.validate_link(
-                self._node_socket_drag["source_node_id"],
-                self._node_socket_drag["source_socket"],
-                str(item.data(2)),
-                str(item.data(3)),
+                *self._link_args_from_socket_drag(item),
                 self._node_registry,
             )
         except ValueError:
@@ -1652,18 +1942,128 @@ class _PreviewWindow:
         self._safe_add_node(type_id)
 
     def _redraw_node_graph(self) -> None:
+        keep_selected = tuple(
+            node_id for node_id in self._selected_node_id_cache if node_id in self._node_graph.nodes
+        )
+        keep_links = tuple(
+            link_id for link_id in self._selected_link_id_cache if link_id in self._node_graph.links
+        )
+        view_state = self._capture_node_view_state()
+        self._redrawing_node_graph = True
+        self._replace_node_scene_for_rebuild()
         self.node_scene.blockSignals(True)
-        self.node_scene.clear()
+        try:
+            self._node_items.clear()
+            self._socket_items.clear()
+            self._node_link_items.clear()
+            self._node_group_items.clear()
+            self._node_inline_widgets.clear()
+            self._draw_graph_groups()
+            for node in self._node_graph.nodes.values():
+                self._draw_graph_node(node)
+            self._refresh_node_links()
+            self._restore_scene_selection(keep_selected, keep_links)
+        finally:
+            self.node_scene.blockSignals(False)
+            self._redrawing_node_graph = False
+        self._restore_captured_node_view_state(view_state)
+        self._selected_node_id_cache = keep_selected
+        self._selected_link_id_cache = keep_links
+        self._node_graph.selected_node_ids = keep_selected
+        self._schedule_node_selection_ui_update()
+
+    def _connect_node_scene_signals(self, scene: Any) -> None:
+        scene.selectionChanged.connect(self._on_node_selection_changed)
+
+    def _replace_node_scene_for_rebuild(self) -> None:
+        old_scene = self.node_scene
+        old_scene.blockSignals(True)
+        self._retired_node_scenes.append(old_scene)
+        self.node_scene = self._qt_widgets.QGraphicsScene()
+        self.node_scene.setSceneRect(old_scene.sceneRect())
+        self._connect_node_scene_signals(self.node_scene)
+        self.node_view.setScene(self.node_scene)
+        self._qt_core.QTimer.singleShot(
+            2000,
+            lambda scene=old_scene: self._dispose_retired_node_scene(scene),
+        )
+
+    def _capture_node_view_state(self) -> tuple[Any, Any] | None:
+        if not hasattr(self, "node_view"):
+            return None
+        return (
+            self.node_view.transform(),
+            self.node_view.mapToScene(self.node_view.viewport().rect().center()),
+        )
+
+    def _restore_captured_node_view_state(self, view_state: tuple[Any, Any] | None) -> None:
+        if view_state is None or not hasattr(self, "node_view"):
+            return
+        transform, center = view_state
+        self.node_view.setTransform(transform)
+        self.node_view.centerOn(center)
+        self._node_zoom = self._bounded_node_zoom(float(transform.m11()))
+        self._update_node_zoom_label()
+        self._sync_node_view_state()
+
+    def _dispose_retired_node_scene(self, scene: Any) -> None:
+        if scene is self.node_scene:
+            return
+        try:
+            scene.blockSignals(True)
+            scene.clearSelection()
+        except RuntimeError:
+            pass
+        if scene in self._retired_node_scenes:
+            self._retired_node_scenes.remove(scene)
+        scene.deleteLater()
+
+    def _cleanup_node_scenes_for_close(self) -> None:
+        self._closing = True
+        if not hasattr(self, "node_view") or not hasattr(self, "node_scene"):
+            return
+        scenes = [self.node_scene, *self._retired_node_scenes]
+        self._node_inline_widgets.clear()
         self._node_items.clear()
         self._socket_items.clear()
         self._node_link_items.clear()
         self._node_group_items.clear()
-        self._draw_graph_groups()
-        for node in self._node_graph.nodes.values():
-            self._draw_graph_node(node)
-        self.node_scene.blockSignals(False)
-        self._refresh_node_links()
-        self._on_node_selection_changed()
+        self.node_view.setScene(self._qt_widgets.QGraphicsScene())
+        for scene in scenes:
+            try:
+                scene.blockSignals(True)
+                scene.clearSelection()
+            except RuntimeError:
+                continue
+
+    def _queue_node_graph_redraw(
+        self,
+        selected_node_ids: tuple[str, ...] = (),
+        selected_link_ids: tuple[str, ...] = (),
+    ) -> None:
+        self._queued_node_selection = tuple(
+            node_id for node_id in selected_node_ids if node_id in self._node_graph.nodes
+        )
+        self._queued_link_selection = tuple(
+            link_id for link_id in selected_link_ids if link_id in self._node_graph.links
+        )
+        self._selected_node_id_cache = self._queued_node_selection
+        self._selected_link_id_cache = self._queued_link_selection
+        if self._node_graph_redraw_queued:
+            return
+        self._node_graph_redraw_queued = True
+        self._qt_core.QTimer.singleShot(0, self._flush_queued_node_graph_redraw)
+
+    def _flush_queued_node_graph_redraw(self) -> None:
+        self._node_graph_redraw_queued = False
+        selected = self._queued_node_selection
+        links = self._queued_link_selection
+        self._queued_node_selection = ()
+        self._queued_link_selection = ()
+        self._selected_node_id_cache = selected
+        self._selected_link_id_cache = links
+        self._redraw_node_graph()
+        self._set_scene_selection_by_ids(selected, links)
 
     def _draw_graph_groups(self) -> None:
         for group in self._node_graph.groups.values():
@@ -1703,8 +2103,21 @@ class _PreviewWindow:
 
     def _draw_graph_node(self, node: NodeInstance) -> None:
         definition = self._node_registry[node.type_id]
-        width = max(node.width, 280.0)
-        height = 54.0 if node.collapsed else max(node.height, 150.0)
+        inline_keys = self._inline_node_setting_keys(node)
+        title_text = self._node_display_title(node)
+        longest_label = max(
+            [len(title_text), *(len(_setting_label(key)) for key in inline_keys)],
+            default=len(title_text),
+        )
+        has_path_field = any(self._is_path_setting(key) for key in inline_keys)
+        content_width = 214.0 + min(220.0, longest_label * 6.5)
+        width = max(node.width, 380.0, content_width, 460.0 if has_path_field else 0.0)
+        inline_height = self._inline_node_settings_height(inline_keys)
+        height = (
+            44.0
+            if node.collapsed
+            else max(node.height, 132.0, 80.0 + inline_height)
+        )
         node.width = width
         node.height = height
         rect = self.node_scene.addRect(
@@ -1731,11 +2144,15 @@ class _PreviewWindow:
             self._qt_gui.QBrush(self._qt_gui.QColor(definition.color)),
         )
         header.setParentItem(rect)
-        title = self.node_scene.addText(node.name)
+        title = self.node_scene.addText(title_text)
         title.setDefaultTextColor(self._qt_gui.QColor("#f0f5fa"))
-        title.setTextWidth(width - 48.0)
-        title.setPos(10.0, 5.0)
+        title.setTextWidth(width - 72.0)
+        title.setPos(34.0, 5.0)
         title.setParentItem(rect)
+        collapse_hint = self.node_scene.addText("[+]" if node.collapsed else "[-]")
+        collapse_hint.setDefaultTextColor(self._qt_gui.QColor("#d7e4ef"))
+        collapse_hint.setPos(9.0, 5.0)
+        collapse_hint.setParentItem(rect)
 
         status = self.node_scene.addEllipse(
             width - 24.0,
@@ -1752,10 +2169,351 @@ class _PreviewWindow:
             )
             details.setDefaultTextColor(self._qt_gui.QColor("#b7c3cf"))
             details.setTextWidth(width - 28.0)
-            details.setPos(14.0, 48.0)
+            details.setPos(14.0, 40.0)
             details.setParentItem(rect)
-        self._draw_node_sockets(rect, node, definition, height)
+            self._draw_inline_node_settings(rect, node, inline_keys)
+        self._draw_node_sockets(
+            rect,
+            node,
+            definition,
+            height,
+            show_labels=not inline_keys,
+        )
         self._node_items[node.id] = rect
+
+    def _inline_node_setting_keys(self, node: NodeInstance) -> tuple[str, ...]:
+        editable = [
+            key
+            for key, value in node.settings.items()
+            if isinstance(value, bool | int | float | str)
+        ]
+        layer_keys = (
+            "enabled",
+            "name",
+            "material",
+            "winding_angle_deg",
+            "angle_tolerance_deg",
+            "start_z_mm",
+            "end_z_mm",
+            "points",
+            "coverage_target",
+        )
+        simple_keys_by_type = {
+            "project": ("name", "output_directory", "units"),
+            "machine_backend": (
+                "controller",
+                "clearance_mm",
+                "max_a_rpm",
+                "max_x_mm",
+                "max_z_mm",
+            ),
+            "mandrel_backend": (
+                "mode",
+                "type",
+                "profile_path",
+                "cylinder_length_mm",
+                "cylinder_radius_mm",
+                "left_dome_length_mm",
+                "right_dome_length_mm",
+                "polar_opening_radius_mm",
+            ),
+            "tow_backend": (
+                "name",
+                "width_mm",
+                "thickness_mm",
+                "effective_width_mm",
+                "calibrated_effective_width",
+                "friction_coefficient",
+                "calibrated_friction",
+                "fibre_type",
+                "resin_system",
+            ),
+            "layer_backend": layer_keys,
+            "hoop_layer": layer_keys,
+            "geodesic_layer": layer_keys,
+            "non_geodesic_layer": layer_keys,
+            "layer_stack_backend": ("name", "ordering", "repeat_stack", "mirror_stack"),
+            "pattern_optimisation_backend": (
+                "method",
+                "angle_tolerance_deg",
+                "require_gcd_clean_pattern",
+            ),
+            "coverage_mode": ("stack_level_full_coverage", "paired_layer_coverage"),
+            "plot_backend": ("enabled", "output_directory"),
+            "csv_backend_export": ("enabled",),
+            "gcode_backend_export": ("enabled",),
+            "report_export": ("enabled",),
+            "controller_run_backend": ("enabled", "port"),
+        }
+        if node.type_id in simple_keys_by_type:
+            return tuple(key for key in simple_keys_by_type[node.type_id] if key in editable)
+        priority = (
+            "enabled",
+            "name",
+            "ply_order",
+            "material",
+            "mode",
+            "type",
+            "profile_path",
+            "samples",
+            "region",
+            "direction",
+            "winding_angle_deg",
+            "target_angle_deg",
+            "initial_angle_deg",
+            "angle_tolerance_deg",
+            "start_z_mm",
+            "end_z_mm",
+            "passes",
+            "coverage_target",
+            "width_mm",
+            "thickness_mm",
+            "cylinder_length_mm",
+            "cylinder_radius_mm",
+            "polar_opening_radius_mm",
+            "feedrate_mm_min",
+            "method",
+            "output_directory",
+        )
+        ordered = [key for key in priority if key in editable]
+        ordered.extend(key for key in editable if key not in ordered)
+        return tuple(ordered)
+
+    def _inline_node_settings_height(self, keys: tuple[str, ...]) -> float:
+        if not keys:
+            return 0.0
+        return 28.0 * len(keys) + 12.0
+
+    def _draw_inline_node_settings(
+        self,
+        parent_item: Any,
+        node: NodeInstance,
+        keys: tuple[str, ...],
+    ) -> None:
+        if node.type_id == "layer_stack_backend":
+            self._draw_layer_stack_table(parent_item, node)
+            return
+        if not keys:
+            return
+        panel = self._qt_widgets.QWidget()
+        panel.setObjectName("inlineNodeSettings")
+        layout = self._qt_widgets.QFormLayout(panel)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(4)
+        layout.setFieldGrowthPolicy(
+            self._qt_widgets.QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+        for key in keys:
+            editor = self._inline_node_setting_editor(node.id, key, node.settings[key])
+            label = self._qt_widgets.QLabel(_setting_label(key))
+            label.setObjectName("inlineNodeSettingLabel")
+            label.setToolTip(key)
+            label.setMinimumWidth(118)
+            label.setMaximumWidth(168)
+            layout.addRow(label, editor)
+        proxy = self.node_scene.addWidget(panel)
+        proxy.setParentItem(parent_item)
+        proxy.setPos(14.0, 74.0)
+        proxy.setZValue(60.0)
+        proxy.resize(
+            parent_item.rect().width() - 28.0,
+            max(36.0, self._inline_node_settings_height(keys)),
+        )
+        self._node_inline_widgets.append(proxy)
+
+    def _draw_layer_stack_table(self, parent_item: Any, node: NodeInstance) -> None:
+        layers = self._connected_layer_nodes_for_stack(node.id)
+        panel = self._qt_widgets.QWidget()
+        panel.setObjectName("inlineNodeSettings")
+        layout = self._qt_widgets.QVBoxLayout(panel)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(6)
+        table = self._qt_widgets.QTableWidget(max(1, len(layers)), 6)
+        table.setObjectName("layerStackNodeTable")
+        table.setHorizontalHeaderLabels(
+            ["Layer", "Angle", "Tol", "Start Z", "End Z", "Steps"]
+        )
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(self._qt_widgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(self._qt_widgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        table.setDragDropMode(self._qt_widgets.QAbstractItemView.DragDropMode.InternalMove)
+        table.setDefaultDropAction(self._qt_core.Qt.DropAction.MoveAction)
+        table.setDragDropOverwriteMode(False)
+        table.setMinimumHeight(138)
+        table.setMaximumHeight(220)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.blockSignals(True)
+        for row, layer_node in enumerate(layers):
+            self._populate_layer_stack_row(table, row, layer_node)
+        if not layers:
+            item = self._qt_widgets.QTableWidgetItem("Connect layer nodes")
+            item.setFlags(item.flags() & ~self._qt_core.Qt.ItemFlag.ItemIsEditable)
+            table.setItem(0, 1, item)
+        table.blockSignals(False)
+        def _on_cell_changed(row: int, col: int) -> None:
+            self.run_safe_action(
+                "Edit Layer Stack Row",
+                lambda: self._update_layer_stack_row(node.id, table, row, col),
+            )
+
+        def _on_rows_moved(*_args: Any) -> None:
+            self.run_safe_action(
+                "Reorder Layer Stack",
+                lambda: self._apply_layer_stack_table_order(node.id, table),
+            )
+
+        table.cellChanged.connect(_on_cell_changed)
+        table.model().rowsMoved.connect(_on_rows_moved)
+        copy_button = self._qt_widgets.QPushButton("Copy Selected Layer Row")
+
+        def _copy_selected_layer_rows() -> None:
+            self._copy_layer_stack_rows(node.id, table)
+
+        self._connect_safe_button(
+            copy_button,
+            "Copy Layer Stack Row",
+            _copy_selected_layer_rows,
+        )
+        hint = self._qt_widgets.QLabel(
+            "Drag rows to change ply order. Angle selects Polar, Helical, or Hoop automatically."
+        )
+        hint.setObjectName("inlineNodeSettingLabel")
+        layout.addWidget(table)
+        layout.addWidget(copy_button)
+        layout.addWidget(hint)
+        proxy = self.node_scene.addWidget(panel)
+        proxy.setParentItem(parent_item)
+        proxy.setPos(14.0, 74.0)
+        proxy.setZValue(60.0)
+        proxy.resize(parent_item.rect().width() - 28.0, 285.0)
+        self._node_inline_widgets.append(proxy)
+
+    def _connected_layer_nodes_for_stack(self, stack_node_id: str) -> list[NodeInstance]:
+        layer_nodes = [
+            self._node_graph.nodes[link.source_node_id]
+            for link in self._node_graph.links.values()
+            if link.target_node_id == stack_node_id
+            and link.target_socket == "layer"
+            and link.source_node_id in self._node_graph.nodes
+            and self._node_graph.nodes[link.source_node_id].type_id
+            in {"layer_backend", "hoop_layer", "geodesic_layer", "non_geodesic_layer"}
+        ]
+        layer_nodes.sort(
+            key=lambda layer: (
+                _float_setting(layer.settings.get("ply_order"), 1_000_000.0),
+                layer.y,
+                layer.name,
+            )
+        )
+        return layer_nodes
+
+    def _populate_layer_stack_row(self, table: Any, row: int, layer_node: NodeInstance) -> None:
+        values = (
+            self._node_display_title(layer_node),
+            layer_node.settings.get(
+                "winding_angle_deg",
+                layer_node.settings.get("target_angle_deg", ""),
+            ),
+            layer_node.settings.get("angle_tolerance_deg", ""),
+            layer_node.settings.get("start_z_mm", ""),
+            layer_node.settings.get("end_z_mm", ""),
+            layer_node.settings.get("points", ""),
+        )
+        for col, value in enumerate(values):
+            item = self._qt_widgets.QTableWidgetItem(str(value))
+            item.setData(self._qt_core.Qt.ItemDataRole.UserRole, layer_node.id)
+            if col == 0:
+                item.setFlags(item.flags() & ~self._qt_core.Qt.ItemFlag.ItemIsEditable)
+            table.setItem(row, col, item)
+
+    def _update_layer_stack_row(self, _stack_node_id: str, table: Any, row: int, col: int) -> None:
+        item = table.item(row, col)
+        if item is None:
+            return
+        layer_node_id = item.data(self._qt_core.Qt.ItemDataRole.UserRole)
+        if layer_node_id not in self._node_graph.nodes:
+            return
+        key_by_col = {
+            1: "winding_angle_deg",
+            2: "angle_tolerance_deg",
+            3: "start_z_mm",
+            4: "end_z_mm",
+            5: "points",
+        }
+        key = key_by_col.get(col)
+        if key is None:
+            return
+        value: Any = item.text().strip()
+        if key in {"points"}:
+            value = max(16, int(float(value or "220")))
+        elif key in {"winding_angle_deg", "angle_tolerance_deg", "start_z_mm", "end_z_mm"}:
+            value = "" if value == "" else float(value)
+        node = self._node_graph.nodes[str(layer_node_id)]
+        node.settings[key] = value
+        if key == "winding_angle_deg":
+            angle = _float_setting(value, 45.0)
+            node.settings["name"] = f"{self._layer_kind_label(node).lower()}_{angle:g}deg"
+        self._node_graph.mark_downstream_dirty(str(layer_node_id))
+        self._queue_node_graph_redraw(self._selected_node_ids())
+        self._schedule_node_setting_render()
+
+    def _apply_layer_stack_table_order(self, _stack_node_id: str, table: Any) -> None:
+        for row in range(table.rowCount()):
+            item = table.item(row, 0) or table.item(row, 1)
+            if item is None:
+                continue
+            layer_node_id = item.data(self._qt_core.Qt.ItemDataRole.UserRole)
+            if layer_node_id in self._node_graph.nodes:
+                self._node_graph.nodes[str(layer_node_id)].settings["ply_order"] = row + 1
+        self._queue_node_graph_redraw(self._selected_node_ids())
+        self._schedule_node_setting_render()
+
+    def _copy_layer_stack_rows(self, stack_node_id: str, table: Any) -> None:
+        selected_rows = sorted({index.row() for index in table.selectedIndexes()})
+        if not selected_rows:
+            self._set_node_status("No layer row selected to copy.")
+            return
+        new_ids = []
+        for row in selected_rows:
+            item = table.item(row, 0) or table.item(row, 1)
+            if item is None:
+                continue
+            layer_node_id = item.data(self._qt_core.Qt.ItemDataRole.UserRole)
+            if layer_node_id not in self._node_graph.nodes:
+                continue
+            source = self._node_graph.nodes[str(layer_node_id)]
+            duplicate = self._node_graph.duplicate_node(
+                source.id,
+                self._node_registry,
+                offset=(40.0, 80.0),
+            )
+            duplicate.settings["name"] = f"{source.settings.get('name', source.name)} copy"
+            duplicate.settings["ply_order"] = (
+                len(self._connected_layer_nodes_for_stack(stack_node_id)) + 1
+            )
+            self._node_graph.add_link(
+                duplicate.id,
+                "layer",
+                stack_node_id,
+                "layer",
+                self._node_registry,
+            )
+            new_ids.append(duplicate.id)
+        self._queue_node_graph_redraw(tuple(new_ids))
+        self._schedule_node_setting_render()
+
+    def _inline_node_setting_editor(self, node_id: str, key: str, value: Any) -> Any:
+        if self._is_path_setting(key):
+            editor = self._node_path_editor(node_id, key, value, compact=True)
+            editor.setObjectName("inlineNodeSettingEditor")
+            return editor
+        editor = self._setting_editor(node_id, key, value, compact=True)
+        editor.setObjectName("inlineNodeSettingEditor")
+        editor.setToolTip(key)
+        if hasattr(editor, "setMaximumHeight"):
+            editor.setMaximumHeight(24)
+        return editor
 
     def _draw_node_sockets(
         self,
@@ -1763,6 +2521,8 @@ class _PreviewWindow:
         node: NodeInstance,
         definition: NodeTypeDefinition,
         height: float,
+        *,
+        show_labels: bool = True,
     ) -> None:
         self._draw_socket_side(
             parent_item,
@@ -1771,6 +2531,7 @@ class _PreviewWindow:
             side="input",
             x_pos=-7.0,
             height=height,
+            show_labels=show_labels,
         )
         self._draw_socket_side(
             parent_item,
@@ -1779,6 +2540,7 @@ class _PreviewWindow:
             side="output",
             x_pos=node.width - 7.0,
             height=height,
+            show_labels=show_labels,
         )
 
     def _draw_socket_side(
@@ -1790,11 +2552,12 @@ class _PreviewWindow:
         side: str,
         x_pos: float,
         height: float,
+        show_labels: bool,
     ) -> None:
         if not sockets:
             return
         spacing = 26.0 if len(sockets) > 1 else 0.0
-        socket_band_start = 58.0
+        socket_band_start = 26.0 if node.collapsed else 54.0
         available_height = max(40.0, height - socket_band_start - 16.0)
         needed_height = spacing * (len(sockets) - 1)
         start_y = socket_band_start + max(0.0, (available_height - needed_height) / 2.0)
@@ -1818,7 +2581,7 @@ class _PreviewWindow:
                 self._qt_gui.QBrush(self._qt_gui.QColor(color)),
             )
             item.setParentItem(parent_item)
-            item.setZValue(40.0)
+            item.setZValue(120.0)
             item.setData(1, "socket")
             item.setData(2, node.id)
             item.setData(3, socket.name)
@@ -1826,7 +2589,7 @@ class _PreviewWindow:
             item.setData(5, socket.kind)
             item.setToolTip(f"{side}: {socket.name} ({socket.kind})")
             self._socket_items[(node.id, socket.name, side)] = item
-            if not node.collapsed:
+            if show_labels and not node.collapsed:
                 label = self.node_scene.addText(socket.name)
                 label.setDefaultTextColor(self._qt_gui.QColor("#8fa0ad"))
                 label.setToolTip(socket.name)
@@ -1843,79 +2606,188 @@ class _PreviewWindow:
         node: NodeInstance,
         definition: NodeTypeDefinition,
     ) -> str:
-        inputs = ", ".join(socket.name for socket in definition.inputs) or "no inputs"
-        outputs = ", ".join(socket.name for socket in definition.outputs) or "no outputs"
         message = node.message or "Not computed"
-        settings = ", ".join(
-            f"{key}: {value}" for key, value in list(node.settings.items())[:2]
+        if self._is_layer_node(node):
+            return f"Layers / {self._layer_kind_label(node)}\n{message}"
+        return f"{definition.category} / {definition.label}\n{message}"
+
+    def _node_display_title(self, node: NodeInstance) -> str:
+        if not self._is_layer_node(node):
+            return node.name
+        angle = self._layer_angle_deg(node)
+        return f"{self._layer_kind_label(node)} {angle:g} deg"
+
+    def _is_layer_node(self, node: NodeInstance) -> bool:
+        return node.type_id in {
+            "layer_backend",
+            "hoop_layer",
+            "geodesic_layer",
+            "non_geodesic_layer",
+        }
+
+    def _layer_angle_deg(self, node: NodeInstance) -> float:
+        return _float_setting(
+            node.settings.get(
+                "winding_angle_deg",
+                node.settings.get("target_angle_deg", node.settings.get("initial_angle_deg", 45.0)),
+            ),
+            45.0,
         )
-        settings_line = f"\n{settings}" if settings else ""
-        return (
-            f"{definition.category}\nInputs: {inputs}\nOutputs: {outputs}\n"
-            f"{message}{settings_line}"
-        )
+
+    def _layer_kind_label(self, node: NodeInstance) -> str:
+        angle = abs(self._layer_angle_deg(node))
+        if angle < 15.0:
+            return "Polar"
+        if angle >= 85.0:
+            return "Hoop"
+        return "Helical"
 
     def _refresh_node_links(self) -> None:
         if self._refreshing_node_links or not hasattr(self, "node_scene"):
             return
         self._refreshing_node_links = True
-        for item in self._node_link_items:
-            self.node_scene.removeItem(item)
-        self._node_link_items.clear()
-        for link in self._node_graph.links.values():
-            source_item = self._socket_items.get(
-                (link.source_node_id, link.source_socket, "output")
-            )
-            target_item = self._socket_items.get(
-                (link.target_node_id, link.target_socket, "input")
-            )
-            if source_item is None or target_item is None:
-                continue
-            path = self._node_link_path(
-                source_item.sceneBoundingRect().center(),
-                target_item.sceneBoundingRect().center(),
-            )
-            pen = self._qt_gui.QPen(self._qt_gui.QColor("#6c8daa"), 2.0)
-            item = self.node_scene.addPath(path, pen)
-            item.setZValue(0.0)
-            item.setFlag(self._qt_widgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
-            item.setData(1, "link")
-            item.setData(2, link.id)
-            item.setToolTip(f"{link.source_socket} -> {link.target_socket}")
-            self._node_link_items.append(item)
-        self._sync_node_graph_from_scene()
-        self._refreshing_node_links = False
-
-    def _selected_node_ids(self) -> tuple[str, ...]:
-        node_ids = []
+        self._node_link_refresh_queued = False
         try:
-            selected_items = self.node_scene.selectedItems()
-        except RuntimeError:
-            return ()
-        for item in selected_items:
-            try:
-                node_id = item.data(0)
-            except RuntimeError:
-                continue
-            if node_id in self._node_graph.nodes:
-                node_ids.append(str(node_id))
-        return tuple(dict.fromkeys(node_ids))
+            for item in self._node_link_items:
+                try:
+                    self.node_scene.removeItem(item)
+                except RuntimeError:
+                    continue
+            self._node_link_items.clear()
+            for link in tuple(self._node_graph.links.values()):
+                source_item = self._socket_items.get(
+                    (link.source_node_id, link.source_socket, "output")
+                )
+                target_item = self._socket_items.get(
+                    (link.target_node_id, link.target_socket, "input")
+                )
+                if source_item is None or target_item is None:
+                    continue
+                try:
+                    path = self._node_link_path(
+                        source_item.sceneBoundingRect().center(),
+                        target_item.sceneBoundingRect().center(),
+                    )
+                except RuntimeError:
+                    continue
+                pen = self._qt_gui.QPen(self._qt_gui.QColor("#6c8daa"), 2.0)
+                item = self.node_scene.addPath(path, pen)
+                item.setZValue(0.0)
+                item.setFlag(self._qt_widgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+                item.setData(1, "link")
+                item.setData(2, link.id)
+                item.setToolTip(f"{link.source_socket} -> {link.target_socket}")
+                self._node_link_items.append(item)
+            if not self._redrawing_node_graph:
+                self._sync_node_graph_from_scene()
+        finally:
+            self._refreshing_node_links = False
 
-    def _selected_link_ids(self) -> tuple[str, ...]:
+    def _schedule_node_link_refresh(self) -> None:
+        if self._node_link_refresh_queued or self._refreshing_node_links:
+            return
+        self._node_link_refresh_queued = True
+        self._qt_core.QTimer.singleShot(0, self._refresh_node_links)
+
+    def _schedule_node_position_sync(self) -> None:
+        if self._node_position_sync_queued:
+            return
+        self._node_position_sync_queued = True
+
+        def _sync() -> None:
+            self._node_position_sync_queued = False
+            self._sync_node_graph_from_scene()
+
+        self._qt_core.QTimer.singleShot(0, _sync)
+
+    def _on_node_scene_changed(self) -> None:
+        if self._redrawing_node_graph:
+            return
+        try:
+            self._refresh_node_links()
+        except Exception as exc:  # noqa: BLE001 - protects Qt event loop
+            self.handle_gui_error("Node Scene Changed", exc)
+
+    def _read_scene_selection_ids(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        node_ids = []
         link_ids = []
         try:
             selected_items = self.node_scene.selectedItems()
         except RuntimeError:
-            return ()
+            return (), ()
         for item in selected_items:
             try:
                 item_kind = item.data(1)
+                node_id = item.data(0)
                 link_id = item.data(2)
             except RuntimeError:
                 continue
-            if item_kind == "link" and link_id in self._node_graph.links:
+            if item_kind == "node" and node_id in self._node_graph.nodes:
+                node_ids.append(str(node_id))
+            elif item_kind == "link" and link_id in self._node_graph.links:
                 link_ids.append(str(link_id))
-        return tuple(dict.fromkeys(link_ids))
+        return tuple(dict.fromkeys(node_ids)), tuple(dict.fromkeys(link_ids))
+
+    def _selected_node_ids(self) -> tuple[str, ...]:
+        return tuple(
+            node_id for node_id in self._selected_node_id_cache if node_id in self._node_graph.nodes
+        )
+
+    def _selected_link_ids(self) -> tuple[str, ...]:
+        return tuple(
+            link_id for link_id in self._selected_link_id_cache if link_id in self._node_graph.links
+        )
+
+    def _clear_node_scene_selection(self) -> None:
+        if not hasattr(self, "node_scene"):
+            return
+        self.node_scene.blockSignals(True)
+        try:
+            self.node_scene.clearSelection()
+        finally:
+            self.node_scene.blockSignals(False)
+        self._selected_node_id_cache = ()
+        self._selected_link_id_cache = ()
+        self._node_graph.selected_node_ids = ()
+
+    def _restore_scene_selection(
+        self,
+        node_ids: tuple[str, ...],
+        link_ids: tuple[str, ...] = (),
+    ) -> None:
+        for node_id in node_ids:
+            item = self._node_items.get(node_id)
+            if item is not None:
+                try:
+                    item.setSelected(True)
+                except RuntimeError:
+                    continue
+        for link_id in link_ids:
+            for item in self._node_link_items:
+                try:
+                    if item.data(2) == link_id:
+                        item.setSelected(True)
+                        break
+                except RuntimeError:
+                    continue
+
+    def _set_scene_selection_by_ids(
+        self,
+        node_ids: tuple[str, ...],
+        link_ids: tuple[str, ...] = (),
+    ) -> None:
+        node_ids = tuple(node_id for node_id in node_ids if node_id in self._node_graph.nodes)
+        link_ids = tuple(link_id for link_id in link_ids if link_id in self._node_graph.links)
+        self.node_scene.blockSignals(True)
+        try:
+            self.node_scene.clearSelection()
+            self._restore_scene_selection(node_ids, link_ids)
+        finally:
+            self.node_scene.blockSignals(False)
+        self._selected_node_id_cache = node_ids
+        self._selected_link_id_cache = link_ids
+        self._node_graph.selected_node_ids = node_ids
+        self._schedule_node_selection_ui_update()
 
     def _delete_link_by_id(self, link_id: str) -> None:
         if link_id not in self._node_graph.links:
@@ -1934,10 +2806,7 @@ class _PreviewWindow:
         return None
 
     def _select_node_item(self, node_id: str) -> None:
-        self.node_scene.clearSelection()
-        item = self._node_items.get(node_id)
-        if item is not None:
-            item.setSelected(True)
+        self._set_scene_selection_by_ids((node_id,))
 
     def _show_node_context_menu(self, view_pos: Any) -> None:
         if self._node_suppress_context_menu:
@@ -2062,8 +2931,7 @@ class _PreviewWindow:
         )
         if accepted:
             self._node_graph.rename_node(node.id, name)
-            self._redraw_node_graph()
-            self._select_node_item(node.id)
+            self._queue_node_graph_redraw((node.id,))
 
     def _rename_group_dialog(self, group_id: str) -> None:
         group = self._node_graph.groups.get(group_id)
@@ -2077,28 +2945,64 @@ class _PreviewWindow:
         )
         if accepted:
             group.name = name.strip() or group.name
-            self._redraw_node_graph()
+            self._queue_node_graph_redraw(self._selected_node_ids())
 
     def _delete_group_only(self, group_id: str) -> None:
         group = self._node_graph.groups.pop(group_id, None)
         if group is None:
             return
+        selected = self._selected_node_ids()
+        self._clear_node_scene_selection()
         for node_id in group.node_ids:
             if node_id in self._node_graph.nodes:
                 self._node_graph.nodes[node_id].group_id = None
-        self._redraw_node_graph()
+        self._selected_node_id_cache = tuple(
+            node_id for node_id in selected if node_id in self._node_graph.nodes
+        )
+        self._queue_node_graph_redraw(self._selected_node_id_cache)
 
     def _delete_group_and_nodes(self, group_id: str) -> None:
         group = self._node_graph.groups.get(group_id)
         if group is None:
             return
-        self._node_graph.delete_nodes(group.node_ids)
+        node_ids = tuple(node_id for node_id in group.node_ids if node_id in self._node_graph.nodes)
+        self._clear_node_scene_selection()
+        result = self._graph_controller().delete_nodes(node_ids)
+        if not result.success:
+            self._show_graph_error(
+                "Delete group nodes failed",
+                RuntimeError(result.error or "unknown error"),
+            )
+            return
         self._node_graph.groups.pop(group_id, None)
-        self._redraw_node_graph()
+        self._queue_node_graph_redraw()
 
     def _on_node_selection_changed(self) -> None:
+        if self._redrawing_node_graph or self._applying_node_selection:
+            return
+        (
+            self._selected_node_id_cache,
+            self._selected_link_id_cache,
+        ) = self._read_scene_selection_ids()
+        self._node_graph.selected_node_ids = self._selected_node_id_cache
+        self._logger.info(
+            "Node selection changed: nodes=%s links=%s",
+            len(self._selected_node_id_cache),
+            len(self._selected_link_id_cache),
+        )
+        self._schedule_node_selection_ui_update()
+
+    def _schedule_node_selection_ui_update(self) -> None:
+        if not hasattr(self, "node_scene") or self._applying_node_selection:
+            return
+        self._applying_node_selection = True
+        self._qt_core.QTimer.singleShot(0, self._apply_node_selection_changed)
+
+    def _apply_node_selection_changed(self) -> None:
         try:
             selected = self._selected_node_ids()
+            self._selected_node_id_cache = selected
+            self._selected_link_id_cache = self._selected_link_ids()
             self._node_graph.selected_node_ids = selected
             if len(selected) != 1:
                 self.node_inspector_type.setText(
@@ -2126,6 +3030,8 @@ class _PreviewWindow:
             self._update_viewport_context_for_selection(selected)
         except RuntimeError:
             return
+        finally:
+            self._applying_node_selection = False
 
     def _rebuild_node_inspector_form(self, selected: tuple[str, ...]) -> None:
         self._clear_form_layout(self.node_inspector_form)
@@ -2175,7 +3081,11 @@ class _PreviewWindow:
         self.node_inspector_form.addRow("Inputs", self._qt_widgets.QLabel(inputs))
         self.node_inspector_form.addRow("Outputs", self._qt_widgets.QLabel(outputs))
         for key, value in node.settings.items():
-            editor = self._setting_editor(node.id, key, value)
+            editor = (
+                self._node_path_editor(node.id, key, value)
+                if self._is_path_setting(key)
+                else self._setting_editor(node.id, key, value)
+            )
             self.node_inspector_form.addRow(_setting_label(key), editor)
         run_button = self._qt_widgets.QPushButton("Run Graph From This Node")
         self._connect_safe_button(
@@ -2192,27 +3102,34 @@ class _PreviewWindow:
             if widget is not None:
                 widget.deleteLater()
 
-    def _setting_editor(self, node_id: str, key: str, value: Any) -> Any:
+    def _setting_editor(
+        self,
+        node_id: str,
+        key: str,
+        value: Any,
+        *,
+        compact: bool = False,
+    ) -> Any:
         if isinstance(value, bool):
             editor = self._qt_widgets.QCheckBox()
             editor.setChecked(value)
             editor.toggled.connect(
-                lambda checked, setting_key=key: self._update_node_setting(
-                    node_id,
-                    setting_key,
-                    bool(checked),
+                lambda checked, setting_key=key: self.run_safe_action(
+                    "Edit Node Setting",
+                    lambda: self._update_node_setting(node_id, setting_key, bool(checked)),
                 )
             )
             return editor
         if isinstance(value, int) and not isinstance(value, bool):
             editor = self._qt_widgets.QSpinBox()
             editor.setRange(-1_000_000, 1_000_000)
+            if compact:
+                editor.setButtonSymbols(self._qt_widgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
             editor.setValue(value)
             editor.valueChanged.connect(
-                lambda new_value, setting_key=key: self._update_node_setting(
-                    node_id,
-                    setting_key,
-                    int(new_value),
+                lambda new_value, setting_key=key: self.run_safe_action(
+                    "Edit Node Setting",
+                    lambda: self._update_node_setting(node_id, setting_key, int(new_value)),
                 )
             )
             return editor
@@ -2220,22 +3137,37 @@ class _PreviewWindow:
             editor = self._qt_widgets.QDoubleSpinBox()
             editor.setRange(-1_000_000.0, 1_000_000.0)
             editor.setDecimals(4)
+            if compact:
+                editor.setButtonSymbols(self._qt_widgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
             editor.setValue(value)
             editor.valueChanged.connect(
-                lambda new_value, setting_key=key: self._update_node_setting(
-                    node_id,
-                    setting_key,
-                    float(new_value),
+                lambda new_value, setting_key=key: self.run_safe_action(
+                    "Edit Node Setting",
+                    lambda: self._update_node_setting(node_id, setting_key, float(new_value)),
                 )
             )
             return editor
         if isinstance(value, str):
+            options = self._setting_options(key, value)
+            if options:
+                editor = self._qt_widgets.QComboBox()
+                editor.setEditable(value not in options)
+                editor.addItems(options)
+                if value not in options:
+                    editor.addItem(value)
+                editor.setCurrentText(value)
+                editor.currentTextChanged.connect(
+                    lambda text, setting_key=key: self.run_safe_action(
+                        "Edit Node Setting",
+                        lambda: self._update_node_setting(node_id, setting_key, text),
+                    )
+                )
+                return editor
             editor = self._qt_widgets.QLineEdit(value)
-            editor.editingFinished.connect(
-                lambda setting_key=key, field=editor: self._update_node_setting(
-                    node_id,
-                    setting_key,
-                    field.text(),
+            editor.textEdited.connect(
+                lambda text, setting_key=key: self.run_safe_action(
+                    "Edit Node Setting",
+                    lambda: self._update_node_setting(node_id, setting_key, text),
                 )
             )
             return editor
@@ -2243,36 +3175,138 @@ class _PreviewWindow:
         summary.setWordWrap(True)
         return summary
 
+    def _is_path_setting(self, key: str) -> bool:
+        lowered = key.lower()
+        return lowered.endswith("_path") or lowered.endswith("_file") or "directory" in lowered
+
+    def _node_path_editor(
+        self,
+        node_id: str,
+        key: str,
+        value: Any,
+        *,
+        compact: bool = False,
+    ) -> Any:
+        container = self._qt_widgets.QWidget()
+        layout = self._qt_widgets.QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        field = self._qt_widgets.QLineEdit(str(value))
+        field.setToolTip(key)
+        field.textEdited.connect(
+            lambda text, setting_key=key: self.run_safe_action(
+                "Edit Node Setting",
+                lambda: self._update_node_setting(node_id, setting_key, text),
+            )
+        )
+        browse = self._qt_widgets.QPushButton("...")
+        browse.setFixedWidth(26 if compact else 32)
+
+        def browse_path_setting() -> None:
+            self._browse_node_path_setting(node_id, key, field)
+
+        self._connect_safe_button(
+            browse,
+            f"Browse {key}",
+            browse_path_setting,
+        )
+        layout.addWidget(field, 1)
+        layout.addWidget(browse)
+        container.setToolTip(key)
+        return container
+
+    def _browse_node_path_setting(self, node_id: str, key: str, field: Any) -> None:
+        if "directory" in key.lower():
+            selected = self._qt_widgets.QFileDialog.getExistingDirectory(
+                self.widget,
+                f"Choose {key}",
+                field.text() or ".",
+            )
+        else:
+            selected, _filter = self._qt_widgets.QFileDialog.getOpenFileName(
+                self.widget,
+                f"Choose {key}",
+                field.text() or ".",
+                "Mandrel/Profile files (*.dxf *.json *.csv);;All files (*.*)",
+            )
+        if not selected:
+            return
+        field.setText(selected)
+        self._update_node_setting(node_id, key, selected)
+
+    def _setting_options(self, key: str, current_value: str) -> list[str]:
+        options = {
+            "type": [
+                "hoop",
+                "helical",
+                "polar",
+                "geodesic",
+                "non_geodesic",
+                "cylinder",
+                "cylinder_with_elliptical_domes",
+                "axisymmetric_profile",
+            ],
+            "mode": ["dome", "cylinder", "profile"],
+            "region": ["cylinder_only", "dome_to_dome", "left_dome", "right_dome"],
+            "direction": ["forward", "reverse"],
+            "passes": ["auto"],
+            "method": ["textbook_integer_closure"],
+            "units": ["mm", "in"],
+            "controller": ["grbl_compatible"],
+            "tow_band_model": ["rectangular_surface_band"],
+            "fibre_type": ["carbon", "glass", "aramid", "basalt"],
+        }.get(key, [])
+        if current_value and current_value not in options and key in {
+            "type",
+            "region",
+            "direction",
+            "method",
+            "units",
+            "controller",
+            "tow_band_model",
+            "fibre_type",
+            "mode",
+        }:
+            options = [*options, current_value]
+        return options
+
     def _update_node_setting(self, node_id: str, key: str, value: Any) -> None:
         node = self._node_graph.nodes.get(node_id)
         if node is None:
             return
+        if node.settings.get(key) == value:
+            return
         node.settings[key] = value
         self._node_graph.mark_downstream_dirty(node_id)
-        self.node_inspector_status.setText(f"Status: {node.status} - {node.message}")
-        self.node_inspector_settings.setPlainText(
-            json.dumps(node.settings, indent=2, sort_keys=True)
-        )
+        if hasattr(self, "node_inspector_status"):
+            self.node_inspector_status.setText(f"Status: {node.status} - {node.message}")
+        if hasattr(self, "node_inspector_settings") and node_id in self._selected_node_ids():
+            self.node_inspector_settings.setPlainText(
+                json.dumps(node.settings, indent=2, sort_keys=True)
+            )
         self._set_node_status(f"Updated {node.name}: {key}")
+        self._schedule_node_setting_render()
+
+    def _schedule_node_setting_render(self) -> None:
+        if self._node_setting_render_pending:
+            return
+        self._node_setting_render_pending = True
+        self._qt_core.QTimer.singleShot(150, self._flush_node_setting_render)
+
+    def _flush_node_setting_render(self) -> None:
+        self._node_setting_render_pending = False
+        self._update_viewport_context_for_selection(self._selected_node_ids())
+        self._render_from_node()
 
     def _update_viewport_context_for_selection(self, selected: tuple[str, ...]) -> None:
         if len(selected) != 1:
-            previous_context = self._viewport_node_context
             self._viewport_node_context = None
-            if previous_context is not None and hasattr(self, "view"):
-                self._render_scene()
             return
         node = self._node_graph.nodes.get(selected[0])
         if node is None:
-            previous_context = self._viewport_node_context
             self._viewport_node_context = None
-            if previous_context is not None and hasattr(self, "view"):
-                self._render_scene()
             return
-        previous_context = self._viewport_node_context
         self._viewport_node_context = node.type_id
-        if previous_context != node.type_id and hasattr(self, "view"):
-            self._render_scene()
         definition = self._node_registry[node.type_id]
         context = self._viewport_context_description(node.type_id)
         current_status = self.status.text() if hasattr(self, "status") else ""
@@ -2300,6 +3334,7 @@ class _PreviewWindow:
             "mandrel_backend": "domed mandrel geometry",
             "tow_backend": "tow and material settings",
             "layer_stack_backend": "backend layer stack",
+            "layer_backend": "angle-driven layer definition",
             "hoop_layer": "single hoop layer definition",
             "geodesic_layer": "single geodesic dome layer definition",
             "non_geodesic_layer": "single controlled non-geodesic layer definition",
@@ -2324,6 +3359,98 @@ class _PreviewWindow:
             return False
         return not hasattr(self, "show_tow_band") or self.show_tow_band.isChecked()
 
+    def _display_layer_points(
+        self,
+        layer: Any,
+        *,
+        mandrel_length_mm: float,
+        center_z_mm: float | None = None,
+        display_offset_mm: float = 0.75,
+    ) -> Any:
+        points = orient_points_for_horizontal_view(
+            layer.path.points_mm,
+            length_mm=mandrel_length_mm,
+            center_z_mm=center_z_mm,
+        )
+        return offset_display_surface(points, offset_mm=display_offset_mm)
+
+    def _display_tow_band_mesh(
+        self,
+        layer: Any,
+        *,
+        mandrel_length_mm: float,
+        center_z_mm: float | None = None,
+        display_offset_mm: float = 0.9,
+    ) -> tuple[Any, Any]:
+        path_points = np.asarray(layer.path.points_mm, dtype=float)
+        if path_points.shape[0] < 2:
+            display_points = orient_points_for_horizontal_view(
+                path_points,
+                length_mm=mandrel_length_mm,
+                center_z_mm=center_z_mm,
+            )
+            return display_points, np.zeros((0, 3), dtype=int)
+        tangent = np.gradient(path_points, axis=0)
+        tangent_norm = np.linalg.norm(tangent, axis=1)
+        tangent_norm[tangent_norm <= 1e-9] = 1.0
+        tangent = tangent / tangent_norm[:, None]
+        surface_normal = self._path_surface_normals(layer)
+        side = np.cross(surface_normal, tangent)
+        side_norm = np.linalg.norm(side, axis=1)
+        fallback = side_norm <= 1e-9
+        side_norm[fallback] = 1.0
+        side = side / side_norm[:, None]
+        side[fallback] = np.asarray([0.0, 1.0, 0.0])
+        half_width = max(float(layer.spec.tow_width_mm) * 0.5, 0.25)
+        centerline = path_points + surface_normal * display_offset_mm
+        vertices_mandrel = np.empty((centerline.shape[0] * 2, 3), dtype=float)
+        vertices_mandrel[0::2] = centerline - side * half_width
+        vertices_mandrel[1::2] = centerline + side * half_width
+        vertices = orient_points_for_horizontal_view(
+            vertices_mandrel,
+            length_mm=mandrel_length_mm,
+            center_z_mm=center_z_mm,
+        )
+        faces = []
+        for index in range(centerline.shape[0] - 1):
+            left0 = index * 2
+            right0 = left0 + 1
+            left1 = left0 + 2
+            right1 = left0 + 3
+            faces.append((left0, left1, right0))
+            faces.append((right0, left1, right1))
+        return vertices, np.asarray(faces, dtype=int)
+
+    def _path_surface_normals(self, layer: Any) -> Any:
+        points = np.asarray(layer.path.points_mm, dtype=float)
+        radius = np.asarray(layer.path.surface_radius_mm, dtype=float)
+        z_mm = np.asarray(layer.path.z_mm, dtype=float)
+        if points.shape[0] == 0:
+            return np.zeros((0, 3), dtype=float)
+        radial = points.copy()
+        radial[:, 2] = 0.0
+        radial_norm = np.linalg.norm(radial[:, :2], axis=1)
+        radial_norm[radial_norm <= 1e-9] = 1.0
+        radial[:, 0] = radial[:, 0] / radial_norm
+        radial[:, 1] = radial[:, 1] / radial_norm
+        radial[:, 2] = 0.0
+        if points.shape[0] < 3 or np.allclose(radius, radius[0]):
+            return radial
+        dz = np.gradient(z_mm)
+        dr = np.gradient(radius)
+        dr_dz = np.divide(
+            dr,
+            dz,
+            out=np.zeros_like(dr, dtype=float),
+            where=np.abs(dz) > 1e-9,
+        )
+        dr_dz = np.nan_to_num(dr_dz, nan=0.0, posinf=0.0, neginf=0.0)
+        normals = radial.copy()
+        normals[:, 2] = -dr_dz
+        normal_norm = np.linalg.norm(normals, axis=1)
+        normal_norm[normal_norm <= 1e-9] = 1.0
+        return normals / normal_norm[:, None]
+
     def _apply_node_inspector(self) -> None:
         selected = self._selected_node_ids()
         if len(selected) != 1:
@@ -2340,8 +3467,8 @@ class _PreviewWindow:
         self._node_graph.rename_node(node_id, self.node_inspector_name.text())
         self._node_graph.nodes[node_id].settings = settings
         self._node_graph.mark_downstream_dirty(node_id)
-        self._redraw_node_graph()
-        self._select_node_item(node_id)
+        self._queue_node_graph_redraw((node_id,))
+        self._schedule_node_setting_render()
         self._rebuild_node_inspector_form((node_id,))
 
     def _link_selected_nodes(self) -> None:
@@ -2357,10 +3484,12 @@ class _PreviewWindow:
         if link_args is None:
             self._set_node_status("No compatible socket pair between selected nodes")
             return
-        try:
-            self._node_graph.add_link(*link_args, registry=self._node_registry)
-        except ValueError as exc:
-            self._show_graph_error("Link creation failed", exc)
+        result = self._graph_controller().link_nodes(*link_args)
+        if not result.success:
+            self._show_graph_error(
+                "Link creation failed",
+                RuntimeError(result.error or "unknown error"),
+            )
             return
         self._refresh_node_links()
         self._set_node_status("Link created")
@@ -2405,6 +3534,8 @@ class _PreviewWindow:
         if not selected:
             self._set_node_status("No node selected. Select a node before using Duplicate.")
             return
+        self._logger.info("Duplicate nodes: count=%s ids=%s", len(selected), selected)
+        self._clear_node_scene_selection()
         new_nodes = []
         for node_id in selected:
             result = self._graph_controller().duplicate_node(node_id)
@@ -2415,15 +3546,17 @@ class _PreviewWindow:
                 )
                 return
             new_nodes.append(self._node_graph.nodes[result.node_id])
-        self._redraw_node_graph()
-        if new_nodes:
-            self._select_node_item(new_nodes[-1].id)
+        new_ids = tuple(node.id for node in new_nodes)
+        self._selected_node_id_cache = new_ids
+        self._queue_node_graph_redraw(new_ids)
 
     def _delete_selected_nodes(self) -> None:
         selected = self._selected_node_ids()
         if not selected:
             self._set_node_status("No node selected. Select a node before using Delete.")
             return
+        self._logger.info("Delete nodes: count=%s ids=%s", len(selected), selected)
+        self._clear_node_scene_selection()
         result = self._graph_controller().delete_nodes(selected)
         if not result.success:
             self._show_graph_error(
@@ -2431,13 +3564,22 @@ class _PreviewWindow:
                 RuntimeError(result.error or "unknown error"),
             )
             return
-        self._redraw_node_graph()
+        self._queue_node_graph_redraw()
 
     def _delete_selected_graph_items(self) -> None:
         link_ids = self._selected_link_ids()
+        selected = self._selected_node_ids()
+        if not link_ids and not selected:
+            self._set_node_status("No node or link selected. Select an item before using Delete.")
+            return
+        self._logger.info(
+            "Delete graph items: nodes=%s links=%s",
+            len(selected),
+            len(link_ids),
+        )
+        self._clear_node_scene_selection()
         for link_id in link_ids:
             self._node_graph.links.pop(link_id, None)
-        selected = self._selected_node_ids()
         if selected:
             result = self._graph_controller().delete_nodes(selected)
             if not result.success:
@@ -2446,54 +3588,59 @@ class _PreviewWindow:
                     RuntimeError(result.error or "unknown error"),
                 )
                 return
-        if not link_ids and not selected:
-            self._set_node_status("No node or link selected. Select an item before using Delete.")
-            return
-        self._redraw_node_graph()
+        self._queue_node_graph_redraw()
 
     def _set_selected_nodes_collapsed(self, collapsed: bool) -> None:
         selected = self._selected_node_ids()
         if not selected:
             self._set_node_status("No node selected. Select a node before Collapse/Expand.")
             return
+        self._clear_node_scene_selection()
         for node_id in selected:
             self._node_graph.set_node_collapsed(node_id, collapsed)
-        self._redraw_node_graph()
+        self._selected_node_id_cache = selected
+        self._queue_node_graph_redraw(selected)
 
     def _group_selected_nodes(self) -> None:
         selected = self._selected_node_ids()
         if len(selected) < 2:
             self._set_node_status("Select at least two nodes to group")
             return
+        self._clear_node_scene_selection()
         self._node_graph.group_nodes(selected, name=f"Group {len(self._node_graph.groups) + 1}")
-        self._redraw_node_graph()
+        self._selected_node_id_cache = selected
+        self._queue_node_graph_redraw(selected)
 
     def _ungroup_selected_nodes(self) -> None:
         selected = set(self._selected_node_ids())
         if not selected:
             self._set_node_status("No node selected. Select grouped nodes before using Ungroup.")
             return
+        self._clear_node_scene_selection()
         for group_id, group in list(self._node_graph.groups.items()):
             if selected.intersection(group.node_ids):
                 for node_id in group.node_ids:
                     if node_id in self._node_graph.nodes:
                         self._node_graph.nodes[node_id].group_id = None
                 self._node_graph.groups.pop(group_id, None)
-        self._redraw_node_graph()
+        self._selected_node_id_cache = tuple(
+            node_id for node_id in selected if node_id in self._node_graph.nodes
+        )
+        self._queue_node_graph_redraw(self._selected_node_id_cache)
 
     def _move_selected_nodes(self, dx: float, dy: float) -> None:
         selected = self._selected_node_ids()
         if not selected:
             self._set_node_status("No node selected. Select node(s) before moving.")
             return
+        self._logger.info("Move nodes: count=%s dx=%s dy=%s", len(selected), dx, dy)
+        self._clear_node_scene_selection()
         for node_id in selected:
             node = self._node_graph.nodes[node_id]
             self._node_graph.set_node_position(node_id, node.x + dx, node.y + dy)
             self._node_graph.mark_downstream_dirty(node_id)
-        self._redraw_node_graph()
-        for node_id in selected:
-            if node_id in self._node_items:
-                self._node_items[node_id].setSelected(True)
+        self._selected_node_id_cache = selected
+        self._queue_node_graph_redraw(selected)
         self._set_node_status(f"Moved {len(selected)} node(s)")
 
     def _align_selected_nodes_horizontally(self) -> None:
@@ -2501,22 +3648,26 @@ class _PreviewWindow:
         if len(selected) < 2:
             self._set_node_status("Select at least two nodes before using Align H.")
             return
+        self._clear_node_scene_selection()
         y_pos = min(self._node_graph.nodes[node_id].y for node_id in selected)
         for node_id in selected:
             self._node_graph.set_node_position(node_id, self._node_graph.nodes[node_id].x, y_pos)
             self._node_graph.mark_downstream_dirty(node_id)
-        self._redraw_node_graph()
+        self._selected_node_id_cache = selected
+        self._queue_node_graph_redraw(selected)
 
     def _align_selected_nodes_vertically(self) -> None:
         selected = self._selected_node_ids()
         if len(selected) < 2:
             self._set_node_status("Select at least two nodes before using Align V.")
             return
+        self._clear_node_scene_selection()
         x_pos = min(self._node_graph.nodes[node_id].x for node_id in selected)
         for node_id in selected:
             self._node_graph.set_node_position(node_id, x_pos, self._node_graph.nodes[node_id].y)
             self._node_graph.mark_downstream_dirty(node_id)
-        self._redraw_node_graph()
+        self._selected_node_id_cache = selected
+        self._queue_node_graph_redraw(selected)
 
     def _distribute_selected_nodes_horizontally(self) -> None:
         selected = sorted(
@@ -2526,6 +3677,7 @@ class _PreviewWindow:
         if len(selected) < 3:
             self._set_node_status("Select at least three nodes before using Distribute H.")
             return
+        self._clear_node_scene_selection()
         start = self._node_graph.nodes[selected[0]].x
         end = self._node_graph.nodes[selected[-1]].x
         step = (end - start) / max(1, len(selected) - 1)
@@ -2536,7 +3688,8 @@ class _PreviewWindow:
                 self._node_graph.nodes[node_id].y,
             )
             self._node_graph.mark_downstream_dirty(node_id)
-        self._redraw_node_graph()
+        self._selected_node_id_cache = tuple(selected)
+        self._queue_node_graph_redraw(tuple(selected))
 
     def _distribute_selected_nodes_vertically(self) -> None:
         selected = sorted(
@@ -2546,6 +3699,7 @@ class _PreviewWindow:
         if len(selected) < 3:
             self._set_node_status("Select at least three nodes before using Distribute V.")
             return
+        self._clear_node_scene_selection()
         start = self._node_graph.nodes[selected[0]].y
         end = self._node_graph.nodes[selected[-1]].y
         step = (end - start) / max(1, len(selected) - 1)
@@ -2556,7 +3710,8 @@ class _PreviewWindow:
                 start + step * index,
             )
             self._node_graph.mark_downstream_dirty(node_id)
-        self._redraw_node_graph()
+        self._selected_node_id_cache = tuple(selected)
+        self._queue_node_graph_redraw(tuple(selected))
 
     def _frame_selected_nodes(self) -> None:
         selected = self._selected_node_ids()
@@ -2599,12 +3754,19 @@ class _PreviewWindow:
                     60.0 + depth * 380.0,
                     70.0 + row * 200.0,
                 )
-        self._redraw_node_graph()
+        selected = self._selected_node_ids()
+        self._selected_node_id_cache = selected
+        self._queue_node_graph_redraw(selected)
         self._schedule_fit_node_graph()
 
     def _sync_node_graph_from_scene(self) -> None:
         for node_id, item in self._node_items.items():
-            position = item.pos()
+            if node_id not in self._node_graph.nodes:
+                continue
+            try:
+                position = item.pos()
+            except RuntimeError:
+                continue
             self._node_graph.set_node_position(node_id, float(position.x()), float(position.y()))
         self._sync_node_view_state()
 
@@ -2614,6 +3776,10 @@ class _PreviewWindow:
             "machine_backend",
             "mandrel_backend",
             "tow_backend",
+            "layer_backend",
+            "hoop_layer",
+            "geodesic_layer",
+            "non_geodesic_layer",
             "layer_stack_backend",
             "pattern_optimisation_backend",
             "coverage_mode",
@@ -2640,6 +3806,7 @@ class _PreviewWindow:
         except ValueError as exc:
             self._show_graph_error("Graph execution failed", exc)
             return
+        self._start_task_progress("Graph", total_steps=len(ordered_node_ids))
         for node_id in ordered_node_ids:
             node = self._node_graph.nodes[node_id]
             node.status = "processing"
@@ -2670,9 +3837,11 @@ class _PreviewWindow:
                         execute_exports=execute_exports,
                     ).execute(graph)
                 except Exception as exc:  # noqa: BLE001 - reported to UI thread
-                    self.signals.failed.emit(str(exc))
+                    with suppress(RuntimeError):
+                        self.signals.failed.emit(str(exc))
                     return
-                self.signals.finished.emit(result, graph.to_dict())
+                with suppress(RuntimeError):
+                    self.signals.finished.emit(result, graph.to_dict())
 
         worker = _GraphWorker()
         worker.signals.finished.connect(self._on_node_graph_worker_finished)
@@ -2685,23 +3854,31 @@ class _PreviewWindow:
         result: GraphExecutionResult,
         graph_data: dict[str, object],
     ) -> None:
+        if self._closing:
+            return
         self._node_graph = NodeGraphState.from_dict(graph_data, self._node_registry)
         self._last_node_result = result
         self._redraw_node_graph()
         self._draw_node_graph_result(result)
+        self._update_task_progress(len(result.executed_node_ids))
         if result.warnings:
             warning_text = "\n".join(result.warnings)
+            self._finish_task_progress("Complete with warnings")
             self._set_node_status(f"Graph completed with warnings:\n{warning_text}")
             return
+        self._finish_task_progress("Complete")
         self._set_node_status(f"Graph complete: {len(result.executed_node_ids)} nodes executed")
         self._log_graph_event("Graph execution completed")
 
     def _on_node_graph_worker_failed(self, message: str) -> None:
+        if self._closing:
+            return
         for node in self._node_graph.nodes.values():
             if node.status == "processing":
                 node.status = "error"
                 node.message = message
         self._redraw_node_graph()
+        self._fail_task_progress("Failed")
         self._show_graph_error(f"Graph execution failed: {message}")
 
     def _run_backend_check(self) -> None:
@@ -2721,6 +3898,9 @@ class _PreviewWindow:
         graph_data = self._node_graph.to_dict()
         registry = self._node_registry
         qt_core = self._qt_core
+        self._logger.info("Backend %s start", operation)
+        self._append_gui_log("Backend", "started", operation)
+        self._start_task_progress(operation.replace("_", " ").title())
         self._mark_backend_nodes_running(operation)
         self._set_backend_busy(True, f"Backend {operation.replace('_', ' ')} running...")
 
@@ -2746,9 +3926,11 @@ class _PreviewWindow:
                     else:
                         raise ValueError(f"unsupported backend operation: {operation}")
                 except Exception as exc:  # noqa: BLE001 - reported to UI thread
-                    self.signals.failed.emit(operation, str(exc), traceback.format_exc())
+                    with suppress(RuntimeError):
+                        self.signals.failed.emit(operation, str(exc), traceback.format_exc())
                     return
-                self.signals.finished.emit(operation, payload, graph.to_dict())
+                with suppress(RuntimeError):
+                    self.signals.finished.emit(operation, payload, graph.to_dict())
 
         worker = _BackendWorker()
         worker.signals.finished.connect(self._on_backend_service_worker_finished)
@@ -2762,6 +3944,10 @@ class _PreviewWindow:
             "machine_backend",
             "mandrel_backend",
             "tow_backend",
+            "layer_backend",
+            "hoop_layer",
+            "geodesic_layer",
+            "non_geodesic_layer",
             "layer_stack_backend",
             "pattern_optimisation_backend",
             "coverage_mode",
@@ -2784,6 +3970,8 @@ class _PreviewWindow:
         payload: object,
         graph_data: dict[str, object],
     ) -> None:
+        if self._closing:
+            return
         self._node_graph = NodeGraphState.from_dict(graph_data, self._node_registry)
         if isinstance(payload, BackendCheckResult):
             self._last_backend_check = payload
@@ -2802,6 +3990,9 @@ class _PreviewWindow:
             self._mark_backend_nodes_passed(f"{operation} complete")
             self._set_node_status(f"{operation.replace('_', ' ').title()} complete")
         self._redraw_node_graph()
+        self._logger.info("Backend %s complete", operation)
+        self._append_gui_log("Backend", "complete", operation)
+        self._finish_task_progress("Complete")
         self._set_backend_busy(False, f"Complete: {operation.replace('_', ' ')}")
 
     def _on_backend_service_worker_failed(
@@ -2810,11 +4001,16 @@ class _PreviewWindow:
         message: str,
         traceback_text: str,
     ) -> None:
+        if self._closing:
+            return
         for node in self._node_graph.nodes.values():
             if node.status == "running":
                 node.status = "failed"
                 node.message = message
+        self._logger.error("Backend %s failed: %s\n%s", operation, message, traceback_text)
+        self._append_gui_log("Backend", "failed", f"{operation}: {message}", traceback_text)
         self._redraw_node_graph()
+        self._fail_task_progress("Failed")
         self._set_backend_busy(False, f"{operation.replace('_', ' ')} failed: {message}")
         self._show_graph_error(
             f"Backend {operation.replace('_', ' ')} failed",
@@ -2838,6 +4034,10 @@ class _PreviewWindow:
                 "machine_backend",
                 "mandrel_backend",
                 "tow_backend",
+                "layer_backend",
+                "hoop_layer",
+                "geodesic_layer",
+                "non_geodesic_layer",
                 "layer_stack_backend",
                 "pattern_optimisation_backend",
                 "coverage_mode",
@@ -3017,7 +4217,6 @@ class _PreviewWindow:
                 length_mm=mandrel.length_mm,
                 center_z_mm=center_z,
             )
-            scale = max(mandrel.length_mm, mandrel.radius_mm * 6.0)
         else:
             mesh_vertices, mesh_faces = profile_mesh_arrays(
                 mandrel,
@@ -3030,7 +4229,6 @@ class _PreviewWindow:
                 length_mm=mandrel.length_mm,
                 center_z_mm=center_z,
             )
-            scale = max(mandrel.length_mm, mandrel.max_radius_mm * 6.0)
         self._visuals.append(
             scene.visuals.Mesh(
                 vertices=display_mandrel,
@@ -3049,12 +4247,11 @@ class _PreviewWindow:
         )
         if self._viewport_show_tow_path():
             for index, layer in enumerate(program.layers):
-                points = orient_points_for_horizontal_view(
-                    layer.path.points_mm,
-                    length_mm=mandrel.length_mm,
+                points = self._display_layer_points(
+                    layer,
+                    mandrel_length_mm=mandrel.length_mm,
                     center_z_mm=center_z,
                 )
-                points = offset_display_surface(points, offset_mm=0.75)
                 self._visuals.append(
                     scene.visuals.Line(
                         pos=points,
@@ -3064,9 +4261,26 @@ class _PreviewWindow:
                     )
                 )
                 self._visuals[-1].set_gl_state("opaque", depth_test=True)
-        self.view.camera.distance = scale * 1.4
-        self.view.camera.center = (0.0, 0.0, 0.0)
-        self.view.camera.scale_factor = scale
+        if self._viewport_show_tow_band():
+            for index, layer in enumerate(program.layers):
+                vertices, faces = self._display_tow_band_mesh(
+                    layer,
+                    mandrel_length_mm=mandrel.length_mm,
+                    center_z_mm=center_z,
+                )
+                if faces.size == 0:
+                    continue
+                color = colors[index % len(colors)]
+                self._visuals.append(
+                    scene.visuals.Mesh(
+                        vertices=vertices,
+                        faces=faces,
+                        color=(color[0], color[1], color[2], 0.38),
+                        shading="flat",
+                        parent=self.view.scene,
+                    )
+                )
+                self._visuals[-1].set_gl_state("translucent", depth_test=True, cull_face=False)
         self.status.setText(
             f"Mode: node graph\nLayers: {len(program.layers)}\nPoints: {program.point_count}"
         )
@@ -3545,6 +4759,37 @@ class _PreviewWindow:
         )
 
     def _render_scene(self) -> None:
+        camera_state = self._capture_mandrel_camera_state()
+        try:
+            self._render_scene_contents()
+        finally:
+            self._restore_mandrel_camera_state(camera_state)
+
+    def _capture_mandrel_camera_state(self) -> dict[str, Any] | None:
+        if not hasattr(self, "view") or not hasattr(self.view, "camera"):
+            return None
+        camera = self.view.camera
+        return {
+            "center": tuple(camera.center),
+            "distance": camera.distance,
+            "scale_factor": camera.scale_factor,
+            "quaternion": camera._quaternion,
+        }
+
+    def _restore_mandrel_camera_state(self, camera_state: dict[str, Any] | None) -> None:
+        if camera_state is None or not hasattr(self, "view") or not hasattr(self.view, "camera"):
+            return
+        camera = self.view.camera
+        camera.center = camera_state["center"]
+        camera.distance = camera_state["distance"]
+        camera.scale_factor = camera_state["scale_factor"]
+        camera._quaternion = camera_state["quaternion"]
+        camera.view_changed()
+
+    def _render_scene_contents(self) -> None:
+        if self._uses_backend_service_graph():
+            self._render_node_graph_scene()
+            return
         if self._is_profile_dome_mode():
             if self._is_pattern_planner_enabled():
                 self._render_profile_dome_pattern_scene()
@@ -3617,6 +4862,185 @@ class _PreviewWindow:
             f"Overlap: {preview.coverage_summary.overlap_percent:.2f}%"
         )
 
+    def _render_node_graph_scene(self) -> None:
+        try:
+            self._sync_node_graph_from_scene()
+            config = self._backend_service.build_project_from_graph(self._node_graph)
+            mandrel = self._preview_mandrel_from_config(config)
+            schedule = self._preview_schedule_from_config(config)
+            program = plan_winding_schedule(mandrel, schedule)
+        except (OSError, ValueError) as exc:
+            self.status.setText(f"Invalid node graph preview: {exc}")
+            return
+        scene = self._vispy_scene
+        for visual in self._visuals:
+            visual.parent = None
+        self._visuals.clear()
+        if isinstance(mandrel, CylinderMandrel):
+            mesh_vertices, mesh_faces = cylinder_mesh_arrays(
+                mandrel,
+                theta_segments=96,
+                z_segments=32,
+            )
+            radius_mm = mandrel.radius_mm
+        else:
+            mesh_vertices, mesh_faces = profile_mesh_arrays(
+                mandrel,
+                theta_segments=96,
+                z_segments=max(24, min(180, config.mandrel.mesh_points_z)),
+            )
+            radius_mm = mandrel.max_radius_mm
+        display_mandrel = orient_points_for_horizontal_view(
+            mesh_vertices,
+            length_mm=mandrel.length_mm,
+        )
+        self._visuals.append(
+            scene.visuals.Mesh(
+                vertices=display_mandrel,
+                faces=mesh_faces,
+                color=(0.42, 0.49, 0.55, 1.0),
+                shading="smooth",
+                parent=self.view.scene,
+            )
+        )
+        self._visuals[-1].set_gl_state("opaque", depth_test=True, cull_face=False)
+        colors = (
+            (0.10, 0.58, 1.0, 1.0),
+            (1.0, 0.52, 0.12, 1.0),
+            (0.30, 0.82, 0.44, 1.0),
+            (0.86, 0.36, 0.95, 1.0),
+        )
+        if self._viewport_show_tow_path():
+            for index, layer in enumerate(program.layers):
+                points = self._display_layer_points(layer, mandrel_length_mm=mandrel.length_mm)
+                if points.shape[0] < 2:
+                    continue
+                self._visuals.append(
+                    scene.visuals.Line(
+                        pos=points,
+                        color=colors[index % len(colors)],
+                        width=2.0,
+                        parent=self.view.scene,
+                    )
+                )
+                self._visuals[-1].set_gl_state("opaque", depth_test=True)
+        if self._viewport_show_tow_band():
+            for index, layer in enumerate(program.layers):
+                vertices, faces = self._display_tow_band_mesh(
+                    layer,
+                    mandrel_length_mm=mandrel.length_mm,
+                )
+                if faces.size == 0:
+                    continue
+                color = colors[index % len(colors)]
+                self._visuals.append(
+                    scene.visuals.Mesh(
+                        vertices=vertices,
+                        faces=faces,
+                        color=(color[0], color[1], color[2], 0.38),
+                        shading="flat",
+                        parent=self.view.scene,
+                    )
+                )
+                self._visuals[-1].set_gl_state("translucent", depth_test=True, cull_face=False)
+        scale = max(mandrel.length_mm, radius_mm * 6.0)
+        self.view.camera.distance = scale * 1.4
+        self.view.camera.center = (0.0, 0.0, 0.0)
+        self.view.camera.scale_factor = scale
+        layer_lines = [
+            (
+                f"{report.layer_name}: {report.winding_type}, "
+                f"{report.actual_angle_deg:.2f} deg, "
+                f"{report.coverage_percent:.1f}%"
+            )
+            for report in program.reports[:5]
+        ]
+        self.status.setText(
+            f"Mode: node graph preview\n"
+            f"Mandrel: {config.mandrel.type}, L={mandrel.length_mm:.1f} mm, "
+            f"R={radius_mm:.1f} mm\n"
+            f"Layers: {len(program.layers)} | Points: {program.point_count}\n"
+            + "\n".join(layer_lines)
+        )
+
+    def _preview_mandrel_from_config(
+        self,
+        config: WindingJobConfig,
+    ) -> CylinderMandrel | AxisymmetricProfileMandrel:
+        if config.mandrel.type == "cylinder":
+            return CylinderMandrel(
+                length_mm=config.mandrel.length_mm,
+                radius_mm=config.mandrel.radius_mm,
+                name=config.project.name,
+            )
+        if config.mandrel.type in {"axisymmetric_profile", "profile"}:
+            if config.mandrel.profile_path is None:
+                raise ValueError("mandrel profile_path is required")
+            return import_dxf_zr_profile(
+                config.mandrel.profile_path,
+                samples=config.mandrel.samples,
+            )
+        return cylinder_with_domes_profile(
+            cylinder_length_mm=config.mandrel.cylinder_length_mm
+            or config.mandrel.length_mm,
+            cylinder_radius_mm=config.mandrel.cylinder_radius_mm
+            or config.mandrel.radius_mm,
+            left_dome_length_mm=config.mandrel.left_dome_length_mm,
+            right_dome_length_mm=config.mandrel.right_dome_length_mm,
+            polar_opening_radius_mm=config.mandrel.polar_opening_radius_mm,
+            samples_per_region=max(16, config.mandrel.mesh_points_z // 3),
+            name=config.project.name,
+        )
+
+    def _preview_schedule_from_config(self, config: WindingJobConfig) -> WindingSchedule:
+        return WindingSchedule(
+            layers=tuple(
+                WindingLayerSpec(
+                    name=layer.name,
+                    winding_type=cast(Any, layer.type),
+                    target_angle_deg=(
+                        layer.target_angle_deg
+                        if layer.target_angle_deg is not None
+                        else layer.winding_angle_deg
+                    ),
+                    tow_width_mm=layer.tow_width_mm or config.tow.width_mm,
+                    layer_thickness_mm=layer.tow_thickness_mm or config.tow.thickness_mm,
+                    coverage_target=layer.coverage_target,
+                    direction=cast(Any, layer.direction),
+                    point_count=max(2, layer.points),
+                    layer_id=layer.name,
+                    enabled=layer.enabled,
+                    number_of_passes=self._preview_layer_pass_count(layer.passes),
+                    start_z_mm=layer.start_z_mm,
+                    end_z_mm=layer.end_z_mm,
+                    feedrate_mm_min=layer.feedrate_mm_min,
+                    transition_points=20,
+                    turnaround_radius_mm=layer.turnaround_radius_mm,
+                    phase_offset_deg=layer.phase_offset_deg,
+                    colour=layer.colour,
+                )
+                for layer in config.layers
+            ),
+            radial_clearance_mm=config.machine.clearance_mm,
+            nominal_feedrate_mm_min=float(
+                next(
+                    (
+                        layer.feedrate_mm_min
+                        for layer in config.layers
+                        if layer.enabled and layer.feedrate_mm_min is not None
+                    ),
+                    500.0,
+                )
+            ),
+        )
+
+    def _preview_layer_pass_count(self, passes: int | str | None) -> int | None:
+        if passes is None:
+            return None
+        if isinstance(passes, str) and passes.strip().lower() in {"", "auto"}:
+            return None
+        return int(passes)
+
     def _render_custom_layer_scene(self) -> None:
         schedule = self._current_layer_schedule()
         if schedule is None:
@@ -3658,12 +5082,11 @@ class _PreviewWindow:
         )
         if self._viewport_show_tow_path():
             for index, layer in enumerate(program.layers):
-                points = orient_points_for_horizontal_view(
-                    layer.path.points_mm,
-                    length_mm=mandrel.length_mm,
+                points = self._display_layer_points(
+                    layer,
+                    mandrel_length_mm=mandrel.length_mm,
                     center_z_mm=0.5 * mandrel.length_mm,
                 )
-                points = offset_display_surface(points, offset_mm=0.75)
                 self._visuals.append(
                     scene.visuals.Line(
                         pos=points,
@@ -3673,6 +5096,26 @@ class _PreviewWindow:
                     )
                 )
                 self._visuals[-1].set_gl_state("opaque", depth_test=True)
+        if self._viewport_show_tow_band():
+            for index, layer in enumerate(program.layers):
+                vertices, faces = self._display_tow_band_mesh(
+                    layer,
+                    mandrel_length_mm=mandrel.length_mm,
+                    center_z_mm=0.5 * mandrel.length_mm,
+                )
+                if faces.size == 0:
+                    continue
+                color = colors[index % len(colors)]
+                self._visuals.append(
+                    scene.visuals.Mesh(
+                        vertices=vertices,
+                        faces=faces,
+                        color=(color[0], color[1], color[2], 0.38),
+                        shading="flat",
+                        parent=self.view.scene,
+                    )
+                )
+                self._visuals[-1].set_gl_state("translucent", depth_test=True, cull_face=False)
         scale = max(mandrel.length_mm, mandrel.radius_mm * 6.0)
         self.view.camera.distance = scale * 1.4
         self.view.camera.center = (0.0, 0.0, 0.0)
@@ -4427,6 +5870,15 @@ def _setting_label(name: str) -> str:
     return name.replace("_", " ").strip().capitalize()
 
 
+def _float_setting(value: Any, default: float) -> float:
+    try:
+        if value in {None, ""}:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _modern_stylesheet() -> str:
     return """
     QWidget {
@@ -4456,6 +5908,18 @@ def _modern_stylesheet() -> str:
         background: #0b1015;
         border: 1px solid #29323d;
         border-radius: 6px;
+    }
+    QWidget#nodeWorkspace {
+        background: #0f141a;
+    }
+    QWidget#nodeToolbar {
+        background: #121a23;
+        border: 1px solid #263442;
+        border-radius: 6px;
+    }
+    QScrollArea#nodeToolbarScroll {
+        background: transparent;
+        border: 0;
     }
     QGroupBox {
         border: 1px solid #2d3742;
@@ -4508,11 +5972,50 @@ def _modern_stylesheet() -> str:
         padding: 4px;
         selection-background-color: #2b6cb0;
     }
+    QWidget#inlineNodeSettings {
+        background: #101820;
+        border: 1px solid #253342;
+        border-radius: 4px;
+    }
+    QLabel#inlineNodeSettingLabel {
+        background: transparent;
+        color: #b5c1cc;
+        font-size: 10px;
+        padding: 2px 0;
+    }
+    QLineEdit#inlineNodeSettingEditor,
+    QDoubleSpinBox#inlineNodeSettingEditor,
+    QSpinBox#inlineNodeSettingEditor,
+    QComboBox#inlineNodeSettingEditor {
+        background: #202830;
+        border: 1px solid #3a4652;
+        border-radius: 3px;
+        min-height: 20px;
+        padding: 1px 5px;
+        font-size: 10px;
+    }
+    QLineEdit#inlineNodeSettingEditor:focus,
+    QDoubleSpinBox#inlineNodeSettingEditor:focus,
+    QSpinBox#inlineNodeSettingEditor:focus,
+    QComboBox#inlineNodeSettingEditor:focus {
+        border-color: #4f8dcc;
+        background: #24313c;
+    }
+    QCheckBox#inlineNodeSettingEditor {
+        background: transparent;
+        spacing: 4px;
+    }
     QPushButton {
         background: #263341;
         border: 1px solid #3a4a5a;
         border-radius: 5px;
         padding: 6px 10px;
+    }
+    QWidget#nodeToolbar QPushButton {
+        background: #1b2530;
+        border-color: #344656;
+        padding: 5px 9px;
+        min-height: 24px;
     }
     QPushButton:hover {
         background: #314255;

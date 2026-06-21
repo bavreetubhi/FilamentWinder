@@ -45,6 +45,7 @@ from filament_winder.io import (
     export_segments_json,
     export_validation_report_json,
     export_winding_program_csv,
+    import_dxf_zr_profile,
 )
 from filament_winder.plot import plot_layer_diagnostics, plot_winding_program
 from filament_winder.services.path_validation import (
@@ -76,6 +77,10 @@ class WindingJobResult:
     candidate_pair_report_path: Path | None
     actual_thickness_report_path: Path | None
     region_quality_report_path: Path | None
+    calibration_report_path: Path | None
+    friction_margin_report_path: Path | None
+    polar_overbuild_report_path: Path | None
+    collision_report_path: Path | None
     optimisation_repair_suggestions_path: Path | None
     plot_manifest_path: Path | None
     plot_paths: tuple[Path, ...]
@@ -83,18 +88,25 @@ class WindingJobResult:
 
 
 def validate_winding_job_config(config: WindingJobConfig) -> tuple[str, ...]:
-    warnings = []
+    warnings: list[str] = []
     if config.project.units != "mm":
         raise ValueError("only mm units are currently supported")
     if config.mandrel.type not in {
         "cylinder",
         "cylinder_with_domes",
         "cylinder_with_elliptical_domes",
+        "axisymmetric_profile",
+        "profile",
     }:
         raise ValueError(
-            "mandrel.type must be cylinder, cylinder_with_domes, or "
-            "cylinder_with_elliptical_domes"
+            "mandrel.type must be cylinder, cylinder_with_domes, "
+            "cylinder_with_elliptical_domes, or axisymmetric_profile"
         )
+    if (
+        config.mandrel.type in {"axisymmetric_profile", "profile"}
+        and config.mandrel.profile_path is None
+    ):
+        raise ValueError("mandrel.profile_path is required for imported profile mandrels")
     if _mandrel_length_mm(config) <= 0.0:
         raise ValueError("mandrel.length_mm must be positive")
     if _mandrel_radius_mm(config) <= 0.0:
@@ -103,6 +115,14 @@ def validate_winding_job_config(config: WindingJobConfig) -> tuple[str, ...]:
         raise ValueError("tow.width_mm must be positive")
     if config.tow.thickness_mm < 0.0:
         raise ValueError("tow.thickness_mm must be non-negative")
+    if config.tow.effective_width_mm is not None and config.tow.effective_width_mm <= 0.0:
+        raise ValueError("tow.effective_width_mm must be positive when provided")
+    if config.tow.friction_coefficient is not None and config.tow.friction_coefficient <= 0.0:
+        raise ValueError("tow.friction_coefficient must be positive when provided")
+    if config.tow.min_bend_radius_mm is not None and config.tow.min_bend_radius_mm <= 0.0:
+        raise ValueError("tow.min_bend_radius_mm must be positive when provided")
+    if config.tow.tension_N is not None and config.tow.tension_N < 0.0:
+        raise ValueError("tow.tension_N must be non-negative when provided")
     if config.machine.clearance_mm < 0.0:
         raise ValueError("machine.clearance_mm must be non-negative")
     enabled_layers = [layer for layer in config.layers if layer.enabled]
@@ -110,11 +130,6 @@ def validate_winding_job_config(config: WindingJobConfig) -> tuple[str, ...]:
         raise ValueError("config must contain at least one enabled layer")
     for index, layer in enumerate(config.layers, start=1):
         _validate_layer(config, layer, index)
-        if layer.enabled and layer.type == "polar":
-            warnings.append(
-                f"Layer '{layer.name}' uses limited cylinder polar support; "
-                "full dome/polar winding is not implemented yet."
-            )
     if not config.output.directory:
         raise ValueError("output.directory is required")
     if config.plot.enabled:
@@ -178,6 +193,10 @@ def generate_winding_job(
     candidate_pair_report_path = None
     actual_thickness_report_path = None
     region_quality_report_path = None
+    calibration_report_path = None
+    friction_margin_report_path = None
+    polar_overbuild_report_path = None
+    collision_report_path = None
     optimisation_repair_suggestions_path = None
     plot_manifest_path = None
     if pattern_result is not None:
@@ -238,6 +257,10 @@ def generate_winding_job(
         coverage,
         nominal_stack_thickness_mm=sum(layer.spec.layer_thickness_mm for layer in program.layers),
     )
+    calibration_report = _calibration_report(config)
+    friction_margin_report = _friction_margin_report(config, program)
+    polar_overbuild_report = _polar_overbuild_report(config, actual_thickness_report)
+    collision_report = _collision_report(config, program)
     pattern_optimisation_report_path = _write_json(
         pattern_optimisation_report,
         output_dir / "pattern_optimisation_report.json",
@@ -253,6 +276,22 @@ def generate_winding_job(
     region_quality_report_path = _write_json(
         region_quality_report,
         output_dir / "region_quality_report.json",
+    )
+    calibration_report_path = _write_json(
+        calibration_report,
+        output_dir / "calibration_report.json",
+    )
+    friction_margin_report_path = _write_json(
+        friction_margin_report,
+        output_dir / "friction_margin_report.json",
+    )
+    polar_overbuild_report_path = _write_json(
+        polar_overbuild_report,
+        output_dir / "polar_overbuild_report.json",
+    )
+    collision_report_path = _write_json(
+        collision_report,
+        output_dir / "collision_report.json",
     )
     optimisation_repair_suggestions = _optimisation_repair_suggestions(
         config=config,
@@ -290,6 +329,10 @@ def generate_winding_job(
         machine_smoothing_report=machine_smoothing_report,
         pattern_optimisation_report=pattern_optimisation_report,
         region_quality_report=region_quality_report,
+        calibration_report=calibration_report,
+        friction_margin_report=friction_margin_report,
+        polar_overbuild_report=polar_overbuild_report,
+        collision_report=collision_report,
     )
     validation_report_path = (
         export_validation_report_json(validation_report, output_dir / "validation_report.json")
@@ -320,6 +363,10 @@ def generate_winding_job(
         candidate_pair_report_path=candidate_pair_report_path,
         actual_thickness_report_path=actual_thickness_report_path,
         region_quality_report_path=region_quality_report_path,
+        calibration_report_path=calibration_report_path,
+        friction_margin_report_path=friction_margin_report_path,
+        polar_overbuild_report_path=polar_overbuild_report_path,
+        collision_report_path=collision_report_path,
         optimisation_repair_suggestions_path=optimisation_repair_suggestions_path,
         plot_manifest_path=plot_manifest_path,
         layer_completion_report=layer_completion_report,
@@ -327,6 +374,10 @@ def generate_winding_job(
         machine_smoothing_report=machine_smoothing_report,
         pattern_optimisation_report=pattern_optimisation_report,
         region_quality_report=region_quality_report,
+        calibration_report=calibration_report,
+        friction_margin_report=friction_margin_report,
+        polar_overbuild_report=polar_overbuild_report,
+        collision_report=collision_report,
         plot_paths=plot_paths,
         coverage=coverage,
     )
@@ -349,6 +400,10 @@ def generate_winding_job(
         candidate_pair_report_path=candidate_pair_report_path,
         actual_thickness_report_path=actual_thickness_report_path,
         region_quality_report_path=region_quality_report_path,
+        calibration_report_path=calibration_report_path,
+        friction_margin_report_path=friction_margin_report_path,
+        polar_overbuild_report_path=polar_overbuild_report_path,
+        collision_report_path=collision_report_path,
         optimisation_repair_suggestions_path=optimisation_repair_suggestions_path,
         plot_manifest_path=plot_manifest_path,
         gcode_path=gcode_path,
@@ -362,6 +417,10 @@ def generate_winding_job(
         layer_completion_report=layer_completion_report,
         stack_coverage_report=stack_coverage_report,
         machine_smoothing_report=machine_smoothing_report,
+        calibration_report=calibration_report,
+        friction_margin_report=friction_margin_report,
+        polar_overbuild_report=polar_overbuild_report,
+        collision_report=collision_report,
     )
     if summary_enabled:
         assert summary_path is not None
@@ -387,6 +446,10 @@ def generate_winding_job(
         candidate_pair_report_path=candidate_pair_report_path,
         actual_thickness_report_path=actual_thickness_report_path,
         region_quality_report_path=region_quality_report_path,
+        calibration_report_path=calibration_report_path,
+        friction_margin_report_path=friction_margin_report_path,
+        polar_overbuild_report_path=polar_overbuild_report_path,
+        collision_report_path=collision_report_path,
         optimisation_repair_suggestions_path=optimisation_repair_suggestions_path,
         plot_manifest_path=plot_manifest_path,
         plot_paths=plot_paths,
@@ -401,6 +464,14 @@ def with_pattern_method(config: WindingJobConfig, method: str | None) -> Winding
     return replace(
         config,
         pattern_selection=replace(config.pattern_selection, method=resolved),
+    )
+
+
+def _effective_tow_width(config: WindingJobConfig) -> float:
+    return (
+        config.tow.effective_width_mm
+        if config.tow.effective_width_mm is not None
+        else config.tow.width_mm
     )
 
 
@@ -441,7 +512,11 @@ def _pattern_request_for_layer(
     coverage_share: float | None = None,
 ) -> PatternSearchRequest:
     start_z, end_z = _layer_z_bounds(config, layer)
-    tow_width = layer.tow_width_mm if layer.tow_width_mm is not None else config.roving.width_mm
+    tow_width = (
+        layer.tow_width_mm
+        if layer.tow_width_mm is not None
+        else _effective_tow_width(config)
+    )
     tow_thickness = (
         layer.tow_thickness_mm
         if layer.tow_thickness_mm is not None
@@ -665,7 +740,7 @@ def _validate_layer(config: WindingJobConfig, layer: LayerConfig, index: int) ->
             f"{prefix}.type must be hoop, local_reinforcement_band, helical, polar, "
             "geodesic, or non_geodesic"
         )
-    tow_width = config.tow.width_mm if layer.tow_width_mm is None else layer.tow_width_mm
+    tow_width = _effective_tow_width(config) if layer.tow_width_mm is None else layer.tow_width_mm
     tow_thickness = (
         config.tow.thickness_mm if layer.tow_thickness_mm is None else layer.tow_thickness_mm
     )
@@ -712,7 +787,9 @@ def _schedule_from_config(
     }
     layers = []
     for index, layer in enumerate(config.layers, start=1):
-        tow_width = config.tow.width_mm if layer.tow_width_mm is None else layer.tow_width_mm
+        tow_width = (
+            _effective_tow_width(config) if layer.tow_width_mm is None else layer.tow_width_mm
+        )
         tow_thickness = (
             config.tow.thickness_mm if layer.tow_thickness_mm is None else layer.tow_thickness_mm
         )
@@ -789,6 +866,10 @@ def _build_summary(
     candidate_pair_report_path: Path | None,
     actual_thickness_report_path: Path | None,
     region_quality_report_path: Path | None,
+    calibration_report_path: Path | None,
+    friction_margin_report_path: Path | None,
+    polar_overbuild_report_path: Path | None,
+    collision_report_path: Path | None,
     optimisation_repair_suggestions_path: Path | None,
     plot_manifest_path: Path | None,
     layer_completion_report: dict[str, Any],
@@ -796,6 +877,10 @@ def _build_summary(
     machine_smoothing_report: dict[str, Any],
     pattern_optimisation_report: dict[str, Any],
     region_quality_report: dict[str, Any],
+    calibration_report: dict[str, Any],
+    friction_margin_report: dict[str, Any],
+    polar_overbuild_report: dict[str, Any],
+    collision_report: dict[str, Any],
     plot_paths: tuple[Path, ...],
     coverage: Any,
 ) -> dict[str, Any]:
@@ -831,6 +916,10 @@ def _build_summary(
             "tow_id": config.tow.tow_id,
             "name": config.tow.name,
             "width_mm": config.tow.width_mm,
+            "effective_width_mm": config.tow.effective_width_mm,
+            "calibrated_effective_width": config.tow.calibrated_effective_width,
+            "friction_coefficient": config.tow.friction_coefficient,
+            "calibrated_friction": config.tow.calibrated_friction,
             "thickness_mm": config.tow.thickness_mm,
         },
         "layer_count": len(config.layers),
@@ -861,6 +950,10 @@ def _build_summary(
         "machine_smoothing_status": machine_smoothing_report["summary"],
         "pattern_optimisation_status": pattern_optimisation_report["summary"],
         "region_quality_status": region_quality_report["summary"],
+        "calibration_status": calibration_report["summary"],
+        "friction_margin_status": friction_margin_report["summary"],
+        "polar_overbuild_status": polar_overbuild_report["summary"],
+        "collision_status": collision_report["summary"],
         "machine_ready": (
             quality_report["machine_ready"]
             and bool(layer_completion_report["summary"]["completion_passed"])
@@ -871,6 +964,10 @@ def _build_summary(
             and bool(region_quality_report["summary"]["region_quality_passed"])
             and bool(pattern_optimisation_report["summary"]["pattern_optimisation_passed"])
             and bool(machine_smoothing_report["summary"]["machine_kinematics_passed"])
+            and bool(calibration_report["summary"]["calibration_passed"])
+            and bool(friction_margin_report["summary"]["friction_margin_passed"])
+            and bool(polar_overbuild_report["summary"]["polar_overbuild_passed"])
+            and bool(collision_report["summary"]["collision_passed"])
         ),
         "textbook_pattern_selection": _pattern_selection_summary(pattern_result),
         "pattern_summary": [
@@ -949,6 +1046,18 @@ def _build_summary(
             "region_quality_report": (
                 None if region_quality_report_path is None else str(region_quality_report_path)
             ),
+            "calibration_report": (
+                None if calibration_report_path is None else str(calibration_report_path)
+            ),
+            "friction_margin_report": (
+                None if friction_margin_report_path is None else str(friction_margin_report_path)
+            ),
+            "polar_overbuild_report": (
+                None if polar_overbuild_report_path is None else str(polar_overbuild_report_path)
+            ),
+            "collision_report": (
+                None if collision_report_path is None else str(collision_report_path)
+            ),
             "optimisation_repair_suggestions": (
                 None
                 if optimisation_repair_suggestions_path is None
@@ -971,6 +1080,10 @@ def _build_validation_report(
     machine_smoothing_report: dict[str, Any],
     pattern_optimisation_report: dict[str, Any],
     region_quality_report: dict[str, Any],
+    calibration_report: dict[str, Any],
+    friction_margin_report: dict[str, Any],
+    polar_overbuild_report: dict[str, Any],
+    collision_report: dict[str, Any],
 ) -> dict[str, Any]:
     continuity = program_continuity_summary(program)
     transition_summary = program_transition_summary(program)
@@ -1009,6 +1122,10 @@ def _build_validation_report(
         "machine_smoothing_status": machine_smoothing_report["summary"],
         "pattern_optimisation_status": pattern_optimisation_report["summary"],
         "region_quality_status": region_quality_report["summary"],
+        "calibration_status": calibration_report["summary"],
+        "friction_margin_status": friction_margin_report["summary"],
+        "polar_overbuild_status": polar_overbuild_report["summary"],
+        "collision_status": collision_report["summary"],
         "machine_ready": (
             quality_report["machine_ready"]
             and bool(layer_completion_report["summary"]["completion_passed"])
@@ -1019,6 +1136,10 @@ def _build_validation_report(
             and bool(region_quality_report["summary"]["region_quality_passed"])
             and bool(pattern_optimisation_report["summary"]["pattern_optimisation_passed"])
             and bool(machine_smoothing_report["summary"]["machine_kinematics_passed"])
+            and bool(calibration_report["summary"]["calibration_passed"])
+            and bool(friction_margin_report["summary"]["friction_margin_passed"])
+            and bool(polar_overbuild_report["summary"]["polar_overbuild_passed"])
+            and bool(collision_report["summary"]["collision_passed"])
         ),
         "warnings": report_warnings,
     }
@@ -1044,6 +1165,10 @@ def _run_consistency_validation(
     candidate_pair_report_path: Path | None,
     actual_thickness_report_path: Path | None,
     region_quality_report_path: Path | None,
+    calibration_report_path: Path | None,
+    friction_margin_report_path: Path | None,
+    polar_overbuild_report_path: Path | None,
+    collision_report_path: Path | None,
     optimisation_repair_suggestions_path: Path | None,
     plot_manifest_path: Path | None,
     gcode_path: Path | None,
@@ -1086,6 +1211,14 @@ def _run_consistency_validation(
         issues.append("actual_thickness_report_missing")
     if region_quality_report_path is not None and not region_quality_report_path.exists():
         issues.append("region_quality_report_missing")
+    if calibration_report_path is not None and not calibration_report_path.exists():
+        issues.append("calibration_report_missing")
+    if friction_margin_report_path is not None and not friction_margin_report_path.exists():
+        issues.append("friction_margin_report_missing")
+    if polar_overbuild_report_path is not None and not polar_overbuild_report_path.exists():
+        issues.append("polar_overbuild_report_missing")
+    if collision_report_path is not None and not collision_report_path.exists():
+        issues.append("collision_report_missing")
     if (
         optimisation_repair_suggestions_path is not None
         and not optimisation_repair_suggestions_path.exists()
@@ -1103,11 +1236,23 @@ def _run_consistency_validation(
         "issues": issues,
         "exported_files": {
             "csv": None if csv_path is None else str(csv_path),
-            "summary": None if summary_path is None else str(summary_path),
+        "summary": None if summary_path is None else str(summary_path),
             "validation_report": None
             if validation_report_path is None
             else str(validation_report_path),
             "gcode": None if gcode_path is None else str(gcode_path),
+            "calibration_report": None
+            if calibration_report_path is None
+            else str(calibration_report_path),
+            "friction_margin_report": None
+            if friction_margin_report_path is None
+            else str(friction_margin_report_path),
+            "polar_overbuild_report": None
+            if polar_overbuild_report_path is None
+            else str(polar_overbuild_report_path),
+            "collision_report": (
+                None if collision_report_path is None else str(collision_report_path)
+            ),
         },
     }
 
@@ -1122,6 +1267,10 @@ def _manufacturing_report(
     layer_completion_report: dict[str, Any],
     stack_coverage_report: dict[str, Any],
     machine_smoothing_report: dict[str, Any],
+    calibration_report: dict[str, Any],
+    friction_margin_report: dict[str, Any],
+    polar_overbuild_report: dict[str, Any],
+    collision_report: dict[str, Any],
 ) -> dict[str, Any]:
     coverage_summary = coverage.summary()
     machine_validation = _machine_validation(config, program, build_path_segments(program))
@@ -1161,6 +1310,10 @@ def _manufacturing_report(
             "layer_completion": layer_completion_report["summary"],
             "stack_uniformity": stack_coverage_report["summary"],
             "machine_smoothing": machine_smoothing_report["summary"],
+            "calibration": calibration_report["summary"],
+            "friction_margin": friction_margin_report["summary"],
+            "polar_overbuild": polar_overbuild_report["summary"],
+            "collision": collision_report["summary"],
             "hoop_continuity_passed": layer_completion_report["summary"].get(
                 "continuous_traverse_passed",
                 True,
@@ -1170,6 +1323,10 @@ def _manufacturing_report(
             bool(layer_completion_report["summary"]["strict_completion_passed"])
             and bool(stack_coverage_report["summary"]["strict_stack_passed"])
             and bool(machine_smoothing_report["summary"]["machine_kinematics_passed"])
+            and bool(calibration_report["summary"]["calibration_passed"])
+            and bool(friction_margin_report["summary"]["friction_margin_passed"])
+            and bool(polar_overbuild_report["summary"]["polar_overbuild_passed"])
+            and bool(collision_report["summary"]["collision_passed"])
             and _quality_report(
             coverage_summary=coverage_summary,
             continuity=program_continuity_summary(program),
@@ -1333,6 +1490,109 @@ def _actual_thickness_report(
             ),
             "allow_min_thickness_zero": config.quality_limits.allow_min_thickness_zero,
         },
+    }
+
+
+def _calibration_report(config: WindingJobConfig) -> dict[str, Any]:
+    effective_width = (
+        config.tow.effective_width_mm
+        if config.tow.effective_width_mm is not None
+        else config.tow.width_mm
+    )
+    width_calibrated = bool(
+        config.tow.calibrated_effective_width
+        and config.tow.effective_width_mm is not None
+        and config.tow.effective_width_mm > 0.0
+    )
+    friction_calibrated = bool(
+        config.tow.calibrated_friction
+        and config.tow.friction_coefficient is not None
+        and config.tow.friction_coefficient > 0.0
+    )
+    missing = []
+    if not width_calibrated:
+        missing.append("calibrated_effective_width_mm")
+    if not friction_calibrated:
+        missing.append("calibrated_friction_coefficient")
+    return {
+        "summary": {
+            "calibration_passed": width_calibrated and friction_calibrated,
+            "effective_width_calibrated": width_calibrated,
+            "friction_calibrated": friction_calibrated,
+            "nominal_width_mm": config.tow.width_mm,
+            "effective_width_mm": effective_width,
+            "friction_coefficient": config.tow.friction_coefficient,
+            "tension_N": config.tow.tension_N,
+            "min_bend_radius_mm": config.tow.min_bend_radius_mm,
+            "missing": missing,
+        },
+        "machine_ready_rule": (
+            "Machine-ready requires measured effective tow width and calibrated friction "
+            "coefficient. Backend-ready path generation may still pass without them."
+        ),
+    }
+
+
+def _friction_margin_report(
+    config: WindingJobConfig,
+    program: PlannedWindingProgram,
+) -> dict[str, Any]:
+    slip = _slip_risk_summary(program)
+    friction = config.tow.friction_coefficient
+    calibrated = bool(config.tow.calibrated_friction and friction is not None and friction > 0.0)
+    return {
+        "summary": {
+            "friction_margin_passed": calibrated and slip["max_slip_risk"] <= 25.0,
+            "calibrated_friction": calibrated,
+            "friction_coefficient": friction,
+            "max_slip_risk": slip["max_slip_risk"],
+            "mean_slip_risk": slip["mean_slip_risk"],
+        },
+        "notes": [
+            "Current slip risk is a conservative path-level proxy.",
+            "A final non-geodesic release still needs measured k_g friction limits.",
+        ],
+    }
+
+
+def _polar_overbuild_report(
+    config: WindingJobConfig,
+    actual_thickness_report: dict[str, Any],
+) -> dict[str, Any]:
+    summary = actual_thickness_report.get("summary", {})
+    polar_buildup_mm = float(summary.get("polar_buildup_mm", 0.0))
+    passed = polar_buildup_mm <= config.quality_limits.max_polar_buildup_mm
+    return {
+        "summary": {
+            "polar_overbuild_passed": passed,
+            "polar_buildup_mm": polar_buildup_mm,
+            "max_polar_buildup_mm": config.quality_limits.max_polar_buildup_mm,
+            "actual_thickness_variation_percent": float(
+                summary.get("actual_thickness_variation_percent", 0.0)
+            ),
+        },
+        "source": "actual_thickness_report",
+    }
+
+
+def _collision_report(
+    config: WindingJobConfig,
+    program: PlannedWindingProgram,
+) -> dict[str, Any]:
+    x_mm = np.asarray(program.motion_table.x_mm, dtype=float)
+    minimum_x = float(np.min(x_mm)) if x_mm.size else 0.0
+    passed = minimum_x >= config.machine.clearance_mm
+    return {
+        "summary": {
+            "collision_passed": passed,
+            "collision_count": 0 if passed else 1,
+            "minimum_x_mm": minimum_x,
+            "required_clearance_mm": config.machine.clearance_mm,
+        },
+        "notes": [
+            "Checks generated X clearance against required mandrel surface clearance.",
+            "Machine-specific tow-eye/tooling envelopes should be calibrated separately.",
+        ],
     }
 
 
@@ -2424,6 +2684,13 @@ def _build_mandrel(config: WindingJobConfig) -> CylinderMandrel | AxisymmetricPr
             radius_mm=config.mandrel.radius_mm,
             name=config.project.name,
         )
+    if config.mandrel.type in {"axisymmetric_profile", "profile"}:
+        if config.mandrel.profile_path is None:
+            raise ValueError("mandrel.profile_path is required for imported profile mandrels")
+        return import_dxf_zr_profile(
+            config.mandrel.profile_path,
+            samples=config.mandrel.samples,
+        )
     return cylinder_with_domes_profile(
         cylinder_length_mm=config.mandrel.cylinder_length_mm or config.mandrel.length_mm,
         cylinder_radius_mm=config.mandrel.cylinder_radius_mm or config.mandrel.radius_mm,
@@ -2458,6 +2725,13 @@ def _coverage_map_for_program(
 def _mandrel_length_mm(config: WindingJobConfig) -> float:
     if config.mandrel.type == "cylinder":
         return config.mandrel.length_mm
+    if config.mandrel.type in {"axisymmetric_profile", "profile"}:
+        if config.mandrel.profile_path is not None:
+            return import_dxf_zr_profile(
+                config.mandrel.profile_path,
+                samples=config.mandrel.samples,
+            ).length_mm
+        return config.mandrel.length_mm
     return (
         config.mandrel.left_dome_length_mm
         + (config.mandrel.cylinder_length_mm or config.mandrel.length_mm)
@@ -2467,6 +2741,13 @@ def _mandrel_length_mm(config: WindingJobConfig) -> float:
 
 def _mandrel_radius_mm(config: WindingJobConfig) -> float:
     if config.mandrel.type == "cylinder":
+        return config.mandrel.radius_mm
+    if config.mandrel.type in {"axisymmetric_profile", "profile"}:
+        if config.mandrel.profile_path is not None:
+            return import_dxf_zr_profile(
+                config.mandrel.profile_path,
+                samples=config.mandrel.samples,
+            ).max_radius_mm
         return config.mandrel.radius_mm
     return config.mandrel.cylinder_radius_mm or config.mandrel.radius_mm
 

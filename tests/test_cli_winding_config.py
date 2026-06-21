@@ -218,8 +218,10 @@ def test_polar_layer_placeholder_does_not_crash(tmp_path: Path) -> None:
     warnings = validate_winding_job_config(config)
     result = generate_winding_job(config)
 
-    assert any("limited cylinder polar support" in warning for warning in warnings)
+    assert warnings == ()
     assert any(layer.spec.winding_type == "polar" for layer in result.program.layers)
+    assert result.polar_overbuild_report_path is not None
+    assert result.polar_overbuild_report_path.exists()
 
 
 def test_cli_validate_and_generate_commands_run(

@@ -321,8 +321,9 @@ def test_display_surface_offset_lifts_points_from_horizontal_axis() -> None:
 def test_preview_cli_delegates_to_launcher(monkeypatch) -> None:
     captured = {}
 
-    def fake_launch(config):
+    def fake_launch(config, **kwargs):
         captured["config"] = config
+        captured["kwargs"] = kwargs
         return 0
 
     monkeypatch.setattr("filament_winder.cli.launch_cylinder_preview", fake_launch)
@@ -348,6 +349,7 @@ def test_preview_cli_delegates_to_launcher(monkeypatch) -> None:
     assert result == 0
     assert captured["config"].length_mm == 500.0
     assert captured["config"].passes == 3
+    assert captured["kwargs"]["debug_gui"] is False
 
 
 def test_preview_cli_can_launch_profile_dome_mode(monkeypatch, tmp_path) -> None:
@@ -355,10 +357,11 @@ def test_preview_cli_can_launch_profile_dome_mode(monkeypatch, tmp_path) -> None
     _write_profile_dxf(dxf_path)
     captured = {}
 
-    def fake_launch(config, *, profile_config=None, initial_mode="cylinder"):
+    def fake_launch(config, *, profile_config=None, initial_mode="cylinder", debug_gui=False):
         captured["config"] = config
         captured["profile_config"] = profile_config
         captured["initial_mode"] = initial_mode
+        captured["debug_gui"] = debug_gui
         return 0
 
     monkeypatch.setattr("filament_winder.cli.launch_cylinder_preview", fake_launch)
@@ -388,6 +391,23 @@ def test_preview_cli_can_launch_profile_dome_mode(monkeypatch, tmp_path) -> None
     assert captured["profile_config"].path_mode == "nosecone"
     assert captured["profile_config"].min_radius_mm == 7.0
     assert captured["profile_config"].points_per_span == 25
+    assert captured["debug_gui"] is False
+
+
+def test_preview_cli_accepts_debug_gui(monkeypatch) -> None:
+    captured = {}
+
+    def fake_launch(config, **kwargs):
+        captured["config"] = config
+        captured["kwargs"] = kwargs
+        return 0
+
+    monkeypatch.setattr("filament_winder.cli.launch_cylinder_preview", fake_launch)
+
+    result = main(["preview", "--debug-gui"])
+
+    assert result == 0
+    assert captured["kwargs"]["debug_gui"] is True
 
 
 def test_gui_dependency_message_is_actionable() -> None:

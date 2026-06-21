@@ -284,7 +284,11 @@ class NodeGraphState:
             registry,
         )
         for link_id, link in list(self.links.items()):
-            if link.target_node_id == target_node_id and link.target_socket == target_socket:
+            if (
+                target_socket != "layer"
+                and link.target_node_id == target_node_id
+                and link.target_socket == target_socket
+            ):
                 self.links.pop(link_id)
         link = NodeLink(
             id=_new_id("link"),
@@ -887,19 +891,22 @@ def _backend_node_registry() -> dict[str, NodeTypeDefinition]:
             inputs=(NodeSocketDefinition("machine_config", "machine_config"),),
             outputs=(NodeSocketDefinition("mandrel", "mandrel"),),
             default_settings={
+                "mode": "dome",
                 "type": "cylinder_with_elliptical_domes",
                 "cylinder_length_mm": 1000.0,
                 "cylinder_radius_mm": 101.6,
                 "left_dome_length_mm": 120.0,
                 "right_dome_length_mm": 120.0,
                 "polar_opening_radius_mm": 25.0,
+                "profile_path": "mandrels/profile.dxf",
+                "samples": 0,
                 "mesh_points_z": 360,
                 "mesh_points_theta": 360,
             },
         ),
         "tow_backend": NodeTypeDefinition(
             type_id="tow_backend",
-            label="Tow / Material",
+            label="Material",
             category="Material",
             color="#7a5aa6",
             inputs=(NodeSocketDefinition("mandrel", "mandrel"),),
@@ -908,6 +915,12 @@ def _backend_node_registry() -> dict[str, NodeTypeDefinition]:
                 "name": "carbon_tow",
                 "width_mm": 6.0,
                 "thickness_mm": 0.25,
+                "effective_width_mm": 6.0,
+                "calibrated_effective_width": False,
+                "friction_coefficient": "",
+                "calibrated_friction": False,
+                "tension_N": "",
+                "min_bend_radius_mm": "",
                 "fibre_type": "carbon",
                 "resin_system": "",
                 "notes": "",
@@ -919,30 +932,70 @@ def _backend_node_registry() -> dict[str, NodeTypeDefinition]:
             category="Layers",
             color="#487d53",
             inputs=(
-                NodeSocketDefinition("tow", "tow"),
                 NodeSocketDefinition("layer", "layer", required=False),
             ),
             outputs=(NodeSocketDefinition("layer_stack", "layer_stack"),),
-            default_settings={"layers": _default_backend_layers()},
+            default_settings={
+                "name": "primary_stack",
+                "ordering": "ply_order",
+                "repeat_stack": 1,
+                "mirror_stack": False,
+                "notes": "",
+            },
+        ),
+        "layer_backend": NodeTypeDefinition(
+            type_id="layer_backend",
+            label="Layer",
+            category="Layers",
+            color="#4d8265",
+            inputs=(NodeSocketDefinition("material", "tow", required=False),),
+            outputs=(NodeSocketDefinition("layer", "layer"),),
+            default_settings={
+                "name": "layer_45deg",
+                "enabled": True,
+                "material": "carbon_tow",
+                "winding_angle_deg": 45.0,
+                "angle_tolerance_deg": 0.5,
+                "start_z_mm": "",
+                "end_z_mm": "",
+                "direction": "forward",
+                "coverage_target": 1.0,
+                "turnaround_radius_mm": 28.0,
+                "polar_opening_radius_mm": 25.0,
+                "feedrate_mm_min": 450.0,
+                "transition_before": True,
+                "transition_after": True,
+                "points": 220,
+                "colour": "#1e90ff",
+                "notes": "",
+            },
         ),
         "hoop_layer": NodeTypeDefinition(
             type_id="hoop_layer",
             label="Hoop Layer",
             category="Layers",
             color="#6f8f3f",
-            inputs=(NodeSocketDefinition("tow", "tow", required=False),),
+            inputs=(NodeSocketDefinition("material", "tow", required=False),),
             outputs=(NodeSocketDefinition("layer", "layer"),),
             default_settings={
                 "name": "hoop_cylinder",
                 "enabled": True,
+                "ply_order": 10,
+                "material": "carbon_tow",
                 "region": "cylinder_only",
                 "type": "hoop",
                 "winding_angle_deg": 90.0,
+                "angle_tolerance_deg": 0.5,
+                "start_z_mm": "",
+                "end_z_mm": "",
                 "passes": 1,
                 "coverage_target": 1.0,
                 "feedrate_mm_min": 500.0,
+                "transition_before": False,
+                "transition_after": True,
                 "points": 80,
                 "colour": "#1e90ff",
+                "notes": "",
             },
         ),
         "geodesic_layer": NodeTypeDefinition(
@@ -950,23 +1003,31 @@ def _backend_node_registry() -> dict[str, NodeTypeDefinition]:
             label="Geodesic Layer",
             category="Layers",
             color="#3f7d7d",
-            inputs=(NodeSocketDefinition("tow", "tow", required=False),),
+            inputs=(NodeSocketDefinition("material", "tow", required=False),),
             outputs=(NodeSocketDefinition("layer", "layer"),),
             default_settings={
                 "name": "geodesic_dome_to_dome",
                 "enabled": True,
+                "ply_order": 20,
+                "material": "carbon_tow",
                 "region": "dome_to_dome",
                 "type": "geodesic",
                 "initial_angle_deg": 45.0,
                 "winding_angle_deg": 45.0,
+                "angle_tolerance_deg": 0.5,
+                "start_z_mm": "",
+                "end_z_mm": "",
                 "direction": "forward",
                 "passes": "auto",
                 "turnaround_radius_mm": 28.0,
                 "polar_opening_radius_mm": 25.0,
                 "coverage_target": 1.0,
                 "feedrate_mm_min": 450.0,
+                "transition_before": True,
+                "transition_after": True,
                 "points": 140,
                 "colour": "#1e90ff",
+                "notes": "",
             },
         ),
         "non_geodesic_layer": NodeTypeDefinition(
@@ -974,23 +1035,31 @@ def _backend_node_registry() -> dict[str, NodeTypeDefinition]:
             label="Non-Geodesic Layer",
             category="Layers",
             color="#5d718f",
-            inputs=(NodeSocketDefinition("tow", "tow", required=False),),
+            inputs=(NodeSocketDefinition("material", "tow", required=False),),
             outputs=(NodeSocketDefinition("layer", "layer"),),
             default_settings={
                 "name": "non_geodesic_controlled",
                 "enabled": True,
+                "ply_order": 30,
+                "material": "carbon_tow",
                 "region": "dome_to_dome",
                 "type": "non_geodesic",
                 "target_angle_deg": 35.0,
                 "winding_angle_deg": 35.0,
+                "angle_tolerance_deg": 1.0,
+                "start_z_mm": "",
+                "end_z_mm": "",
                 "direction": "reverse",
                 "passes": "auto",
                 "turnaround_radius_mm": 28.0,
                 "polar_opening_radius_mm": 25.0,
                 "coverage_target": 1.0,
                 "feedrate_mm_min": 400.0,
+                "transition_before": True,
+                "transition_after": True,
                 "points": 140,
                 "colour": "#ff851b",
+                "notes": "",
             },
         ),
         "coverage_mode": NodeTypeDefinition(
@@ -1254,20 +1323,61 @@ def default_backend_winding_graph() -> NodeGraphState:
     machine = graph.add_node("machine_backend", registry, x=380.0, y=60.0)
     mandrel = graph.add_node("mandrel_backend", registry, x=720.0, y=60.0)
     tow = graph.add_node("tow_backend", registry, x=1060.0, y=60.0)
-    layers = graph.add_node("layer_stack_backend", registry, x=1400.0, y=60.0)
-    coverage = graph.add_node("coverage_mode", registry, x=1400.0, y=260.0)
-    pattern = graph.add_node("pattern_optimisation_backend", registry, x=1760.0, y=80.0)
-    validation = graph.add_node("validation_backend", registry, x=2140.0, y=60.0)
-    backend_check = graph.add_node("backend_check", registry, x=2480.0, y=60.0)
-    plots = graph.add_node("plot_backend", registry, x=2840.0, y=20.0)
-    reports = graph.add_node("report_export", registry, x=2840.0, y=200.0)
-    csv_export = graph.add_node("csv_backend_export", registry, x=3200.0, y=20.0)
-    gcode_export = graph.add_node("gcode_backend_export", registry, x=3200.0, y=200.0)
+    hoop_layer = graph.add_node("layer_backend", registry, x=1400.0, y=-160.0)
+    hoop_layer.settings.update(
+        {
+            "name": "hoop_90deg",
+            "winding_angle_deg": 90.0,
+            "angle_tolerance_deg": 0.5,
+            "start_z_mm": "",
+            "end_z_mm": "",
+            "feedrate_mm_min": 500.0,
+            "points": 160,
+            "colour": "#1e90ff",
+        }
+    )
+    helical_layer = graph.add_node("layer_backend", registry, x=1400.0, y=180.0)
+    helical_layer.settings.update(
+        {
+            "name": "helical_45deg",
+            "winding_angle_deg": 45.0,
+            "angle_tolerance_deg": 0.5,
+            "feedrate_mm_min": 450.0,
+            "points": 260,
+            "colour": "#1e90ff",
+        }
+    )
+    polar_layer = graph.add_node("layer_backend", registry, x=1400.0, y=560.0)
+    polar_layer.settings.update(
+        {
+            "name": "polar_10deg",
+            "enabled": False,
+            "winding_angle_deg": 10.0,
+            "angle_tolerance_deg": 1.0,
+            "feedrate_mm_min": 400.0,
+            "points": 260,
+            "colour": "#ff851b",
+        }
+    )
+    layers = graph.add_node("layer_stack_backend", registry, x=1840.0, y=120.0)
+    coverage = graph.add_node("coverage_mode", registry, x=1840.0, y=360.0)
+    pattern = graph.add_node("pattern_optimisation_backend", registry, x=2220.0, y=120.0)
+    validation = graph.add_node("validation_backend", registry, x=2600.0, y=100.0)
+    backend_check = graph.add_node("backend_check", registry, x=2940.0, y=100.0)
+    plots = graph.add_node("plot_backend", registry, x=3280.0, y=20.0)
+    reports = graph.add_node("report_export", registry, x=3280.0, y=200.0)
+    csv_export = graph.add_node("csv_backend_export", registry, x=3640.0, y=20.0)
+    gcode_export = graph.add_node("gcode_backend_export", registry, x=3640.0, y=200.0)
 
     graph.add_link(project.id, "project_config", machine.id, "project_config", registry)
     graph.add_link(machine.id, "machine_config", mandrel.id, "machine_config", registry)
     graph.add_link(mandrel.id, "mandrel", tow.id, "mandrel", registry)
-    graph.add_link(tow.id, "tow", layers.id, "tow", registry)
+    graph.add_link(tow.id, "tow", hoop_layer.id, "material", registry)
+    graph.add_link(tow.id, "tow", helical_layer.id, "material", registry)
+    graph.add_link(tow.id, "tow", polar_layer.id, "material", registry)
+    graph.add_link(hoop_layer.id, "layer", layers.id, "layer", registry)
+    graph.add_link(helical_layer.id, "layer", layers.id, "layer", registry)
+    graph.add_link(polar_layer.id, "layer", layers.id, "layer", registry)
     graph.add_link(project.id, "project_config", coverage.id, "project_config", registry)
     graph.add_link(machine.id, "machine_config", pattern.id, "machine_config", registry)
     graph.add_link(mandrel.id, "mandrel", pattern.id, "mandrel", registry)

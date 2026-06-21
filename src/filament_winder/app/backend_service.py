@@ -29,6 +29,18 @@ from filament_winder.services.winding_job import (
 )
 
 GUI_PROJECT_SCHEMA_VERSION = 1
+_LAYER_NODE_TYPE_IDS = {"layer_backend", "hoop_layer", "geodesic_layer", "non_geodesic_layer"}
+_POLAR_ANGLE_MAX_DEG = 15.0
+_HOOP_ANGLE_MIN_DEG = 85.0
+
+
+def _layer_type_from_angle(angle_deg: float) -> str:
+    angle = abs(float(angle_deg))
+    if angle < _POLAR_ANGLE_MAX_DEG:
+        return "polar"
+    if angle >= _HOOP_ANGLE_MIN_DEG:
+        return "hoop"
+    return "geodesic"
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,7 +181,7 @@ class BackendService:
         validation = validate_path_csv(result.csv_path, summary_path=result.summary_path)
         checks = _backend_checks(result, path_ok=validation.ok)
         machine_ready = bool(result.summary.get("machine_ready"))
-        overall = machine_ready and all(checks.values())
+        overall = all(checks.values())
         reports = _report_paths(result)
         plots = _plot_paths(result)
         log = _backend_check_log(checks, overall, machine_ready, result)
@@ -399,7 +411,13 @@ def graph_to_config_mapping(
         or _export_parent(csv_export.get("csv_path"))
         or "exports/gui_winding_job"
     )
-    tow_width = float(tow.get("width_mm", tow.get("tow_width_mm", 6.0)))
+    nominal_tow_width = float(tow.get("width_mm", tow.get("tow_width_mm", 6.0)))
+    effective_width_raw = tow.get("effective_width_mm")
+    tow_width = (
+        nominal_tow_width
+        if effective_width_raw is None or effective_width_raw == ""
+        else float(effective_width_raw)
+    )
     tow_thickness = float(tow.get("thickness_mm", tow.get("layer_thickness_mm", 0.25)))
     layers = _layers_from_graph(layer_stack, graph, scoped_ids, tow_width, tow_thickness)
     mapping = {
@@ -411,8 +429,14 @@ def graph_to_config_mapping(
         "mandrel": _mandrel_mapping(mandrel),
         "tow": {
             "name": str(tow.get("name", "tow")),
-            "width_mm": tow_width,
+            "width_mm": nominal_tow_width,
             "thickness_mm": tow_thickness,
+            "effective_width_mm": tow.get("effective_width_mm"),
+            "calibrated_effective_width": bool(tow.get("calibrated_effective_width", False)),
+            "friction_coefficient": tow.get("friction_coefficient"),
+            "calibrated_friction": bool(tow.get("calibrated_friction", False)),
+            "tension_N": tow.get("tension_N", tow.get("tension_n")),
+            "min_bend_radius_mm": tow.get("min_bend_radius_mm"),
             "fibre_type": str(tow.get("fibre_type", tow.get("fiber_type", ""))),
             "resin_system": str(tow.get("resin_system", "")),
             "notes": str(tow.get("notes", "")),
@@ -528,6 +552,8 @@ def _backend_checks(result: WindingJobResult, *, path_ok: bool) -> dict[str, boo
     region_status = summary.get("region_quality_status", {})
     machine_status = summary.get("machine_smoothing_status", {})
     optimisation_status = summary.get("pattern_optimisation_status", {})
+    polar_status = summary.get("polar_overbuild_status", {})
+    collision_status = summary.get("collision_status", {})
     return {
         "Config": True,
         "Pattern optimisation": bool(
@@ -550,6 +576,13 @@ def _backend_checks(result: WindingJobResult, *, path_ok: bool) -> dict[str, boo
         ),
         "Machine kinematics": bool(
             isinstance(machine_status, dict) and machine_status.get("machine_kinematics_passed")
+        ),
+        "Polar overbuild report": bool(
+            isinstance(polar_status, dict)
+            and "polar_buildup_mm" in polar_status
+        ),
+        "Collision": bool(
+            isinstance(collision_status, dict) and collision_status.get("collision_passed", True)
         ),
         "Exports": _required_exports_exist(result),
     }
@@ -576,6 +609,10 @@ def _required_exports_exist(result: WindingJobResult) -> bool:
         result.layer_completion_report_path,
         result.stack_coverage_report_path,
         result.region_quality_report_path,
+        result.calibration_report_path,
+        result.friction_margin_report_path,
+        result.polar_overbuild_report_path,
+        result.collision_report_path,
         result.machine_smoothing_report_path,
         result.pattern_optimisation_report_path,
         result.candidate_pair_report_path,
@@ -600,6 +637,10 @@ def _report_paths(result: WindingJobResult) -> dict[str, Path]:
         "layer_completion_report": result.layer_completion_report_path,
         "stack_coverage_report": result.stack_coverage_report_path,
         "region_quality_report": result.region_quality_report_path,
+        "calibration_report": result.calibration_report_path,
+        "friction_margin_report": result.friction_margin_report_path,
+        "polar_overbuild_report": result.polar_overbuild_report_path,
+        "collision_report": result.collision_report_path,
         "machine_smoothing_report": result.machine_smoothing_report_path,
         "pattern_optimisation_report": result.pattern_optimisation_report_path,
         "candidate_pair_report": result.candidate_pair_report_path,
@@ -620,6 +661,10 @@ def _candidate_report_paths(directory: Path) -> tuple[Path, ...]:
         "layer_completion_report.json",
         "stack_coverage_report.json",
         "region_quality_report.json",
+        "calibration_report.json",
+        "friction_margin_report.json",
+        "polar_overbuild_report.json",
+        "collision_report.json",
         "machine_smoothing_report.json",
         "pattern_optimisation_report.json",
         "candidate_pair_report.json",
@@ -683,10 +728,44 @@ def _layers_from_graph(
         ]
     if layers:
         return layers
+    stack_node_ids = {
+        node.id
+        for node in graph.nodes.values()
+        if node.type_id == "layer_stack_backend"
+        and (scoped_ids is None or node.id in scoped_ids)
+    }
+    connected_layer_nodes = [
+        graph.nodes[link.source_node_id]
+        for link in graph.links.values()
+        if link.target_node_id in stack_node_ids
+        and link.target_socket == "layer"
+        and link.source_node_id in graph.nodes
+        and graph.nodes[link.source_node_id].type_id
+        in _LAYER_NODE_TYPE_IDS
+        and (scoped_ids is None or link.source_node_id in scoped_ids)
+    ]
+    connected_layer_nodes.sort(
+        key=lambda node: (
+            _float_or_default(node.settings.get("ply_order"), 1_000_000.0),
+            node.y,
+            node.name,
+        )
+    )
+    for node in connected_layer_nodes:
+        layers.append(
+            _normalise_layer_mapping(
+                node.settings,
+                len(layers),
+                tow_width_mm,
+                tow_thickness_mm,
+            )
+        )
+    if layers:
+        return layers
     for node in graph.nodes.values():
         if scoped_ids is not None and node.id not in scoped_ids:
             continue
-        if node.type_id in {"hoop_layer", "geodesic_layer", "non_geodesic_layer"}:
+        if node.type_id in _LAYER_NODE_TYPE_IDS:
             layers.append(
                 _normalise_layer_mapping(
                     node.settings,
@@ -718,15 +797,33 @@ def _normalise_layer_mapping(
     tow_width_mm: float,
     tow_thickness_mm: float,
 ) -> dict[str, Any]:
-    layer_type = str(
+    angle_deg = float(
         raw_layer.get(
-            "type",
-            raw_layer.get("winding_mode", raw_layer.get("winding_type", "geodesic")),
+            "winding_angle_deg",
+            raw_layer.get("angle_deg", raw_layer.get("target_angle_deg", 45.0)),
         )
     )
+    explicit_type = raw_layer.get(
+        "type",
+        raw_layer.get("winding_mode", raw_layer.get("winding_type")),
+    )
+    layer_type = (
+        _layer_type_from_angle(angle_deg)
+        if explicit_type in {None, ""}
+        else str(explicit_type)
+    )
+    if layer_type in {"helical", "geodesic"}:
+        layer_type = "geodesic"
+    elif layer_type in {"controlled", "non_geodesic"}:
+        layer_type = "non_geodesic"
+    elif layer_type not in {"hoop", "polar"}:
+        layer_type = _layer_type_from_angle(angle_deg)
     passes = raw_layer.get("passes", raw_layer.get("number_of_passes", "auto"))
     if passes in {None, "", 0}:
         passes = "auto"
+    region = raw_layer.get("region")
+    if region in {None, ""}:
+        region = "cylinder_only" if layer_type == "hoop" else "dome_to_dome"
     direction = str(raw_layer.get("direction", "forward"))
     if direction == "positive":
         direction = "forward"
@@ -735,17 +832,15 @@ def _normalise_layer_mapping(
     return {
         "name": str(raw_layer.get("name", f"layer_{index + 1}")),
         "enabled": bool(raw_layer.get("enabled", True)),
-        "region": str(raw_layer.get("region", "full_mandrel")),
+        "region": str(region),
         "type": layer_type,
         "winding_mode": raw_layer.get("winding_mode", layer_type),
+        "ply_order": int(_float_or_default(raw_layer.get("ply_order"), index + 1)),
+        "material": str(raw_layer.get("material", raw_layer.get("material_name", ""))),
         "initial_angle_deg": raw_layer.get("initial_angle_deg"),
         "target_angle_deg": raw_layer.get("target_angle_deg"),
-        "winding_angle_deg": float(
-            raw_layer.get(
-                "winding_angle_deg",
-                raw_layer.get("angle_deg", raw_layer.get("target_angle_deg", 45.0)),
-            )
-        ),
+        "winding_angle_deg": angle_deg,
+        "angle_tolerance_deg": float(raw_layer.get("angle_tolerance_deg", 0.5)),
         "direction": direction,
         "passes": passes,
         "coverage_target": float(raw_layer.get("coverage_target", 1.0)),
@@ -796,7 +891,22 @@ def _float_or_default(value: Any, default: float) -> float:
 
 
 def _mandrel_mapping(mandrel: Mapping[str, Any]) -> dict[str, Any]:
-    if str(mandrel.get("mode", "")) == "cylinder":
+    mode = str(mandrel.get("mode", "")).lower()
+    mandrel_type = str(mandrel.get("type", "cylinder_with_elliptical_domes"))
+    if mode in {"profile", "custom", "dxf"} or mandrel_type in {
+        "axisymmetric_profile",
+        "profile",
+    }:
+        return {
+            "type": "axisymmetric_profile",
+            "profile_path": str(mandrel.get("profile_path", "mandrels/profile.dxf")),
+            "samples": int(mandrel.get("samples", 0) or 0),
+            "length_mm": float(mandrel.get("length_mm", 1000.0)),
+            "radius_mm": float(mandrel.get("radius_mm", 100.0)),
+            "mesh_points_z": int(mandrel.get("mesh_points_z", 240)),
+            "mesh_points_theta": int(mandrel.get("mesh_points_theta", 180)),
+        }
+    if mode == "cylinder" or mandrel_type == "cylinder":
         return {
             "type": "cylinder",
             "length_mm": float(mandrel.get("length_mm", 1000.0)),
@@ -805,7 +915,7 @@ def _mandrel_mapping(mandrel: Mapping[str, Any]) -> dict[str, Any]:
             "mesh_points_theta": int(mandrel.get("mesh_points_theta", 180)),
         }
     return {
-        "type": str(mandrel.get("type", "cylinder_with_elliptical_domes")),
+        "type": mandrel_type,
         "length_mm": float(mandrel.get("length_mm", mandrel.get("cylinder_length_mm", 1000.0))),
         "radius_mm": float(mandrel.get("radius_mm", mandrel.get("cylinder_radius_mm", 100.0))),
         "cylinder_length_mm": mandrel.get("cylinder_length_mm"),
@@ -813,6 +923,8 @@ def _mandrel_mapping(mandrel: Mapping[str, Any]) -> dict[str, Any]:
         "left_dome_length_mm": float(mandrel.get("left_dome_length_mm", 0.0)),
         "right_dome_length_mm": float(mandrel.get("right_dome_length_mm", 0.0)),
         "polar_opening_radius_mm": float(mandrel.get("polar_opening_radius_mm", 0.0)),
+        "profile_path": str(mandrel.get("profile_path", "mandrels/profile.dxf")),
+        "samples": int(mandrel.get("samples", 0) or 0),
         "mesh_points_z": int(mandrel.get("mesh_points_z", 240)),
         "mesh_points_theta": int(mandrel.get("mesh_points_theta", 180)),
     }

@@ -532,9 +532,20 @@ def _plan_single_layer(
             raise ValueError(f"{spec.winding_type} planning currently requires a cylinder mandrel")
         path, report, motion_type = _plan_cylinder_helical_layer(mandrel, spec, theta_offset_rad)
     elif spec.winding_type == "polar":
-        if not isinstance(mandrel, CylinderMandrel):
-            raise ValueError("polar planning currently requires a cylinder mandrel")
-        path, report, motion_type = _plan_cylinder_helical_layer(mandrel, spec, theta_offset_rad)
+        if isinstance(mandrel, CylinderMandrel):
+            path, report, motion_type = _plan_cylinder_helical_layer(
+                mandrel,
+                spec,
+                theta_offset_rad,
+            )
+        elif isinstance(mandrel, AxisymmetricProfileMandrel):
+            path, report, motion_type = _plan_axisymmetric_geodesic_layer(
+                mandrel,
+                spec,
+                theta_offset_rad,
+            )
+        else:
+            raise ValueError("unsupported mandrel for polar planning")
     elif spec.winding_type == "dome":
         if not isinstance(mandrel, AxisymmetricProfileMandrel):
             raise ValueError(f"{spec.winding_type} planning requires an axisymmetric profile")

@@ -41,6 +41,8 @@ class MandrelConfig:
     left_dome_length_mm: float = 0.0
     right_dome_length_mm: float = 0.0
     polar_opening_radius_mm: float = 0.0
+    profile_path: Path | None = None
+    samples: int | None = None
     mesh_points_z: int = 240
     mesh_points_theta: int = 180
 
@@ -51,6 +53,12 @@ class TowConfig:
     name: str = "tow"
     width_mm: float = 6.0
     thickness_mm: float = 0.0
+    effective_width_mm: float | None = None
+    calibrated_effective_width: bool = False
+    min_bend_radius_mm: float | None = None
+    tension_N: float | None = None
+    friction_coefficient: float | None = None
+    calibrated_friction: bool = False
     fibre_type: str = ""
     resin_system: str = ""
     notes: str = ""
@@ -126,10 +134,13 @@ class LayerConfig:
     type: str
     winding_angle_deg: float
     enabled: bool = True
+    ply_order: int | None = None
+    material: str = ""
     region: str = "full_mandrel"
     winding_mode: str | None = None
     initial_angle_deg: float | None = None
     target_angle_deg: float | None = None
+    angle_tolerance_deg: float = 0.5
     direction: str = "forward"
     passes: int | str | None = "auto"
     coverage_target: float = 1.0
@@ -260,6 +271,12 @@ def _mandrel_config(raw: object) -> MandrelConfig:
         left_dome_length_mm=float(data.get("left_dome_length_mm", 0.0)),
         right_dome_length_mm=float(data.get("right_dome_length_mm", 0.0)),
         polar_opening_radius_mm=float(data.get("polar_opening_radius_mm", 0.0)),
+        profile_path=(
+            None
+            if data.get("profile_path") in {None, ""}
+            else Path(str(data.get("profile_path")))
+        ),
+        samples=None if data.get("samples") in {None, "", 0} else int(data.get("samples", 0)),
         mesh_points_z=int(data.get("mesh_points_z", 240)),
         mesh_points_theta=int(data.get("mesh_points_theta", 180)),
     )
@@ -272,6 +289,12 @@ def _tow_config(raw: object) -> TowConfig:
         name=str(data.get("name", "tow")),
         width_mm=float(data.get("width_mm", 6.0)),
         thickness_mm=float(data.get("thickness_mm", 0.0)),
+        effective_width_mm=_optional_float(data.get("effective_width_mm")),
+        calibrated_effective_width=bool(data.get("calibrated_effective_width", False)),
+        min_bend_radius_mm=_optional_float(data.get("min_bend_radius_mm")),
+        tension_N=_optional_float(data.get("tension_N", data.get("tension_n"))),
+        friction_coefficient=_optional_float(data.get("friction_coefficient")),
+        calibrated_friction=bool(data.get("calibrated_friction", False)),
         fibre_type=str(data.get("fibre_type", "")),
         resin_system=str(data.get("resin_system", "")),
         notes=str(data.get("notes", "")),
@@ -379,6 +402,8 @@ def _coverage_mode_config(raw: object) -> CoverageModeConfig:
 
 def _layer_config(index: int, raw: object) -> LayerConfig:
     data = _mapping(raw, f"layers[{index}]")
+    ply_order_raw = data.get("ply_order")
+    ply_order = None if ply_order_raw in {None, ""} else int(float(str(ply_order_raw)))
     return LayerConfig(
         name=str(data.get("name", f"layer_{index + 1}")),
         type=str(data.get("type", data.get("winding_mode", data.get("winding_type", "helical")))),
@@ -386,12 +411,15 @@ def _layer_config(index: int, raw: object) -> LayerConfig:
             data.get("winding_angle_deg", data.get("angle_deg", data.get("target_angle_deg", 45.0)))
         ),
         enabled=bool(data.get("enabled", True)),
+        ply_order=ply_order,
+        material=str(data.get("material", data.get("material_name", ""))),
         region=str(data.get("region", "full_mandrel")),
         winding_mode=(
             None if data.get("winding_mode") is None else str(data.get("winding_mode"))
         ),
         initial_angle_deg=_optional_float(data.get("initial_angle_deg")),
         target_angle_deg=_optional_float(data.get("target_angle_deg")),
+        angle_tolerance_deg=float(data.get("angle_tolerance_deg", 0.5)),
         direction=str(data.get("direction", "forward")),
         passes=data.get("passes", "auto"),
         coverage_target=float(data.get("coverage_target", 1.0)),
