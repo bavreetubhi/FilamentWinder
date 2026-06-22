@@ -884,18 +884,16 @@ def _normalise_layer_mapping(
         if explicit_type in {None, ""}
         else str(explicit_type)
     )
-    if layer_type in {"helical", "geodesic"}:
-        layer_type = "geodesic"
-    elif layer_type in {"controlled", "non_geodesic"}:
+    if layer_type in {"controlled", "non_geodesic"}:
         layer_type = "non_geodesic"
-    elif layer_type not in {"hoop", "polar"}:
+    elif layer_type not in {"helical", "geodesic", "hoop", "polar"}:
         layer_type = _layer_type_from_angle(angle_deg)
     passes = raw_layer.get("passes", raw_layer.get("number_of_passes", "auto"))
     if passes in {None, "", 0}:
         passes = "auto"
     region = raw_layer.get("region")
     if region in {None, ""}:
-        region = "cylinder_only" if layer_type == "hoop" else "dome_to_dome"
+        region = "cylinder_only" if layer_type in {"helical", "hoop"} else "dome_to_dome"
     direction = str(raw_layer.get("direction", "forward"))
     if direction == "positive":
         direction = "forward"
@@ -962,6 +960,12 @@ def _float_or_default(value: Any, default: float) -> float:
     return float(value)
 
 
+def _optional_path_text(value: Any) -> str | None:
+    if value in {None, ""}:
+        return None
+    return str(value)
+
+
 def _mandrel_mapping(mandrel: Mapping[str, Any]) -> dict[str, Any]:
     mode = str(mandrel.get("mode", "")).lower()
     mandrel_type = str(mandrel.get("type", "cylinder_with_elliptical_domes"))
@@ -972,7 +976,9 @@ def _mandrel_mapping(mandrel: Mapping[str, Any]) -> dict[str, Any]:
     }:
         return {
             "type": "axisymmetric_profile",
-            "profile_path": str(mandrel.get("profile_path", "mandrels/profile.dxf")),
+            "profile_path": _optional_path_text(
+                mandrel.get("profile_path", "mandrels/profile.dxf")
+            ),
             "samples": int(mandrel.get("samples", 0) or 0),
             "length_mm": float(mandrel.get("length_mm", 1000.0)),
             "radius_mm": float(mandrel.get("radius_mm", 100.0)),
@@ -999,7 +1005,7 @@ def _mandrel_mapping(mandrel: Mapping[str, Any]) -> dict[str, Any]:
         "right_dome_length_mm": float(mandrel.get("right_dome_length_mm", 0.0)),
         "polar_opening_radius_mm": float(mandrel.get("polar_opening_radius_mm", 0.0)),
         "min_wind_radius_mm": min_wind_radius_mm,
-        "profile_path": str(mandrel.get("profile_path", "mandrels/profile.dxf")),
+        "profile_path": _optional_path_text(mandrel.get("profile_path")),
         "samples": int(mandrel.get("samples", 0) or 0),
         "mesh_points_z": int(mandrel.get("mesh_points_z", 240)),
         "mesh_points_theta": int(mandrel.get("mesh_points_theta", 180)),

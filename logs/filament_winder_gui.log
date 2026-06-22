@@ -4942,3 +4942,73 @@ ValueError: drop link on a compatible socket
 2026-06-22 03:27:28,005 INFO filament_winder.gui: Button clicked: Edit Node Setting
 2026-06-22 03:27:28,005 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
 2026-06-22 03:27:28,005 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 20:38:53,901 INFO filament_winder.gui: Application startup
+2026-06-22 20:39:31,463 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 20:39:31,463 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 20:39:34,138 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 20:40:04,221 INFO filament_winder.gui: Button clicked: Reset View
+2026-06-22 20:40:04,221 INFO filament_winder.gui: Action started: Reset View selected_nodes=0
+2026-06-22 20:40:04,313 INFO filament_winder.gui: Action completed: Reset View
+2026-06-22 20:40:44,945 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 20:40:44,945 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 20:40:46,072 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 20:40:53,011 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 20:40:53,011 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 20:40:54,108 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 20:40:57,194 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 20:40:57,195 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 20:40:58,257 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 20:41:21,703 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 20:41:21,703 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 20:41:22,825 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 20:41:35,794 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 20:41:35,795 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 20:41:36,932 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 20:41:49,344 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 20:41:49,344 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 20:41:50,372 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 20:41:54,627 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 20:41:54,627 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 20:41:55,634 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 20:42:12,374 INFO filament_winder.gui: Button clicked: Reset View
+2026-06-22 20:42:12,374 INFO filament_winder.gui: Action started: Reset View selected_nodes=0
+2026-06-22 20:42:12,479 INFO filament_winder.gui: Action completed: Reset View
+2026-06-22 20:42:28,060 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 20:42:28,061 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 20:42:29,013 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 20:42:33,435 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 20:42:33,435 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 20:42:34,508 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 20:43:18,221 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 20:43:18,221 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 20:43:29,386 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 20:43:34,094 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 20:43:34,094 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 20:43:37,025 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 20:43:37,713 INFO filament_winder.gui: Button clicked: Reset View
+2026-06-22 20:43:37,713 INFO filament_winder.gui: Action started: Reset View selected_nodes=0
+2026-06-22 20:43:37,823 INFO filament_winder.gui: Action completed: Reset View
+2026-06-22 20:44:09,844 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 20:44:09,845 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 20:44:12,627 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 20:44:36,409 INFO filament_winder.gui: Button clicked: Choose Export Folder
+2026-06-22 20:44:36,409 INFO filament_winder.gui: Action started: Choose Export Folder selected_nodes=0
+2026-06-22 20:44:44,665 INFO filament_winder.gui: Action completed: Choose Export Folder
+2026-06-22 20:44:45,593 INFO filament_winder.gui: Button clicked: Export All
+2026-06-22 20:44:45,593 INFO filament_winder.gui: Action started: Export All selected_nodes=0
+2026-06-22 20:50:30,313 INFO filament_winder.gui: Application startup
+2026-06-22 20:50:42,330 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 20:50:42,330 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 20:50:45,395 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 21:22:30,676 INFO filament_winder.gui: Application startup
+2026-06-22 21:22:49,713 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 21:22:49,713 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 21:22:52,312 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 22:51:55,184 INFO filament_winder.gui: Application startup
+2026-06-22 22:52:05,204 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 22:52:05,204 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 22:52:08,260 INFO filament_winder.gui: Action completed: Regenerate
+2026-06-22 23:06:57,781 INFO filament_winder.gui: Application startup
+2026-06-22 23:07:51,636 INFO filament_winder.gui: Button clicked: Regenerate
+2026-06-22 23:07:51,637 INFO filament_winder.gui: Action started: Regenerate selected_nodes=0
+2026-06-22 23:07:54,289 INFO filament_winder.gui: Action completed: Regenerate

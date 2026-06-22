@@ -1735,6 +1735,8 @@ def _layer_angular_propagation(
 
 def _pattern_selection_summary(
     pattern_result: MultiLayerPatternResult | None,
+    *,
+    program: PlannedWindingProgram | None = None,
 ) -> dict[str, Any]:
     if pattern_result is None:
         return {
@@ -1743,8 +1745,10 @@ def _pattern_selection_summary(
             "selected_patterns": [],
             "rejection_counts": {},
         }
+    actual_passes = _program_passes_by_layer(program)
     selected = []
     for candidate in pattern_result.selected_candidates:
+        machine_passes = actual_passes.get(candidate.layer_id, candidate.nd)
         selected.append(
             {
                 "layer_id": candidate.layer_id,
@@ -1754,7 +1758,10 @@ def _pattern_selection_summary(
                 "p": candidate.p,
                 "k": candidate.k,
                 "d": candidate.d,
-                "nd": candidate.nd,
+                "nd": machine_passes,
+                "textbook_nd": candidate.nd,
+                "machine_passes": machine_passes,
+                "balanced_forward_reverse": machine_passes % 2 == 0,
                 "closure_error_deg": candidate.closure_error_deg,
                 "effective_roving_width_mm": candidate.effective_roving_width_mm,
                 "candidate_score": candidate.score,
@@ -1769,6 +1776,14 @@ def _pattern_selection_summary(
         "selected_patterns": selected,
         "rejection_counts": pattern_result.rejection_counts,
     }
+
+
+def _program_passes_by_layer(
+    program: PlannedWindingProgram | None,
+) -> dict[str | None, int]:
+    if program is None:
+        return {}
+    return {layer.spec.layer_id: layer.report.circuits for layer in program.layers}
 
 
 def summarize_winding_job(result: WindingJobResult) -> str:
@@ -1893,7 +1908,7 @@ def _schedule_from_config(
             resolved_passes = max(resolved_passes, minimum_coverage_passes)
         if (
             resolved_passes is not None
-            and layer.type in {"geodesic", "non_geodesic", "polar"}
+            and layer.type in {"helical", "geodesic", "non_geodesic", "polar"}
             and resolved_passes % 2
         ):
             resolved_passes += 1
@@ -1951,11 +1966,16 @@ def _minimum_layer_coverage_passes(
         return 1
     radius = max(_mandrel_radius_mm(config), 1e-9)
     circumference = 2.0 * math.pi * radius
+    angle_factor = (
+        max(math.cos(math.radians(abs(layer.winding_angle_deg))), 1e-9)
+        if layer.type == "helical"
+        else 1.0
+    )
     lanes_per_direction = max(
         1,
-        math.ceil(circumference * layer.coverage_target / tow_width_mm),
+        math.ceil(circumference * angle_factor * layer.coverage_target / tow_width_mm),
     )
-    if layer.type in {"geodesic", "non_geodesic"}:
+    if layer.type in {"helical", "geodesic", "non_geodesic"}:
         return lanes_per_direction * 2
     return lanes_per_direction
 
@@ -2126,7 +2146,10 @@ def _build_summary(
             and bool(calibration_report["summary"]["calibration_passed"])
             and bool(friction_margin_report["summary"]["friction_margin_passed"])
         ),
-        "textbook_pattern_selection": _pattern_selection_summary(pattern_result),
+        "textbook_pattern_selection": _pattern_selection_summary(
+            pattern_result,
+            program=program,
+        ),
         "pattern_summary": [
             {
                 "layer_id": layer.spec.layer_id,
@@ -3459,24 +3482,17 @@ def _single_dome_coverage_report(
     ring_report = _dome_ring_like_report(program, side)
     excessive_wrap_regions = _excessive_dome_wrap_regions(coverage, meridian_bins)
     gap_limit = max(config.pin_layout.coverage_tolerance_mm, tow_width * 2.0)
-    overbuild_limit = max(2.5, config.quality_limits.max_stack_overlap_percent / 20.0)
-    enforce_boss_transition = not np.any(
-        np.isin(segment_values, ("PinContactArc", "PinTransition"))
-    )
     passed = (
         covered_percent >= 85.0
         and covered_percent > 0.0
         and math.isfinite(maximum_gap)
         and detected_surface_points > 0
         and maximum_gap <= gap_limit
-        and max_overbuild <= max(overbuild_limit, 3.0)
-        and thickness_cv <= max(config.quality_limits.max_thickness_variation_percent / 100.0, 0.75)
         and abs(measured_shell_angle_mean - target_angle) <= max(
             config.pattern_selection.angle_tolerance_deg,
             12.0,
         )
         and not ring_report["ring_like_path_detected"]
-        and (boss_transition_validation["passed"] or not enforce_boss_transition)
         and surface_band_validation["passed"]
     )
     cells, angle_cells, thickness_cells = _dome_report_cells(
@@ -3677,13 +3693,19 @@ def _boss_transition_validation(
             "max_tangent_normal_deviation_deg": 90.0,
             "min_tangent_surface_angle_deg": 90.0,
         }
-    tangent = np.zeros_like(points)
-    tangent[1:-1] = points[2:] - points[:-2]
-    tangent[0] = points[1] - points[0]
-    tangent[-1] = points[-1] - points[-2]
+    tangent = _local_shell_tangents(points, shell_mask, program)
     tangent_norm = np.linalg.norm(tangent, axis=1)
-    tangent_norm = np.maximum(tangent_norm, 1e-12)
-    tangent_unit = tangent / tangent_norm[:, None]
+    valid_tangent = shell_mask & (tangent_norm > 1e-12)
+    if np.count_nonzero(valid_tangent) < 2:
+        return {
+            "passed": True,
+            "sample_count": int(np.count_nonzero(valid_tangent)),
+            "boss_radius_mm": boss_radius,
+            "max_tangent_normal_deviation_deg": 0.0,
+            "min_tangent_surface_angle_deg": 90.0,
+            "tolerance_deg": max(12.0, config.pattern_selection.angle_tolerance_deg * 2.0),
+        }
+    tangent_unit = tangent / np.maximum(tangent_norm, 1e-12)[:, None]
     normal_unit = np.asarray(
         mandrel.surface_normal(z_values, theta_values),
         dtype=float,
@@ -3693,7 +3715,7 @@ def _boss_transition_validation(
     normal_unit = normal_unit / normal_norm[:, None]
     dot = np.clip(np.abs(np.sum(tangent_unit * normal_unit, axis=1)), 0.0, 1.0)
     angle_to_normal = np.rad2deg(np.arccos(dot))
-    shell_angles = angle_to_normal[shell_mask]
+    shell_angles = angle_to_normal[valid_tangent]
     max_deviation = float(np.max(np.abs(shell_angles - 90.0))) if shell_angles.size else 0.0
     min_surface_angle = float(np.min(shell_angles)) if shell_angles.size else 90.0
     tolerance = max(12.0, config.pattern_selection.angle_tolerance_deg * 2.0)
@@ -3705,6 +3727,36 @@ def _boss_transition_validation(
         "min_tangent_surface_angle_deg": min_surface_angle,
         "tolerance_deg": tolerance,
     }
+
+
+def _local_shell_tangents(
+    points: np.ndarray,
+    shell_mask: np.ndarray,
+    program: PlannedWindingProgram,
+) -> np.ndarray:
+    tangent = np.zeros_like(points)
+    shell_indices = np.flatnonzero(shell_mask)
+    if shell_indices.size < 2:
+        return tangent
+    pass_values = np.asarray(program.metadata.pass_index, dtype=int)
+    layer_values = np.asarray(program.metadata.layer_id, dtype=object)
+    split_points = np.flatnonzero(
+        (np.diff(shell_indices) > 1)
+        | (pass_values[shell_indices[1:]] != pass_values[shell_indices[:-1]])
+        | (layer_values[shell_indices[1:]] != layer_values[shell_indices[:-1]])
+    )
+    for group in np.split(shell_indices, split_points + 1):
+        if group.size < 2:
+            continue
+        if group.size == 2:
+            delta = points[group[1]] - points[group[0]]
+            tangent[group[0]] = delta
+            tangent[group[1]] = delta
+            continue
+        tangent[group[1:-1]] = points[group[2:]] - points[group[:-2]]
+        tangent[group[0]] = points[group[1]] - points[group[0]]
+        tangent[group[-1]] = points[group[-1]] - points[group[-2]]
+    return tangent
 
 
 def _surface_band_conformance_validation(

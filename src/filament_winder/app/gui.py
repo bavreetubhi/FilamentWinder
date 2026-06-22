@@ -23,8 +23,10 @@ from filament_winder.app.backend_service import (
     BackendService,
     LoadedPlotSet,
     LoadedReportSet,
+    graph_from_winding_config,
 )
 from filament_winder.app.exporting import (
+    PreviewExportResult,
     export_cylinder_pattern_preview_files,
     export_preview_files,
     export_profile_dome_pattern_preview_files,
@@ -66,7 +68,18 @@ from filament_winder.app.project_binding import (
     profile_config_from_project,
     project_from_preview_config,
 )
-from filament_winder.config import WindingJobConfig
+from filament_winder.config import (
+    LayerConfig,
+    MachineConfig,
+    MandrelConfig,
+    OutputConfig,
+    PlotConfig,
+    ProjectConfig,
+    RovingConfig,
+    TowConfig,
+    WindingJobConfig,
+)
+from filament_winder.core.coverage import cylinder_coverage_map
 from filament_winder.core.geometry import (
     AxisymmetricProfileMandrel,
     CylinderMandrel,
@@ -83,6 +96,9 @@ from filament_winder.core.path_planning import (
 from filament_winder.core.tow import generate_surface_tow_band
 from filament_winder.io import (
     GCodeOptions,
+    export_coverage_csv,
+    export_coverage_summary_csv,
+    export_cylinder_preview_obj,
     export_gcode,
     export_winding_program_csv,
     import_dxf_zr_profile,
@@ -92,6 +108,7 @@ from filament_winder.project import load_project, save_project
 GUI_LOG_PATH = Path("logs/filament_winder_gui.log")
 _ORIGINAL_EXCEPTHOOK = sys.excepthook
 NODE_CANVAS_SCENE_RECT = (-10000.0, -6000.0, 20000.0, 12000.0)
+SIMPLE_FULL_COVERAGE_TARGET = 1.15
 
 
 def _gui_logger() -> logging.Logger:
@@ -287,6 +304,8 @@ class _PreviewWindow:
         self._node_right_press_pos: Any | None = None
         self._node_suppress_context_menu = False
         self._node_space_down = False
+        self._simple_gui_mode = True
+        self._simple_backend_config: WindingJobConfig | None = None
 
         class _PreviewMainWindow(qt_widgets.QMainWindow):  # type: ignore[name-defined, misc, valid-type]
             def __init__(self, owner: _PreviewWindow) -> None:
@@ -309,7 +328,7 @@ class _PreviewWindow:
 
         self.canvas = vispy_scene.SceneCanvas(
             keys="interactive",
-            bgcolor="#101418",
+            bgcolor="#f7fafc",
             show=False,
         )
         self.view = self.canvas.central_widget.add_view()
@@ -353,34 +372,13 @@ class _PreviewWindow:
 
         toolbar = qt_widgets.QHBoxLayout()
         toolbar.setSpacing(8)
-        refresh = qt_widgets.QPushButton("Update Preview")
-        self._connect_safe_button(refresh, "Update Preview", self._render_scene)
+        refresh = qt_widgets.QPushButton("Regenerate")
+        refresh.setObjectName("viewportRegenerateButton")
+        refresh.setProperty("primary", True)
+        refresh.setToolTip("Rebuild the preview from the current setup.")
+        self._connect_safe_button(refresh, "Regenerate", self._regenerate_current)
         reset_view = qt_widgets.QPushButton("Reset View")
         self._connect_safe_button(reset_view, "Reset View", self._reset_camera)
-        fit_mandrel = qt_widgets.QPushButton("Fit Mandrel")
-        self._connect_safe_button(fit_mandrel, "Fit Mandrel", self._reset_camera)
-        import_config = qt_widgets.QPushButton("Import Config")
-        self._connect_safe_button(
-            import_config,
-            "Import Backend Config",
-            self._import_backend_config_dialog,
-        )
-        export_config = qt_widgets.QPushButton("Export Config")
-        self._connect_safe_button(
-            export_config,
-            "Export Backend Config",
-            self._export_backend_config_dialog,
-        )
-        backend_check = qt_widgets.QPushButton("Backend Check")
-        self._connect_safe_button(backend_check, "Backend Check", self._run_backend_check)
-        backend_csv = qt_widgets.QPushButton("Backend CSV")
-        self._connect_safe_button(backend_csv, "Backend CSV", self._run_backend_csv_export)
-        backend_gcode = qt_widgets.QPushButton("Backend G-code")
-        self._connect_safe_button(
-            backend_gcode,
-            "Backend G-code",
-            self._run_backend_gcode_export,
-        )
         self.show_tow_path = qt_widgets.QCheckBox("Tow Path")
         self.show_tow_path.setChecked(True)
         self.show_tow_path.toggled.connect(
@@ -430,22 +428,6 @@ class _PreviewWindow:
         camera_help.setObjectName("viewportHelp")
         toolbar.addWidget(refresh)
         toolbar.addWidget(reset_view)
-        toolbar.addWidget(fit_mandrel)
-        toolbar.addWidget(import_config)
-        toolbar.addWidget(export_config)
-        toolbar.addWidget(backend_check)
-        toolbar.addWidget(backend_csv)
-        toolbar.addWidget(backend_gcode)
-        toolbar.addSpacing(12)
-        toolbar.addWidget(self.show_mandrel_body)
-        toolbar.addWidget(self.show_tow_path)
-        toolbar.addWidget(self.show_tow_band)
-        toolbar.addWidget(self.show_dome_shell)
-        toolbar.addWidget(self.show_cylinder_winding)
-        toolbar.addWidget(self.show_boss_contact)
-        toolbar.addWidget(self.show_transition_moves)
-        toolbar.addWidget(self.show_coverage)
-        toolbar.addWidget(self.show_machine_view)
         toolbar.addStretch(1)
         toolbar.addWidget(camera_help)
         layout.addLayout(toolbar)
@@ -466,8 +448,20 @@ class _PreviewWindow:
         self.status.setWordWrap(True)
         self.status.setMinimumWidth(260)
         self.status.setMaximumWidth(520)
+        self.simple_progress = qt_widgets.QProgressBar()
+        self.simple_progress.setObjectName("simpleProgress")
+        self.simple_progress.setRange(0, 100)
+        self.simple_progress.setValue(0)
+        self.simple_progress.setTextVisible(False)
+        self.simple_progress.setMaximumWidth(360)
+        self.simple_progress.setVisible(False)
         overlay_layout.addWidget(
             self.status,
+            0,
+            qt_core.Qt.AlignmentFlag.AlignTop | qt_core.Qt.AlignmentFlag.AlignLeft,
+        )
+        overlay_layout.addWidget(
+            self.simple_progress,
             0,
             qt_core.Qt.AlignmentFlag.AlignTop | qt_core.Qt.AlignmentFlag.AlignLeft,
         )
@@ -488,6 +482,9 @@ class _PreviewWindow:
         self._append_gui_log(action_name, "started", f"selected_nodes={selected_count}")
         previous_status = self.status.text() if hasattr(self, "status") else ""
         self._set_gui_status(f"Running: {action_name}")
+        app = self._qt_widgets.QApplication.instance()
+        if app is not None:
+            app.processEvents()
         try:
             result = callback()
         except Exception as exc:  # noqa: BLE001 - protects Qt event loop
@@ -510,10 +507,19 @@ class _PreviewWindow:
         action_name: str,
         callback: Callable[[], Any],
     ) -> Any | None:
+        original_text = button.text() if hasattr(button, "text") else ""
         button.setEnabled(False)
+        if original_text in {"Regenerate", "Export", "Export All"}:
+            button.setText("Working...")
+        app = self._qt_widgets.QApplication.instance()
+        if app is not None:
+            app.processEvents()
         try:
             return self.run_safe_action(action_name, callback)
         finally:
+            if original_text:
+                with suppress(RuntimeError):
+                    button.setText(original_text)
             if not self._backend_busy:
                 button.setEnabled(True)
 
@@ -561,6 +567,62 @@ class _PreviewWindow:
             self.node_status.setText(message)
         if hasattr(self, "node_status_log"):
             self.node_status_log.appendPlainText(message)
+
+    def _set_simple_loading(self, busy: bool, message: str = "") -> None:
+        if message:
+            self._set_gui_status(message)
+        if not hasattr(self, "simple_progress"):
+            return
+        if busy:
+            self.simple_progress.setRange(0, 0)
+            self.simple_progress.setVisible(True)
+        else:
+            self.simple_progress.setRange(0, 100)
+            self.simple_progress.setValue(100)
+            self.simple_progress.setVisible(False)
+        app = self._qt_widgets.QApplication.instance()
+        if app is not None:
+            app.processEvents()
+
+    def _commit_setup_edits(self) -> None:
+        for control in (
+            self.length,
+            self.radius,
+            self.tow_width,
+            self.angle,
+            self.points,
+            self.passes,
+            self.target_coverage,
+            self.max_opt_passes,
+            self.phase_offset,
+            self.clearance,
+            self.profile_samples,
+            self.profile_min_radius,
+            self.turnaround_radius,
+            self.turnaround_points,
+            self.turnaround_angle,
+            self.circuits,
+            self.pattern_coverage,
+            self.pattern_max_angle_error,
+            self.feedrate,
+        ):
+            if hasattr(control, "interpretText"):
+                control.interpretText()
+
+    def _force_canvas_refresh(self) -> None:
+        if hasattr(self, "canvas"):
+            self.canvas.update()
+            canvas_app = getattr(self.canvas, "app", None)
+            if canvas_app is not None:
+                with suppress(Exception):
+                    canvas_app.process_events()
+        native = getattr(getattr(self, "canvas", None), "native", None)
+        if native is not None:
+            native.update()
+            native.repaint()
+        app = self._qt_widgets.QApplication.instance()
+        if app is not None:
+            app.processEvents()
 
     def _connect_safe_button(
         self,
@@ -614,13 +676,18 @@ class _PreviewWindow:
 
         self.length = self._double_spin(config.length_mm, 1.0, 10000.0, 10.0)
         self.radius = self._double_spin(config.radius_mm, 1.0, 2000.0, 1.0)
-        self.tow_width = self._double_spin(config.tow_width_mm, 0.0, 200.0, 0.5)
+        self.tow_width = self._double_spin(config.tow_width_mm, 0.001, 200.0, 0.5)
         self._last_global_tow_width_mm = float(config.tow_width_mm)
         self.tow_width.valueChanged.connect(self._on_global_tow_width_changed)
         self.angle = self._double_spin(config.winding_angle_deg, 1.0, 89.0, 1.0)
         self.points = self._int_spin(config.points_per_pass, 2, 10000, 10)
         self.passes = self._int_spin(config.passes, 1, 200, 1)
-        self.target_coverage = self._double_spin(100.0, 1.0, 300.0, 5.0)
+        self.target_coverage = self._double_spin(
+            SIMPLE_FULL_COVERAGE_TARGET * 100.0,
+            1.0,
+            300.0,
+            5.0,
+        )
         self.max_opt_passes = self._int_spin(max(200, config.passes), 1, 1000, 10)
         self.auto_phase = qt_widgets.QCheckBox()
         self.auto_phase.setChecked(config.phase_offset_deg is None)
@@ -634,6 +701,10 @@ class _PreviewWindow:
         self.clearance = self._double_spin(config.radial_clearance_mm, 0.0, 2000.0, 1.0)
         self.alternate = qt_widgets.QCheckBox()
         self.alternate.setChecked(config.alternate_direction)
+        self.auto_passes_label = qt_widgets.QLabel("Auto (overlap full coverage)")
+        self.auto_passes_label.setObjectName("autoPassesLabel")
+        self.profile_auto_passes_label = qt_widgets.QLabel("Auto (overlap full coverage)")
+        self.profile_auto_passes_label.setObjectName("profileAutoPassesLabel")
         self.passes.valueChanged.connect(self._update_auto_phase_value)
         self.auto_phase.toggled.connect(self._on_auto_phase_toggled)
 
@@ -663,6 +734,7 @@ class _PreviewWindow:
         project_layout.addWidget(self.project_name)
         project_layout.addLayout(project_buttons)
         project_layout.addWidget(self.project_path_label)
+        project_group.setVisible(False)
 
         winding_group = qt_widgets.QGroupBox("Cylinder Winding")
         winding_layout = qt_widgets.QVBoxLayout(winding_group)
@@ -671,24 +743,21 @@ class _PreviewWindow:
         form.addRow("Tow width mm", self.tow_width)
         form.addRow("Angle deg", self.angle)
         form.addRow("Points/pass", self.points)
-        form.addRow("Passes", self.passes)
-        form.addRow("Target coverage %", self.target_coverage)
-        form.addRow("Max opt passes", self.max_opt_passes)
-        form.addRow("Auto phase", self.auto_phase)
-        form.addRow("Phase offset deg", self.phase_offset)
+        form.addRow("Passes", self.auto_passes_label)
         form.addRow("Clearance mm", self.clearance)
-        form.addRow("Alternate direction", self.alternate)
         winding_layout.addLayout(form)
 
         layer_group = qt_widgets.QGroupBox("Layer Stack")
         layer_layout = qt_widgets.QVBoxLayout(layer_group)
         layer_header = qt_widgets.QHBoxLayout()
         self.use_layer_stack = qt_widgets.QCheckBox("Use layer stack")
-        self.use_layer_stack.setChecked(True)
+        self.use_layer_stack.setChecked(False)
         self.use_layer_stack.toggled.connect(
-            lambda _checked: self.run_safe_action("Toggle Layer Stack", self._render_scene)
+            lambda _checked: self._set_gui_status(
+                "Layer stack setting changed. Click Regenerate to update the preview."
+            )
         )
-        add_layer = qt_widgets.QPushButton("+ Helical")
+        add_layer = qt_widgets.QPushButton("Add Layer")
         self._connect_safe_button(
             add_layer,
             "Add Helical Layer",
@@ -716,13 +785,13 @@ class _PreviewWindow:
             "Move Layer Down",
             lambda: self._move_selected_layer(1),
         )
+        add_hoop.setVisible(False)
+        add_polar.setVisible(False)
+        move_up.setVisible(False)
+        move_down.setVisible(False)
         layer_header.addWidget(self.use_layer_stack, 1)
         layer_header.addWidget(add_layer)
-        layer_header.addWidget(add_hoop)
-        layer_header.addWidget(add_polar)
         layer_header.addWidget(remove_layer)
-        layer_header.addWidget(move_up)
-        layer_header.addWidget(move_down)
         layer_layout.addLayout(layer_header)
         self.layer_table = qt_widgets.QTableWidget(0, 14)
         self.layer_table.setHorizontalHeaderLabels(
@@ -743,15 +812,19 @@ class _PreviewWindow:
                 "Transition pts",
             ]
         )
+        for column in (4, 7, 8, 9, 10, 12, 13):
+            self.layer_table.setColumnHidden(column, True)
         self.layer_table.horizontalHeader().setStretchLastSection(True)
         self.layer_table.verticalHeader().setVisible(False)
-        self.layer_table.setMinimumHeight(260)
+        self.layer_table.setMinimumHeight(170)
+        self.layer_table.setMaximumHeight(240)
         self.layer_table.setSelectionBehavior(self.layer_table.SelectionBehavior.SelectRows)
         self.layer_table.setSelectionMode(self.layer_table.SelectionMode.ExtendedSelection)
         self.layer_table.itemChanged.connect(self._on_layer_table_changed)
         layer_layout.addWidget(self.layer_table)
 
         profile_group = qt_widgets.QGroupBox("Axisymmetric Profile")
+        self._profile_group = profile_group
         profile_layout = qt_widgets.QVBoxLayout(profile_group)
         profile_form = qt_widgets.QFormLayout()
         self.profile_path = qt_widgets.QLineEdit(str(self._profile_config.profile_path))
@@ -804,7 +877,7 @@ class _PreviewWindow:
         profile_form.addRow("Turn radius (0 auto)", self.turnaround_radius)
         profile_form.addRow("Turn points", self.turnaround_points)
         profile_form.addRow("Turn angle deg", self.turnaround_angle)
-        profile_form.addRow("Circuits", self.circuits)
+        profile_form.addRow("Passes", self.profile_auto_passes_label)
         profile_layout.addLayout(profile_form)
         inspect_profile = qt_widgets.QPushButton("Inspect DXF Import")
         self._connect_safe_button(inspect_profile, "Import DXF", self._inspect_profile_import)
@@ -828,6 +901,7 @@ class _PreviewWindow:
         pattern_layout.addRow("Balanced +/-", self.balanced_pm_layers)
         pattern_layout.addRow("Include hoop", self.include_hoop_layer)
         pattern_layout.addRow("Max angle err deg", self.pattern_max_angle_error)
+        pattern_group.setVisible(False)
         self._populate_default_layers()
 
         export_group = qt_widgets.QGroupBox("Export")
@@ -908,6 +982,7 @@ class _PreviewWindow:
             lambda: self._export_current(preview_obj=True),
         )
         export_all = qt_widgets.QPushButton("Export All")
+        export_all.setProperty("primary", True)
         self._connect_safe_button(
             export_all,
             "Export All",
@@ -919,28 +994,53 @@ class _PreviewWindow:
                 preview_obj=True,
             ),
         )
-        export_buttons.addWidget(export_folder, 0, 0, 1, 2)
-        export_buttons.addWidget(export_csv, 1, 0)
-        export_buttons.addWidget(export_gcode, 1, 1)
-        export_buttons.addWidget(export_coverage, 2, 0)
-        export_buttons.addWidget(export_obj, 2, 1)
-        export_buttons.addWidget(export_all, 3, 0, 1, 2)
+        export_csv.setVisible(False)
+        export_gcode.setVisible(False)
+        export_coverage.setVisible(False)
+        export_obj.setVisible(False)
+        export_buttons.addWidget(export_folder, 0, 0)
+        export_buttons.addWidget(export_all, 0, 1)
         export_layout.addLayout(export_form)
         export_layout.addLayout(export_buttons)
 
-        nodes_tab = self._build_node_workspace()
-        tabs.addTab(self._scroll_tab(mode_group, project_group), "Setup")
-        tabs.addTab(self._scroll_tab(winding_group, layer_group, profile_group), "Path")
-        tabs.addTab(self._scroll_tab(pattern_group), "Pattern")
-        tabs.addTab(self._scroll_tab(export_group), "Export")
-
-        tabs.setVisible(False)
-        self._legacy_control_tabs = tabs
-        nodes_tab.setSizePolicy(
-            self._qt_widgets.QSizePolicy.Policy.Expanding,
-            self._qt_widgets.QSizePolicy.Policy.Expanding,
+        process_bar = qt_widgets.QHBoxLayout()
+        regenerate = qt_widgets.QPushButton("Regenerate")
+        regenerate.setObjectName("workflowRegenerateButton")
+        regenerate.setProperty("primary", True)
+        regenerate.setToolTip("Update the preview from all current setup values.")
+        self._connect_safe_button(regenerate, "Regenerate", self._regenerate_current)
+        process_export = qt_widgets.QPushButton("Export")
+        process_export.setObjectName("workflowExportButton")
+        process_export.setProperty("primary", True)
+        self._connect_safe_button(
+            process_export,
+            "Export",
+            lambda: self._export_current(
+                csv=True,
+                gcode=True,
+                coverage_csv=True,
+                coverage_summary_csv=True,
+                preview_obj=True,
+            ),
         )
-        layout.addWidget(nodes_tab, 1)
+        process_bar.addWidget(regenerate)
+        process_bar.addWidget(process_export)
+        process_bar.addStretch(1)
+
+        workflow = qt_widgets.QSplitter(self._qt_core.Qt.Orientation.Horizontal)
+        workflow.setChildrenCollapsible(False)
+        layer_group.setVisible(False)
+        setup_panel = self._scroll_tab(mode_group, winding_group, profile_group, pattern_group)
+        export_panel = self._scroll_tab(export_group)
+        workflow.addWidget(setup_panel)
+        workflow.addWidget(export_panel)
+        workflow.setStretchFactor(0, 2)
+        workflow.setStretchFactor(1, 1)
+        workflow.setSizes([980, 420])
+        self._legacy_control_tabs = tabs
+        layout.addLayout(process_bar)
+        layout.addWidget(workflow, 1)
+        self._on_mode_changed(regenerate=False)
         return panel
 
     def _build_node_workspace(self) -> Any:
@@ -4153,6 +4253,8 @@ class _PreviewWindow:
         self._sync_node_view_state()
 
     def _uses_backend_service_graph(self) -> bool:
+        if not hasattr(self, "node_view"):
+            return False
         backend_types = {
             "project",
             "machine_backend",
@@ -4269,6 +4371,30 @@ class _PreviewWindow:
 
     def _run_backend_generate(self) -> None:
         self._start_backend_service_worker("generate")
+
+    def _regenerate_current(self) -> None:
+        if hasattr(self, "node_view") and self._uses_backend_service_graph():
+            self._update_everything()
+            return
+        self._set_simple_loading(True, "Regenerating preview...")
+        success_status = ""
+        try:
+            self._commit_setup_edits()
+            self._last_backend_check = None
+            self._last_loaded_reports = None
+            self._last_loaded_plots = None
+            self._current_plot_path = None
+            self._render_scene(preserve_camera=False)
+            success_status = self.status.text()
+        except Exception as exc:  # noqa: BLE001 - reported in the GUI instead of escaping Qt
+            self.handle_gui_error("Regenerate", exc)
+            return
+        finally:
+            self._set_simple_loading(False)
+        if success_status and not success_status.lower().startswith("invalid"):
+            timestamp = self._qt_core.QTime.currentTime().toString("HH:mm:ss")
+            self._set_gui_status(f"{success_status}\nRegenerated: {timestamp}")
+            self._force_canvas_refresh()
 
     def _update_everything(self) -> None:
         self._set_node_status("Updating everything from current node settings...")
@@ -4906,6 +5032,110 @@ class _PreviewWindow:
             alternate_direction=bool(self.alternate.isChecked()),
         )
 
+    def _simple_generated_dome_length_mm(self, radius_mm: float, min_radius_mm: float) -> float:
+        return max(
+            1.0,
+            math.sqrt(max(radius_mm**2 - min(max(min_radius_mm, 0.0), radius_mm) ** 2, 0.0)),
+        )
+
+    def _current_backend_config(self) -> WindingJobConfig:
+        self._commit_setup_edits()
+        output_paths = self._current_export_paths()
+        output_dir = Path(output_paths.csv_path).parent
+        tow_width_mm = float(self.tow_width.value())
+        tow_thickness_mm = 0.25
+        coverage_target = SIMPLE_FULL_COVERAGE_TARGET
+        if self._is_profile_dome_mode():
+            profile_config = self._current_profile_config()
+            radius_mm = float(self.radius.value())
+            min_radius_mm = min(float(self.profile_min_radius.value()), radius_mm - 1e-6)
+            dome_length_mm = self._simple_generated_dome_length_mm(radius_mm, min_radius_mm)
+            turnaround_radius_mm = profile_config.turnaround_radius_mm
+            if turnaround_radius_mm is None:
+                turnaround_radius_mm = min_radius_mm
+            mandrel = MandrelConfig(
+                type="cylinder_with_elliptical_domes",
+                length_mm=float(self.length.value()),
+                radius_mm=radius_mm,
+                cylinder_length_mm=float(self.length.value()),
+                cylinder_radius_mm=radius_mm,
+                left_dome_length_mm=dome_length_mm,
+                right_dome_length_mm=dome_length_mm,
+                polar_opening_radius_mm=min_radius_mm,
+                min_wind_radius_mm=min_radius_mm,
+                mesh_points_z=max(48, int(self.points.value())),
+                mesh_points_theta=180,
+            )
+            layer = LayerConfig(
+                name="generated_domed_wind",
+                type="geodesic",
+                winding_angle_deg=float(self.angle.value()),
+                region="dome_to_dome",
+                direction="forward",
+                passes="auto",
+                coverage_target=coverage_target,
+                turnaround_radius_mm=max(turnaround_radius_mm, min_radius_mm),
+                tow_width_mm=tow_width_mm,
+                tow_thickness_mm=tow_thickness_mm,
+                feedrate_mm_min=float(self.feedrate.value()),
+                points=max(12, int(self.points.value())),
+                polar_opening_radius_mm=min_radius_mm,
+            )
+        else:
+            mandrel = MandrelConfig(
+                type="cylinder",
+                length_mm=float(self.length.value()),
+                radius_mm=float(self.radius.value()),
+                mesh_points_z=max(48, int(self.points.value())),
+                mesh_points_theta=180,
+            )
+            layer = LayerConfig(
+                name="cylinder_helical",
+                type="helical",
+                winding_angle_deg=float(self.angle.value()),
+                region="cylinder_only",
+                direction="forward",
+                passes="auto",
+                coverage_target=coverage_target,
+                tow_width_mm=tow_width_mm,
+                tow_thickness_mm=tow_thickness_mm,
+                feedrate_mm_min=float(self.feedrate.value()),
+                points=max(12, int(self.points.value())),
+                phase_offset_deg=None,
+            )
+        return WindingJobConfig(
+            project=ProjectConfig(name=_safe_output_prefix(self._current_project_name())),
+            machine=MachineConfig(clearance_mm=float(self.clearance.value())),
+            mandrel=mandrel,
+            tow=TowConfig(width_mm=tow_width_mm, thickness_mm=tow_thickness_mm),
+            roving=RovingConfig(width_mm=tow_width_mm, thickness_mm=tow_thickness_mm),
+            layers=(layer,),
+            output=OutputConfig(
+                directory=output_dir,
+                csv=True,
+                summary_json=True,
+                segments_json=True,
+                validation_report_json=True,
+                coverage_grid=True,
+                gcode=True,
+            ),
+            plot=PlotConfig(enabled=False, save=False),
+        )
+
+    def _current_project_name(self) -> str:
+        if hasattr(self, "project_name"):
+            with suppress(RuntimeError):
+                text = self.project_name.text().strip()
+                if text:
+                    return text
+        return "gui_winding_job"
+
+    def _sync_simple_backend_from_controls(self) -> WindingJobConfig:
+        config = self._current_backend_config()
+        self._simple_backend_config = config
+        self._node_graph = graph_from_winding_config(config)
+        return config
+
     def _current_profile_config(self) -> ProfileDomePreviewConfig:
         samples = int(self.profile_samples.value())
         turnaround_radius = float(self.turnaround_radius.value())
@@ -4934,6 +5164,8 @@ class _PreviewWindow:
         )
 
     def _current_layer_schedule(self) -> WindingSchedule | None:
+        if getattr(self, "_simple_gui_mode", False):
+            return None
         if not self.use_layer_stack.isChecked():
             return None
         layers = []
@@ -5066,7 +5298,7 @@ class _PreviewWindow:
                 self._set_layer_table_value(row, col, value)
         self.layer_table.blockSignals(False)
         if render:
-            self._render_scene()
+            self._set_gui_status("Layer added. Click Regenerate to update the preview.")
 
     def _add_layer_preset(self, winding_type: str) -> None:
         if winding_type == "hoop":
@@ -5151,7 +5383,7 @@ class _PreviewWindow:
         rows = sorted({index.row() for index in self.layer_table.selectedIndexes()}, reverse=True)
         for row in rows:
             self.layer_table.removeRow(row)
-        self._render_scene()
+        self._set_gui_status("Layer stack changed. Click Regenerate to update the preview.")
 
     def _move_selected_layer(self, direction: int) -> None:
         rows = sorted({index.row() for index in self.layer_table.selectedIndexes()})
@@ -5190,10 +5422,10 @@ class _PreviewWindow:
             else:
                 self._set_layer_table_value(target, col, value)
         self.layer_table.blockSignals(False)
-        self._render_scene()
+        self._set_gui_status("Layer stack changed. Click Regenerate to update the preview.")
 
     def _on_layer_table_changed(self, *_args: Any) -> None:
-        self._render_scene()
+        self._set_gui_status("Layer stack changed. Click Regenerate to update the preview.")
 
     def _on_global_tow_width_changed(self, value: float) -> None:
         previous = float(getattr(self, "_last_global_tow_width_mm", value))
@@ -5248,12 +5480,13 @@ class _PreviewWindow:
             or self._default_export_paths.preview_obj_path,
         )
 
-    def _render_scene(self) -> None:
-        camera_state = self._capture_mandrel_camera_state()
+    def _render_scene(self, *, preserve_camera: bool = True) -> None:
+        camera_state = self._capture_mandrel_camera_state() if preserve_camera else None
         try:
             self._render_scene_contents()
         finally:
             self._restore_mandrel_camera_state(camera_state)
+            self._force_canvas_refresh()
 
     def _capture_mandrel_camera_state(self) -> dict[str, Any] | None:
         if not hasattr(self, "view") or not hasattr(self.view, "camera"):
@@ -5277,6 +5510,9 @@ class _PreviewWindow:
         camera.view_changed()
 
     def _render_scene_contents(self) -> None:
+        if getattr(self, "_simple_gui_mode", False):
+            self._render_simple_backend_scene(self._sync_simple_backend_from_controls())
+            return
         if self._uses_backend_service_graph():
             self._render_node_graph_scene()
             return
@@ -5344,6 +5580,12 @@ class _PreviewWindow:
             preview.config.radius_mm * 6.0,
         )
         self.status.setText(
+            f"Mode: cylinder\n"
+            f"L={preview.config.length_mm:.1f} mm, "
+            f"R={preview.config.radius_mm:.1f} mm, "
+            f"Angle={preview.config.winding_angle_deg:.1f} deg\n"
+            f"Passes: {preview.config.passes} | "
+            f"Tow: {preview.config.tow_width_mm:.1f} mm | "
             f"Points: {preview.path.point_count}\n"
             f"Final turns: {preview.path.final_turns:.4f}\n"
             f"Closure error: {preview.closure.closure_error_deg:.3f} deg\n"
@@ -5351,6 +5593,16 @@ class _PreviewWindow:
             f"Gap: {preview.coverage_summary.gap_percent:.2f}%\n"
             f"Overlap: {preview.coverage_summary.overlap_percent:.2f}%"
         )
+
+    def _render_simple_backend_scene(self, config: WindingJobConfig) -> None:
+        try:
+            mandrel = self._preview_mandrel_from_config(config)
+            schedule = self._preview_schedule_from_config(config)
+            program = plan_winding_schedule(mandrel, schedule)
+        except (OSError, ValueError) as exc:
+            self.status.setText(f"Invalid backend preview: {exc}")
+            return
+        self._draw_backend_program_scene(config, mandrel, program, mode_label="backend")
 
     def _render_node_graph_scene(self) -> None:
         try:
@@ -5362,6 +5614,16 @@ class _PreviewWindow:
         except (OSError, ValueError) as exc:
             self.status.setText(f"Invalid node graph preview: {exc}")
             return
+        self._draw_backend_program_scene(config, mandrel, program, mode_label="node graph")
+
+    def _draw_backend_program_scene(
+        self,
+        config: WindingJobConfig,
+        mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+        program: Any,
+        *,
+        mode_label: str,
+    ) -> None:
         scene = self._vispy_scene
         for visual in self._visuals:
             visual.parent = None
@@ -5409,13 +5671,42 @@ class _PreviewWindow:
             )
             for report in program.reports[:5]
         ]
+        pass_summary = self._backend_pass_status(config, program)
+        coverage_summary = self._backend_coverage_status(config, program)
+        winding_label = "profile dome" if config.mandrel.type in {
+            "axisymmetric_profile",
+            "profile",
+            "cylinder_with_elliptical_domes",
+        } else config.mandrel.type
         self.status.setText(
-            f"Mode: node graph preview\n"
+            f"Mode: {winding_label} {mode_label}\n"
             f"Mandrel: {config.mandrel.type}, L={mandrel.length_mm:.1f} mm, "
-            f"R={radius_mm:.1f} mm\n"
+            f"R={radius_mm:.1f} mm, Angle={config.layers[0].winding_angle_deg:.1f} deg\n"
+            f"Passes: {pass_summary} | Tow={config.tow.width_mm:.1f} mm | "
             f"Layers: {len(program.layers)} | Points: {program.point_count}\n"
+            f"{coverage_summary}\n"
             + "\n".join(layer_lines)
         )
+
+    def _backend_pass_status(self, config: WindingJobConfig, program: Any) -> str:
+        configured = config.layers[0].passes if config.layers else "auto"
+        if not program.reports:
+            return str(configured)
+        resolved = int(program.reports[0].circuits)
+        if isinstance(configured, str) and configured.strip().lower() in {"", "auto"}:
+            return f"auto -> {resolved}"
+        return str(resolved)
+
+    def _backend_coverage_status(self, config: WindingJobConfig, program: Any) -> str:
+        target = (
+            float(config.layers[0].coverage_target) * 100.0
+            if config.layers
+            else SIMPLE_FULL_COVERAGE_TARGET * 100.0
+        )
+        if not program.reports:
+            return f"Coverage target: {target:.1f}%"
+        coverage = float(program.reports[0].coverage_percent)
+        return f"Coverage target: {target:.1f}% | Actual: {coverage:.1f}%"
 
     def _preview_mandrel_from_config(
         self,
@@ -5742,6 +6033,8 @@ class _PreviewWindow:
         self.status.setText(
             f"Mode: profile {preview.config.path_mode}\n"
             f"Profile: {preview.config.profile_path}\n"
+            f"Angle={preview.config.winding_angle_deg:.1f} deg | "
+            f"Tow={preview.config.tow_width_mm:.1f} mm\n"
             f"Points: {preview.path.point_count}\n"
             f"Final turns: {preview.path.final_turns:.4f}\n"
             f"Turn radius: {preview.turnaround_radius_mm:.3f} mm\n"
@@ -5823,7 +6116,8 @@ class _PreviewWindow:
         except (OSError, KeyError, TypeError, ValueError) as exc:
             self.status.setText(f"Could not load project: {exc}")
             return
-        self.project_name.setText(project.name)
+        with suppress(RuntimeError):
+            self.project_name.setText(project.name)
         self.feedrate.setValue(project.machine.feedrate_mm_min)
         self._apply_export_paths_to_controls(export_paths_from_project(project))
         self._set_project_path(Path(filename))
@@ -5858,7 +6152,7 @@ class _PreviewWindow:
                 return
         project = project_from_preview_config(
             self._current_config(),
-            name=self.project_name.text(),
+            name=self._current_project_name(),
             profile_config=self._current_profile_config(),
             pattern_config=self._current_pattern_config(),
             pattern_enabled=self._is_pattern_planner_enabled(),
@@ -5907,7 +6201,7 @@ class _PreviewWindow:
         )
         if not folder:
             return
-        prefix = _safe_output_prefix(self.project_name.text())
+        prefix = _safe_output_prefix(self._current_project_name())
         self._apply_export_paths_to_controls(export_paths_from_directory(folder, prefix=prefix))
         self.status.setText(f"Export folder set: {folder}")
 
@@ -5964,7 +6258,8 @@ class _PreviewWindow:
             self._schedule_fit_node_graph()
         config = self._backend_service.build_project_from_graph(graph)
         if hasattr(self, "project_name"):
-            self.project_name.setText(config.project.name)
+            with suppress(RuntimeError):
+                self.project_name.setText(config.project.name)
         self._set_gui_status(f"Imported backend config: {filename}")
         self._load_backend_artifacts(config.output.directory)
 
@@ -5981,8 +6276,11 @@ class _PreviewWindow:
         path = self._backend_service.export_graph_to_config(self._node_graph, filename)
         self._set_gui_status(f"Exported backend config: {path}")
 
-    def _on_mode_changed(self, *_args: Any) -> None:
-        self._render_scene()
+    def _on_mode_changed(self, *_args: Any, regenerate: bool = True) -> None:
+        if hasattr(self, "_profile_group"):
+            self._profile_group.setVisible(self._is_profile_dome_mode())
+        if regenerate and hasattr(self, "status"):
+            self._set_gui_status("Mode changed. Click Regenerate to update the preview.")
 
     def _export_current(
         self,
@@ -5993,78 +6291,108 @@ class _PreviewWindow:
         coverage_summary_csv: bool = False,
         preview_obj: bool = False,
     ) -> None:
+        self._set_simple_loading(True, "Exporting files...")
         try:
-            schedule = self._current_layer_schedule()
-            if not self._is_profile_dome_mode() and schedule is not None:
-                mandrel = self._current_custom_mandrel()
-                program = plan_winding_schedule(mandrel, schedule)
-                written: list[str] = []
-                if csv:
-                    csv_path = self._current_export_paths().csv_path
-                    written.append(
-                        str(export_winding_program_csv(program, csv_path))
-                    )
-                if gcode:
-                    gcode_path = self._current_export_paths().gcode_path
-                    written.append(
-                        str(
-                            export_gcode(
-                                program.motion_table,
-                                gcode_path,
-                                options=GCodeOptions(
-                                    feedrate_mm_min=float(self.feedrate.value()),
-                                    feed_schedule=program.feed_schedule,
-                                ),
-                            )
-                        )
-                    )
-                written_text = ", ".join(written)
-                self.status.setText(
-                    f"Exported custom layer stack: {written_text}"
-                    if written_text
-                    else "Nothing exported."
-                )
-                return
-            if self._is_profile_dome_mode():
-                if self._is_pattern_planner_enabled():
-                    result = export_profile_dome_pattern_preview_files(
-                        self._current_profile_config(),
-                        self._current_pattern_config(),
-                        self._current_export_paths(),
-                        feedrate_mm_min=float(self.feedrate.value()),
-                        csv=csv,
-                        gcode=gcode,
-                    )
-                else:
-                    result = export_profile_dome_preview_files(
-                        self._current_profile_config(),
-                        self._current_export_paths(),
-                        feedrate_mm_min=float(self.feedrate.value()),
-                        csv=csv,
-                        gcode=gcode,
-                    )
-            elif self._is_pattern_planner_enabled():
-                result = export_cylinder_pattern_preview_files(
-                    self._current_config(),
-                    self._current_pattern_config(),
-                    self._current_export_paths(),
-                    feedrate_mm_min=float(self.feedrate.value()),
-                    csv=csv,
-                    gcode=gcode,
-                    coverage_csv=coverage_csv,
-                    coverage_summary_csv=coverage_summary_csv,
-                )
-            else:
-                result = export_preview_files(
-                    self._current_config(),
-                    self._current_export_paths(),
-                    feedrate_mm_min=float(self.feedrate.value()),
+            self._export_current_impl(
+                csv=csv,
+                gcode=gcode,
+                coverage_csv=coverage_csv,
+                coverage_summary_csv=coverage_summary_csv,
+                preview_obj=preview_obj,
+            )
+        finally:
+            self._set_simple_loading(False)
+
+    def _export_current_impl(
+        self,
+        *,
+        csv: bool = False,
+        gcode: bool = False,
+        coverage_csv: bool = False,
+        coverage_summary_csv: bool = False,
+        preview_obj: bool = False,
+    ) -> None:
+        try:
+            if getattr(self, "_simple_gui_mode", False):
+                result = self._export_simple_backend_files(
                     csv=csv,
                     gcode=gcode,
                     coverage_csv=coverage_csv,
                     coverage_summary_csv=coverage_summary_csv,
                     preview_obj=preview_obj,
                 )
+            else:
+                schedule = self._current_layer_schedule()
+                if not self._is_profile_dome_mode() and schedule is not None:
+                    mandrel = self._current_custom_mandrel()
+                    program = plan_winding_schedule(mandrel, schedule)
+                    written: list[str] = []
+                    if csv:
+                        csv_path = self._current_export_paths().csv_path
+                        written.append(
+                            str(export_winding_program_csv(program, csv_path))
+                        )
+                    if gcode:
+                        gcode_path = self._current_export_paths().gcode_path
+                        written.append(
+                            str(
+                                export_gcode(
+                                    program.motion_table,
+                                    gcode_path,
+                                    options=GCodeOptions(
+                                        feedrate_mm_min=float(self.feedrate.value()),
+                                        feed_schedule=program.feed_schedule,
+                                    ),
+                                )
+                            )
+                        )
+                    written_text = ", ".join(written)
+                    self.status.setText(
+                        f"Exported custom layer stack: {written_text}"
+                        if written_text
+                        else "Nothing exported."
+                    )
+                    return
+                if self._is_profile_dome_mode():
+                    if self._is_pattern_planner_enabled():
+                        result = export_profile_dome_pattern_preview_files(
+                            self._current_profile_config(),
+                            self._current_pattern_config(),
+                            self._current_export_paths(),
+                            feedrate_mm_min=float(self.feedrate.value()),
+                            csv=csv,
+                            gcode=gcode,
+                        )
+                    else:
+                        result = export_profile_dome_preview_files(
+                            self._current_profile_config(),
+                            self._current_export_paths(),
+                            feedrate_mm_min=float(self.feedrate.value()),
+                            csv=csv,
+                            gcode=gcode,
+                        )
+                elif self._is_pattern_planner_enabled():
+                    result = export_cylinder_pattern_preview_files(
+                        self._current_config(),
+                        self._current_pattern_config(),
+                        self._current_export_paths(),
+                        feedrate_mm_min=float(self.feedrate.value()),
+                        csv=csv,
+                        gcode=gcode,
+                        coverage_csv=coverage_csv,
+                        coverage_summary_csv=coverage_summary_csv,
+                    )
+                else:
+                    result = export_preview_files(
+                        self._current_config(),
+                        self._current_export_paths(),
+                        feedrate_mm_min=float(self.feedrate.value()),
+                        csv=csv,
+                        gcode=gcode,
+                        coverage_csv=coverage_csv,
+                        coverage_summary_csv=coverage_summary_csv,
+                        preview_obj=preview_obj,
+                    )
         except (OSError, RuntimeError, ValueError) as exc:
             self.status.setText(f"Export failed: {exc}")
             return
@@ -6083,6 +6411,69 @@ class _PreviewWindow:
             f"Exported: {written_paths}{skipped}"
             if written_paths
             else f"Nothing exported.{skipped}"
+        )
+
+    def _export_simple_backend_files(
+        self,
+        *,
+        csv: bool = False,
+        gcode: bool = False,
+        coverage_csv: bool = False,
+        coverage_summary_csv: bool = False,
+        preview_obj: bool = False,
+    ) -> PreviewExportResult:
+        config = self._sync_simple_backend_from_controls()
+        mandrel = self._preview_mandrel_from_config(config)
+        schedule = self._preview_schedule_from_config(config)
+        program = plan_winding_schedule(mandrel, schedule)
+        paths = self._current_export_paths()
+
+        csv_path = export_winding_program_csv(program, paths.csv_path) if csv else None
+        gcode_path = (
+            export_gcode(
+                program.motion_table,
+                paths.gcode_path,
+                options=GCodeOptions(
+                    feedrate_mm_min=float(self.feedrate.value()),
+                    feed_schedule=program.feed_schedule,
+                ),
+            )
+            if gcode
+            else None
+        )
+        coverage_map = None
+        if isinstance(mandrel, CylinderMandrel) and (coverage_csv or coverage_summary_csv):
+            preview_config = self._current_config()
+            coverage_map = cylinder_coverage_map(
+                mandrel,
+                program.path,
+                z_samples=preview_config.coverage_z_samples,
+                theta_samples=preview_config.coverage_theta_samples,
+            )
+        coverage_csv_path = (
+            export_coverage_csv(coverage_map, paths.coverage_csv_path)
+            if coverage_csv and coverage_map is not None
+            else None
+        )
+        coverage_summary_csv_path = (
+            export_coverage_summary_csv(coverage_map, paths.coverage_summary_csv_path)
+            if coverage_summary_csv and coverage_map is not None
+            else None
+        )
+        preview_obj_path = None
+        if isinstance(mandrel, CylinderMandrel) and preview_obj:
+            preview_obj_path = export_cylinder_preview_obj(
+                mandrel,
+                program.path,
+                paths.preview_obj_path,
+                tow_band=generate_surface_tow_band(mandrel, program.path),
+            )
+        return PreviewExportResult(
+            csv_path=csv_path,
+            gcode_path=gcode_path,
+            coverage_csv_path=coverage_csv_path,
+            coverage_summary_csv_path=coverage_summary_csv_path,
+            preview_obj_path=preview_obj_path,
         )
 
     def _optimize_pattern(self) -> None:
@@ -6348,39 +6739,58 @@ def _float_setting(value: Any, default: float) -> float:
 def _modern_stylesheet() -> str:
     return """
     QWidget {
-        background: #101418;
-        color: #e8edf2;
+        background: #f5f7fa;
+        color: #17202a;
         font-size: 12px;
     }
+    QWidget#viewportPanel {
+        background: #eef2f6;
+    }
+    QFrame#viewportFrame {
+        background: #f7fafc;
+        border: 1px solid #cbd5e1;
+        border-radius: 6px;
+    }
+    QLabel#viewportStatusOverlay {
+        background: rgba(255, 255, 255, 224);
+        color: #17202a;
+        border: 1px solid #cbd5e1;
+        border-radius: 6px;
+        padding: 8px;
+    }
+    QLabel#viewportHelp {
+        color: #52616f;
+        background: transparent;
+    }
     QWidget#controlPanel {
-        background: #151b22;
-        border-right: 1px solid #29323d;
+        background: #ffffff;
+        border-top: 1px solid #d5dde6;
     }
     QWidget#nodeSidePanel {
-        background: #111820;
-        border: 1px solid #29323d;
+        background: #ffffff;
+        border: 1px solid #d5dde6;
         border-radius: 6px;
     }
     QWidget#nodeBottomPanel {
-        background: #111820;
-        border: 1px solid #29323d;
+        background: #ffffff;
+        border: 1px solid #d5dde6;
         border-radius: 6px;
     }
     QTabWidget#nodeBottomTabs::pane {
-        border: 1px solid #29323d;
-        background: #101820;
+        border: 1px solid #d5dde6;
+        background: #ffffff;
     }
     QGraphicsView#nodeView {
-        background: #0b1015;
-        border: 1px solid #29323d;
+        background: #f8fafc;
+        border: 1px solid #d5dde6;
         border-radius: 6px;
     }
     QWidget#nodeWorkspace {
-        background: #0f141a;
+        background: #f5f7fa;
     }
     QWidget#nodeToolbar {
-        background: #121a23;
-        border: 1px solid #263442;
+        background: #ffffff;
+        border: 1px solid #d5dde6;
         border-radius: 6px;
     }
     QScrollArea#nodeToolbarScroll {
@@ -6388,22 +6798,22 @@ def _modern_stylesheet() -> str:
         border: 0;
     }
     QGroupBox {
-        border: 1px solid #2d3742;
+        border: 1px solid #d5dde6;
         border-radius: 6px;
         margin-top: 10px;
         padding: 8px;
-        background: #171e26;
+        background: #ffffff;
         font-weight: 600;
     }
     QGroupBox#nodeCard {
-        border: 1px solid #3a5063;
+        border: 1px solid #cbd5e1;
         border-radius: 7px;
         margin-top: 14px;
-        background: #151c24;
+        background: #ffffff;
     }
     QGroupBox#nodeCard::title {
-        background: #213142;
-        border: 1px solid #3a5063;
+        background: #e8f1fb;
+        border: 1px solid #cbd5e1;
         border-radius: 5px;
         subcontrol-origin: margin;
         left: 8px;
@@ -6415,49 +6825,49 @@ def _modern_stylesheet() -> str:
         padding: 0 4px;
     }
     QTabWidget::pane {
-        border: 1px solid #2d3742;
+        border: 1px solid #d5dde6;
         border-radius: 6px;
-        background: #111820;
+        background: #ffffff;
     }
     QTabBar::tab {
-        background: #202a34;
-        border: 1px solid #2d3742;
+        background: #eef2f6;
+        border: 1px solid #d5dde6;
         padding: 7px 10px;
         margin-right: 2px;
         border-top-left-radius: 5px;
         border-top-right-radius: 5px;
     }
     QTabBar::tab:selected {
-        background: #2b6cb0;
-        border-color: #3b82c4;
+        background: #d9ecff;
+        border-color: #7db7ee;
     }
     QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QTableWidget,
     QDoubleSpinBox, QSpinBox, QComboBox {
-        background: #0f141a;
-        border: 1px solid #33404d;
+        background: #ffffff;
+        border: 1px solid #cbd5e1;
         border-radius: 4px;
         padding: 4px;
-        selection-background-color: #2b6cb0;
+        selection-background-color: #b9dcff;
     }
     QTableWidget {
-        gridline-color: #253342;
-        alternate-background-color: #131a21;
+        gridline-color: #d5dde6;
+        alternate-background-color: #f8fafc;
     }
     QHeaderView::section {
-        background: #1a2430;
-        border: 1px solid #2b3947;
+        background: #eef2f6;
+        border: 1px solid #d5dde6;
         padding: 4px 6px;
-        color: #d7e0e8;
+        color: #17202a;
         font-weight: 600;
     }
     QWidget#inlineNodeSettings {
-        background: #101820;
-        border: 1px solid #253342;
+        background: #f8fafc;
+        border: 1px solid #d5dde6;
         border-radius: 4px;
     }
     QLabel#inlineNodeSettingLabel {
         background: transparent;
-        color: #b5c1cc;
+        color: #52616f;
         font-size: 10px;
         padding: 2px 0;
     }
@@ -6466,8 +6876,8 @@ def _modern_stylesheet() -> str:
     QDoubleSpinBox#inlineNodeSettingEditor,
     QSpinBox#inlineNodeSettingEditor,
     QComboBox#inlineNodeSettingEditor {
-        background: #202830;
-        border: 1px solid #3a4652;
+        background: #ffffff;
+        border: 1px solid #cbd5e1;
         border-radius: 3px;
         min-height: 20px;
         padding: 1px 5px;
@@ -6478,30 +6888,50 @@ def _modern_stylesheet() -> str:
     QDoubleSpinBox#inlineNodeSettingEditor:focus,
     QSpinBox#inlineNodeSettingEditor:focus,
     QComboBox#inlineNodeSettingEditor:focus {
-        border-color: #4f8dcc;
-        background: #24313c;
+        border-color: #3b82c4;
+        background: #f8fbff;
     }
     QCheckBox#inlineNodeSettingEditor {
         background: transparent;
         spacing: 4px;
     }
     QPushButton {
-        background: #263341;
-        border: 1px solid #3a4a5a;
+        background: #ffffff;
+        border: 1px solid #b8c4d1;
         border-radius: 5px;
         padding: 6px 10px;
     }
+    QPushButton[primary="true"] {
+        background: #1f6fb2;
+        border-color: #1c5f99;
+        color: #ffffff;
+        font-weight: 700;
+        min-height: 28px;
+    }
     QWidget#nodeToolbar QPushButton {
-        background: #1b2530;
-        border-color: #344656;
+        background: #ffffff;
+        border-color: #b8c4d1;
         padding: 5px 9px;
         min-height: 24px;
     }
     QPushButton:hover {
-        background: #314255;
+        background: #eef6ff;
+    }
+    QPushButton[primary="true"]:hover {
+        background: #2f7fc2;
     }
     QPushButton:pressed {
+        background: #d9ecff;
+    }
+    QProgressBar#simpleProgress, QProgressBar#taskProgress {
+        background: #e5ebf2;
+        border: 1px solid #cbd5e1;
+        border-radius: 4px;
+        min-height: 8px;
+    }
+    QProgressBar#simpleProgress::chunk, QProgressBar#taskProgress::chunk {
         background: #1f6fb2;
+        border-radius: 3px;
     }
     QScrollArea {
         background: transparent;

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -53,6 +54,11 @@ def test_cylinder_with_domes_profile_regions_and_normals() -> None:
     normals = mandrel.surface_normal(mandrel.z_mm[::10], np.zeros(mandrel.z_mm[::10].shape))
     assert np.allclose(np.linalg.norm(normals, axis=1), 1.0)
     assert np.all(np.diff(mandrel.meridional_arc_length_at(mandrel.z_mm)) >= 0.0)
+    left_dome = mandrel.z_mm < 60.0
+    t = mandrel.z_mm[left_dome] / 60.0
+    cap_depth = math.sqrt(50.0**2 - 8.0**2)
+    expected_radius = np.sqrt(50.0**2 - (cap_depth * (1.0 - t)) ** 2)
+    assert np.allclose(mandrel.r_mm[left_dome], expected_radius)
 
 
 def test_geodesic_clairaut_constant_on_domed_profile() -> None:

@@ -258,6 +258,7 @@ def _build_profile_path(
             turnaround_angle_deg=config.turnaround_angle_deg,
             circuits=config.circuits,
             turnaround_radius_mm=config.turnaround_radius_mm,
+            phase_offset_deg=360.0 / config.circuits if config.circuits > 1 else 0.0,
         )
         dome_generator = ProfileDomePathGenerator(profile, dome_config)
         path = dome_generator.generate()

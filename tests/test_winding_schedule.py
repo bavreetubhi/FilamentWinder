@@ -5,12 +5,14 @@ import csv
 import numpy as np
 import pytest
 
+from filament_winder.core.coverage import cylinder_coverage_map
 from filament_winder.core.geometry import (
     AxisymmetricProfileMandrel,
     CylinderMandrel,
     cylinder_with_domes_profile,
 )
 from filament_winder.core.path_planning import (
+    SurfacePath,
     WindingLayerSpec,
     WindingSchedule,
     axisymmetric_surface_coverage_map,
@@ -57,6 +59,67 @@ def test_cylinder_schedule_plans_alternating_layers_with_transition() -> None:
     assert np.min(program.motion_table.b_deg) < 0.0
     assert "transition" in program.metadata.winding_type
     assert not report.has_errors
+
+
+def test_auto_cylinder_helical_passes_reach_full_coverage() -> None:
+    mandrel = CylinderMandrel(length_mm=500.0, radius_mm=60.0)
+    schedule = WindingSchedule(
+        layers=(
+            WindingLayerSpec(
+                name="auto-full",
+                winding_type="helical",
+                target_angle_deg=35.0,
+                tow_width_mm=6.0,
+                point_count=20,
+                coverage_target=1.0,
+                max_angle_error_deg=5.0,
+            ),
+        )
+    )
+
+    program = plan_winding_schedule(mandrel, schedule)
+
+    assert program.layers[0].spec.number_of_passes is None
+    assert program.reports[0].circuits == program.layers[0].path.pass_count
+    assert program.reports[0].coverage_percent >= 100.0
+    assert program.reports[0].gap_mm == 0.0
+
+
+def test_auto_cylinder_helical_coverage_has_no_diamond_gaps() -> None:
+    mandrel = CylinderMandrel(length_mm=500.0, radius_mm=60.0)
+    schedule = WindingSchedule(
+        layers=(
+            WindingLayerSpec(
+                name="uniform",
+                winding_type="helical",
+                target_angle_deg=35.0,
+                tow_width_mm=6.0,
+                point_count=80,
+                coverage_target=1.0,
+                max_angle_error_deg=5.0,
+            ),
+        )
+    )
+
+    program = plan_winding_schedule(mandrel, schedule)
+    wind_groups = _contiguous_true_spans(
+        np.asarray(program.layers[0].metadata.motion_type) == "wind"
+    )
+    wind_path = _path_from_mask(
+        program.layers[0].path,
+        np.asarray(program.layers[0].metadata.motion_type) == "wind",
+    )
+    coverage = cylinder_coverage_map(mandrel, wind_path, z_samples=80, theta_samples=180)
+    z_deltas = [
+        program.layers[0].path.z_mm[stop - 1] - program.layers[0].path.z_mm[start]
+        for start, stop in wind_groups
+    ]
+
+    assert wind_groups
+    assert any(delta > 0.0 for delta in z_deltas)
+    assert any(delta < 0.0 for delta in z_deltas)
+    assert coverage.gap_fraction == pytest.approx(0.0)
+    assert coverage.summary().mean_coverage_count >= 2.0
 
 
 def test_hoop_schedule_uses_continuous_z_traverse() -> None:
@@ -189,7 +252,7 @@ def test_profile_axisymmetric_schedule_reports_axisymmetric_layer() -> None:
     assert program.motion_table.b_deg[0] == 30.0
 
 
-def test_axisymmetric_dome_turnaround_touches_min_diameter_tangentially() -> None:
+def test_axisymmetric_dome_turnaround_wraps_min_diameter_tangentially() -> None:
     profile = cylinder_with_domes_profile(
         cylinder_length_mm=120.0,
         cylinder_radius_mm=30.0,
@@ -224,15 +287,13 @@ def test_axisymmetric_dome_turnaround_touches_min_diameter_tangentially() -> Non
     assert float(np.min(profile.radius_at(path.z_mm))) >= min_centerline_radius - 1e-6
     for start, stop in _contiguous_true_spans(motion_type == "DomeTurnaround"):
         span_z = path.z_mm[start:stop]
+        span_theta = np.unwrap(path.theta_rad[start:stop])
         span_radius = profile.radius_at(span_z)
-        boundary_index = int(np.argmin(span_radius))
-        assert float(span_radius[boundary_index]) == pytest.approx(
-            min_centerline_radius,
-            abs=1e-6,
-        )
-        assert 0 < boundary_index < span_z.size - 1
-        assert span_radius[boundary_index - 1] > span_radius[boundary_index]
-        assert span_radius[boundary_index + 1] > span_radius[boundary_index]
+        wrap_mask = np.isclose(span_radius, min_centerline_radius, atol=1e-6)
+        assert int(np.count_nonzero(wrap_mask)) >= 3
+        assert np.rad2deg(np.ptp(span_theta[wrap_mask])) >= 170.0
+        assert span_radius[0] > min_centerline_radius
+        assert span_radius[-1] > min_centerline_radius
 
     points = path.points_mm
     segment = np.diff(points, axis=0)
@@ -242,6 +303,48 @@ def test_axisymmetric_dome_turnaround_touches_min_diameter_tangentially() -> Non
         np.arccos(np.clip(np.sum(segment[1:] * segment[:-1], axis=1), -1.0, 1.0))
     )
     assert float(np.max(tangent_turn)) < 35.0
+
+
+def test_axisymmetric_dome_turnaround_preserves_cylinder_lane_spacing() -> None:
+    profile = cylinder_with_domes_profile(
+        cylinder_length_mm=220.0,
+        cylinder_radius_mm=45.0,
+        left_dome_length_mm=45.0,
+        right_dome_length_mm=45.0,
+        polar_opening_radius_mm=6.0,
+        samples_per_region=48,
+    )
+    schedule = WindingSchedule(
+        layers=(
+            WindingLayerSpec(
+                name="domed",
+                winding_type="geodesic",
+                target_angle_deg=45.0,
+                tow_width_mm=6.0,
+                coverage_target=1.15,
+                point_count=40,
+                turnaround_points=18,
+                turnaround_radius_mm=8.0,
+            ),
+        )
+    )
+
+    program = plan_winding_schedule(profile, schedule)
+    layer = program.layers[0]
+    wind_path = _path_from_mask(
+        layer.path,
+        np.asarray(layer.metadata.motion_type) == "wind",
+    )
+    coverage = axisymmetric_surface_coverage_map(
+        profile,
+        wind_path,
+        z_samples=80,
+        theta_samples=180,
+    )
+    cylinder_rows = profile.radius_at(coverage.z_mm) >= profile.max_radius_mm * 0.98
+
+    assert cylinder_rows.any()
+    assert float(np.mean(coverage.coverage_count[cylinder_rows, :] == 0)) == pytest.approx(0.0)
 
 
 def test_axisymmetric_geodesic_dome_span_follows_clairaut_from_cylinder_radius() -> None:
@@ -289,6 +392,23 @@ def _contiguous_true_spans(mask: np.ndarray) -> tuple[tuple[int, int], ...]:
         return ()
     groups = np.split(indices, np.flatnonzero(np.diff(indices) > 1) + 1)
     return tuple((int(group[0]), int(group[-1]) + 1) for group in groups)
+
+
+def _path_from_mask(path: SurfacePath, mask: np.ndarray) -> SurfacePath:
+    return SurfacePath(
+        z_mm=np.asarray(path.z_mm[mask], dtype=float),
+        theta_rad=np.asarray(path.theta_rad[mask], dtype=float),
+        x_mm=np.asarray(path.x_mm[mask], dtype=float),
+        y_mm=np.asarray(path.y_mm[mask], dtype=float),
+        winding_angle_deg=path.winding_angle_deg,
+        tow_width_mm=path.tow_width_mm,
+        pass_index=np.asarray(path.pass_index[mask], dtype=int),
+        tow_eye_angle_deg=(
+            None
+            if path.tow_eye_angle_deg is None
+            else np.asarray(path.tow_eye_angle_deg[mask], dtype=float)
+        ),
+    )
 
 
 def test_winding_program_csv_exports_machine_and_layer_metadata(tmp_path) -> None:
@@ -425,7 +545,7 @@ def test_layers_can_use_different_passes_feedrate_and_clearance() -> None:
     program = plan_winding_schedule(mandrel, schedule)
 
     assert program.layers[0].path.pass_count == 2
-    assert program.layers[1].path.pass_count == 3
+    assert program.layers[1].path.pass_count == 4
     assert (
         program.layers[0].feed_schedule.max_feedrate_mm_min
         > program.layers[1].feed_schedule.max_feedrate_mm_min

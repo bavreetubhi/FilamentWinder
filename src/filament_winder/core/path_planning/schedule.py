@@ -455,6 +455,8 @@ def axisymmetric_surface_coverage_map(
     theta_rad = np.linspace(0.0, 2.0 * np.pi, theta_samples, endpoint=False)
     z_grid, theta_grid = np.meshgrid(z_mm, theta_rad, indexing="ij")
     radius_grid = mandrel.radius_at(z_grid)
+    meridional_mm = mandrel.meridional_arc_length_at(z_mm)
+    meridional_grid = meridional_mm[:, np.newaxis]
     coverage_count = np.zeros(z_grid.shape, dtype=int)
     pass_index = np.asarray(surface_path.pass_index, dtype=int)
 
@@ -464,25 +466,33 @@ def axisymmetric_surface_coverage_map(
         if pass_z.size < 2:
             continue
         if np.isclose(pass_z[-1], pass_z[0]):
+            pass_m = float(mandrel.meridional_arc_length_at(np.asarray([pass_z[0]]))[0])
             coverage_count += (
-                np.abs(z_grid - float(pass_z[0])) <= surface_path.tow_width_mm / 2.0
+                np.abs(meridional_grid - pass_m) <= surface_path.tow_width_mm / 2.0
             ).astype(int)
             continue
         pass_theta_unwrapped = np.unwrap(pass_theta)
-        order = np.argsort(pass_z)
-        unique_z, unique_indices = np.unique(pass_z[order], return_index=True)
-        if unique_z.size < 2:
+        pass_m = mandrel.meridional_arc_length_at(pass_z)
+        order = np.argsort(pass_m)
+        unique_m, unique_indices = np.unique(pass_m[order], return_index=True)
+        if unique_m.size < 2:
             continue
         unique_theta = pass_theta_unwrapped[order][unique_indices]
-        theta_expected = np.interp(z_grid[:, 0], unique_z, unique_theta)
+        theta_expected = np.interp(meridional_mm, unique_m, unique_theta)
         theta_expected_grid = theta_expected[:, np.newaxis]
+        dtheta_dm = np.gradient(unique_theta, unique_m, edge_order=1)
+        local_theta_slope = np.interp(meridional_mm, unique_m, dtheta_dm)[:, np.newaxis]
+        local_surface_slope = radius_grid * local_theta_slope
         circumference_grid = 2.0 * np.pi * radius_grid
         actual_s_mm = radius_grid * theta_grid
         expected_s_mm = radius_grid * theta_expected_grid
         wrapped_offset_mm = _wrap_periodic(actual_s_mm - expected_s_mm, circumference_grid)
-        coverage_count += (np.abs(wrapped_offset_mm) <= surface_path.tow_width_mm / 2.0).astype(
-            int
+        perpendicular_distance_mm = np.abs(wrapped_offset_mm) / np.sqrt(
+            local_surface_slope**2 + 1.0
         )
+        coverage_count += (
+            perpendicular_distance_mm <= surface_path.tow_width_mm / 2.0
+        ).astype(int)
 
     return CoverageMap(
         z_mm=z_mm,
@@ -623,9 +633,12 @@ def _plan_cylinder_helical_layer(
     if spec.number_of_passes is not None:
         actual_angle = abs(spec.target_angle_deg)
         passes = spec.number_of_passes
+        if passes % 2:
+            passes += 1
+        lanes_per_direction = max(1, passes // 2)
         phase_offset = 360.0 / passes if spec.phase_offset_deg is None else spec.phase_offset_deg
         perpendicular_circumference = circumference * math.cos(math.radians(actual_angle))
-        tow_spacing = perpendicular_circumference / passes
+        tow_spacing = perpendicular_circumference / lanes_per_direction
         coverage_percent = spec.tow_width_mm / tow_spacing * 100.0
         gap_mm = max(tow_spacing - spec.tow_width_mm, 0.0)
         overlap_mm = max(spec.tow_width_mm - tow_spacing, 0.0)
@@ -650,22 +663,44 @@ def _plan_cylinder_helical_layer(
         if result.candidates:
             candidate = result.best
             actual_angle = candidate.winding_angle_deg
-            passes = candidate.passes
-            phase_offset = candidate.phase_offset_deg
+            lanes_per_direction = candidate.passes
+            passes = lanes_per_direction * 2
+            phase_offset = 360.0 / passes
             tow_spacing = candidate.band_spacing_mm
             coverage_percent = candidate.estimated_coverage_percent
             gap_mm = max(candidate.estimated_gap_overlap_mm, 0.0)
             overlap_mm = max(-candidate.estimated_gap_overlap_mm, 0.0)
             closes = True
+            minimum_coverage_passes = max(
+                1,
+                math.ceil(
+                    circumference
+                    * math.cos(math.radians(actual_angle))
+                    * spec.coverage_target
+                    / spec.tow_width_mm
+                ),
+            )
+            if lanes_per_direction < minimum_coverage_passes:
+                lanes_per_direction = minimum_coverage_passes
+                passes = lanes_per_direction * 2
+                phase_offset = 360.0 / passes
+                tow_spacing = (
+                    circumference * math.cos(math.radians(actual_angle))
+                    / lanes_per_direction
+                )
+                coverage_percent = spec.tow_width_mm / tow_spacing * 100.0
+                gap_mm = max(tow_spacing - spec.tow_width_mm, 0.0)
+                overlap_mm = max(spec.tow_width_mm - tow_spacing, 0.0)
         else:
             actual_angle = abs(spec.target_angle_deg)
             perpendicular_circumference = circumference * math.cos(math.radians(actual_angle))
-            passes = max(
+            lanes_per_direction = max(
                 1,
                 math.ceil(perpendicular_circumference * spec.coverage_target / spec.tow_width_mm),
             )
+            passes = lanes_per_direction * 2
             phase_offset = 360.0 / passes
-            tow_spacing = perpendicular_circumference / passes
+            tow_spacing = perpendicular_circumference / lanes_per_direction
             coverage_percent = spec.tow_width_mm / tow_spacing * 100.0
             gap_mm = max(tow_spacing - spec.tow_width_mm, 0.0)
             overlap_mm = max(spec.tow_width_mm - tow_spacing, 0.0)
@@ -1006,15 +1041,17 @@ def _plan_profile_dome_layer(
         1,
         math.ceil(circumference * spec.coverage_target / spec.tow_width_mm),
     )
+    total_passes = max(1, math.ceil(circuits / 2.0))
     config = ProfileDomePathConfig(
         winding_angle_deg=abs(spec.target_angle_deg),
         tow_width_mm=spec.tow_width_mm,
         points_per_span=spec.point_count,
         turnaround_points=spec.turnaround_points,
         turnaround_angle_deg=spec.turnaround_angle_deg,
-        circuits=max(1, math.ceil(circuits / 2.0)),
+        circuits=total_passes,
         start_theta_rad=theta_offset_rad + math.radians(spec.start_offset_deg),
         turnaround_radius_mm=spec.turnaround_radius_mm,
+        phase_offset_deg=360.0 / total_passes if total_passes > 1 else 0.0,
     )
     generator = ProfileDomePathGenerator(mandrel, config)
     path = generator.generate()
@@ -1127,7 +1164,7 @@ def _plan_axisymmetric_geodesic_layer(
         forward_path = _densify_surface_path(
             mandrel,
             forward_path,
-            max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
+            max_segment_length_mm=_axisymmetric_max_segment_length(spec),
         )
         if next_forward_alignment_theta is not None:
             forward_path = _align_path_start_theta(
@@ -1158,7 +1195,7 @@ def _plan_axisymmetric_geodesic_layer(
         return_path = _densify_surface_path(
             mandrel,
             return_path,
-            max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
+            max_segment_length_mm=_axisymmetric_max_segment_length(spec),
         )
         end_turnaround = _smooth_dome_turnaround_path(
             mandrel,
@@ -1167,6 +1204,7 @@ def _plan_axisymmetric_geodesic_layer(
             safe_start_z_mm=safe_start_z,
             safe_end_z_mm=safe_end_z,
             point_count=spec.turnaround_points,
+            wrap_angle_deg=spec.turnaround_angle_deg,
         )
         return_path = _align_path_start_theta(
             mandrel,
@@ -1211,7 +1249,7 @@ def _plan_axisymmetric_geodesic_layer(
             next_forward_path = _densify_surface_path(
                 mandrel,
                 next_forward_path,
-                max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
+                max_segment_length_mm=_axisymmetric_max_segment_length(spec),
             )
             start_turnaround = _smooth_dome_turnaround_path(
                 mandrel,
@@ -1220,6 +1258,7 @@ def _plan_axisymmetric_geodesic_layer(
                 safe_start_z_mm=safe_start_z,
                 safe_end_z_mm=safe_end_z,
                 point_count=spec.turnaround_points,
+                wrap_angle_deg=spec.turnaround_angle_deg,
             )
             next_forward_alignment_theta = float(start_turnaround.theta_rad[-1])
             chunks.append(
@@ -1319,7 +1358,7 @@ def _plan_axisymmetric_non_geodesic_layer(
         forward_path = _densify_surface_path(
             mandrel,
             forward_path,
-            max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
+            max_segment_length_mm=_axisymmetric_max_segment_length(spec),
         )
         if next_forward_alignment_theta is not None:
             forward_path = _align_path_start_theta(
@@ -1349,7 +1388,7 @@ def _plan_axisymmetric_non_geodesic_layer(
         return_path = _densify_surface_path(
             mandrel,
             return_path,
-            max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
+            max_segment_length_mm=_axisymmetric_max_segment_length(spec),
         )
         end_turnaround = _smooth_dome_turnaround_path(
             mandrel,
@@ -1358,6 +1397,7 @@ def _plan_axisymmetric_non_geodesic_layer(
             safe_start_z_mm=safe_start_z,
             safe_end_z_mm=safe_end_z,
             point_count=spec.turnaround_points,
+            wrap_angle_deg=spec.turnaround_angle_deg,
         )
         return_path = _align_path_start_theta(
             mandrel,
@@ -1401,7 +1441,7 @@ def _plan_axisymmetric_non_geodesic_layer(
             next_forward_path = _densify_surface_path(
                 mandrel,
                 next_forward_path,
-                max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
+                max_segment_length_mm=_axisymmetric_max_segment_length(spec),
             )
             start_turnaround = _smooth_dome_turnaround_path(
                 mandrel,
@@ -1410,6 +1450,7 @@ def _plan_axisymmetric_non_geodesic_layer(
                 safe_start_z_mm=safe_start_z,
                 safe_end_z_mm=safe_end_z,
                 point_count=spec.turnaround_points,
+                wrap_angle_deg=spec.turnaround_angle_deg,
             )
             next_forward_alignment_theta = float(start_turnaround.theta_rad[-1])
             chunks.append(
@@ -1879,29 +1920,28 @@ def _smooth_dome_turnaround_path(
     safe_start_z_mm: float,
     safe_end_z_mm: float,
     point_count: int,
+    wrap_angle_deg: float,
 ) -> SurfacePath:
-    count = max(17, int(point_count))
+    count = max(31, int(point_count))
     start_z = float(previous_path.z_mm[-1])
     end_z = float(next_path.z_mm[0])
     start_theta = float(previous_path.theta_rad[-1])
-    end_theta = start_theta + _unwrap_delta(start_theta, float(next_path.theta_rad[0]))
-    theta_delta = end_theta - start_theta
     boundary_z = _turnaround_boundary_z(
         start_z=start_z,
         safe_start_z_mm=safe_start_z_mm,
         safe_end_z_mm=safe_end_z_mm,
     )
-    z_mm, theta_rad = _min_diameter_tangent_turnaround_curve(
+    z_mm, theta_rad = _wrapped_dome_turnaround_curve(
         previous_path,
         next_path,
         start_z=start_z,
         end_z=end_z,
         boundary_z=boundary_z,
         start_theta=start_theta,
-        theta_delta=theta_delta,
         point_count=count,
         min_z=min(safe_start_z_mm, safe_end_z_mm),
         max_z=max(safe_start_z_mm, safe_end_z_mm),
+        wrap_angle_deg=wrap_angle_deg,
     )
     sample_count = int(z_mm.size)
     points = mandrel.surface_points(z_mm, theta_rad)
@@ -1942,7 +1982,7 @@ def _turnaround_boundary_z(
     return safe_end_z_mm
 
 
-def _min_diameter_tangent_turnaround_curve(
+def _wrapped_dome_turnaround_curve(
     previous_path: SurfacePath,
     next_path: SurfacePath,
     *,
@@ -1950,21 +1990,45 @@ def _min_diameter_tangent_turnaround_curve(
     end_z: float,
     boundary_z: float,
     start_theta: float,
-    theta_delta: float,
     point_count: int,
     min_z: float,
     max_z: float,
+    wrap_angle_deg: float,
 ) -> tuple[FloatArray, FloatArray]:
-    first_count = max(5, point_count // 2 + 1)
-    second_count = max(5, point_count - first_count + 2)
-    t_first = np.linspace(0.0, 1.0, first_count)
-    t_second = np.linspace(0.0, 1.0, second_count)
-    end_theta = start_theta + theta_delta
-    contact_theta = start_theta + theta_delta * 0.5
     slope_start = _path_endpoint_dz_dtheta(previous_path, at_start=False)
     slope_end = _path_endpoint_dz_dtheta(next_path, at_start=True)
-    first_theta_delta = contact_theta - start_theta
-    second_theta_delta = end_theta - contact_theta
+    target_end_theta = float(next_path.theta_rad[0])
+    target_delta = _unwrap_delta(start_theta, target_end_theta)
+    wrap_sign = _turnaround_wrap_sign(
+        start_z=start_z,
+        end_z=end_z,
+        boundary_z=boundary_z,
+        start_slope=slope_start,
+        end_slope=slope_end,
+        fallback_delta=target_delta,
+    )
+    wrap_angle_rad = math.radians(max(abs(wrap_angle_deg), 90.0)) * wrap_sign
+    blend_angle_abs = max(
+        math.radians(12.0),
+        min(abs(wrap_angle_rad) * 0.25, math.radians(45.0)),
+    )
+    total_theta_delta = _turnaround_total_theta_delta(
+        target_delta=target_delta,
+        direction=wrap_sign,
+        minimum_magnitude=abs(wrap_angle_rad) + 2.0 * blend_angle_abs,
+    )
+    blend_total = total_theta_delta - wrap_angle_rad
+    first_theta_delta = blend_total * 0.5
+    second_theta_delta = blend_total - first_theta_delta
+    first_count = max(12, point_count // 4 + 1)
+    wrap_count = max(9, point_count // 2 + 1)
+    second_count = max(12, point_count - first_count - wrap_count + 4)
+    t_first = np.linspace(0.0, 1.0, first_count)
+    t_wrap = np.linspace(0.0, 1.0, wrap_count)
+    t_second = np.linspace(0.0, 1.0, second_count)
+    contact_start_theta = start_theta + first_theta_delta
+    contact_end_theta = contact_start_theta + wrap_angle_rad
+    end_theta = start_theta + total_theta_delta
     m0 = slope_start * first_theta_delta
     m1 = slope_end * second_theta_delta
     first_z = _cubic_hermite(start_z, boundary_z, m0, 0.0, t_first)
@@ -1981,11 +2045,61 @@ def _min_diameter_tangent_turnaround_curve(
         m1 *= 0.5
         first_z = _cubic_hermite(start_z, boundary_z, m0, 0.0, t_first)
         second_z = _cubic_hermite(boundary_z, end_z, 0.0, m1, t_second)
-    first_theta = np.linspace(start_theta, contact_theta, first_count)
-    second_theta = np.linspace(contact_theta, end_theta, second_count)
-    z_mm = np.concatenate((first_z, second_z[1:]))
-    theta_rad = np.concatenate((first_theta, second_theta[1:]))
+    first_theta = np.linspace(start_theta, contact_start_theta, first_count)
+    wrap_theta = contact_start_theta + wrap_angle_rad * t_wrap
+    wrap_z = np.full(wrap_theta.shape, boundary_z, dtype=float)
+    second_theta = np.linspace(contact_end_theta, end_theta, second_count)
+    z_mm = np.concatenate((first_z, wrap_z[1:], second_z[1:]))
+    theta_rad = np.concatenate((first_theta, wrap_theta[1:], second_theta[1:]))
     return np.clip(z_mm, min_z, max_z), theta_rad
+
+
+def _turnaround_wrap_sign(
+    *,
+    start_z: float,
+    end_z: float,
+    boundary_z: float,
+    start_slope: float,
+    end_slope: float,
+    fallback_delta: float,
+) -> float:
+    candidates = []
+    if abs(start_slope) > 1e-9 and abs(boundary_z - start_z) > 1e-9:
+        candidates.append(math.copysign(1.0, (boundary_z - start_z) / start_slope))
+    if abs(end_slope) > 1e-9 and abs(end_z - boundary_z) > 1e-9:
+        candidates.append(math.copysign(1.0, (end_z - boundary_z) / end_slope))
+    if candidates:
+        score = sum(candidates)
+        if abs(score) > 1e-9:
+            return math.copysign(1.0, score)
+    if abs(fallback_delta) > 1e-9:
+        return math.copysign(1.0, fallback_delta)
+    return 1.0
+
+
+def _turnaround_total_theta_delta(
+    *,
+    target_delta: float,
+    direction: float,
+    minimum_magnitude: float,
+) -> float:
+    direction = math.copysign(1.0, direction)
+    best_delta: float | None = None
+    best_score: tuple[float, float] | None = None
+    for turns in range(-6, 7):
+        candidate = target_delta + turns * 2.0 * math.pi
+        if math.copysign(1.0, candidate if abs(candidate) > 1e-12 else direction) != direction:
+            continue
+        if abs(candidate) < minimum_magnitude:
+            continue
+        score = (abs(abs(candidate) - minimum_magnitude), abs(candidate))
+        if best_score is None or score < best_score:
+            best_delta = candidate
+            best_score = score
+    if best_delta is not None:
+        return best_delta
+    turns_needed = math.ceil((minimum_magnitude - abs(target_delta)) / (2.0 * math.pi))
+    return target_delta + direction * max(1, turns_needed) * 2.0 * math.pi
 
 
 def _cubic_hermite(
@@ -2350,6 +2464,10 @@ def _axisymmetric_pass_count(
     if spec.number_of_passes is not None:
         return spec.number_of_passes
     return coverage_passes
+
+
+def _axisymmetric_max_segment_length(spec: WindingLayerSpec) -> float:
+    return max(spec.tow_width_mm * 1.25, 8.0)
 
 
 def _even_axisymmetric_lane_count(

@@ -135,9 +135,10 @@ def test_node_workspace_uses_canvas_left_tools_right_layout() -> None:
     assert "bottom_tabs.addTab(library_panel, \"Node Library\")" in source
     assert "toolbar_scroll.setWidget(toolbar_widget)" in source
     assert "container_layout.addWidget(toolbar_scroll)" in source
-    assert "tabs.setVisible(False)" in controls_source
+    assert "workflow = qt_widgets.QSplitter" in controls_source
+    assert "layout.addWidget(workflow, 1)" in controls_source
     assert 'tabs.addTab(nodes_tab, "Nodes")' not in controls_source
-    assert "layout.addWidget(nodes_tab, 1)" in controls_source
+    assert "layout.addWidget(nodes_tab, 1)" not in controls_source
 
 
 def test_gui_button_connections_use_safe_action_wrapper() -> None:
@@ -658,6 +659,7 @@ def test_node_linking_layer_stack_table_and_tow_band_rendering_are_supported() -
         [
             inspect.getsource(_PreviewWindow._display_tow_band_mesh),
             inspect.getsource(_PreviewWindow._render_node_graph_scene),
+            inspect.getsource(_PreviewWindow._draw_backend_program_scene),
         ]
     )
 

@@ -422,6 +422,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     profile_dome.add_argument("--circuits", type=int, default=1, help="Out-and-back cycles")
     profile_dome.add_argument(
+        "--phase-offset",
+        type=float,
+        default=None,
+        help="Inter-circuit phase offset in degrees (default: 360/circuits)",
+    )
+    profile_dome.add_argument(
         "--clearance",
         type=float,
         default=25.0,
@@ -1318,14 +1324,21 @@ def _run_profile_dome(args: argparse.Namespace) -> int:
     if profile is None:
         return 1
     try:
+        circuits = max(1, args.circuits)
+        phase_offset = (
+            args.phase_offset
+            if args.phase_offset is not None
+            else (360.0 / circuits if circuits > 1 else 0.0)
+        )
         config = ProfileDomePathConfig(
             winding_angle_deg=args.angle,
             tow_width_mm=args.tow_width,
             points_per_span=args.points,
             turnaround_points=args.turnaround_points,
             turnaround_angle_deg=args.turnaround_angle,
-            circuits=args.circuits,
+            circuits=circuits,
             turnaround_radius_mm=args.turnaround_radius,
+            phase_offset_deg=phase_offset,
         )
         generator = ProfileDomePathGenerator(profile, config)
         surface_path = generator.generate()

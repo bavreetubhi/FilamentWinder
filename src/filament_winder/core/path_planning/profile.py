@@ -249,9 +249,9 @@ class ProfileTurnaroundPathGenerator:
 class ProfileDomePathConfig:
     """Dome-aware profile winding settings.
 
-    The requested winding angle is the cylinder/max-radius helix angle. On
-    smaller dome radii the local angle follows Clairaut's relation until the
-    path reaches the computed or user-provided turnaround radius.
+    The winding angle is held constant across the dome spans (same as the
+    cylinder helix angle). Turnaround segments blend from the helix angle
+    to 90° (hoop) at constant Z.
     """
 
     winding_angle_deg: float
@@ -262,6 +262,7 @@ class ProfileDomePathConfig:
     circuits: int = 1
     start_theta_rad: float = 0.0
     turnaround_radius_mm: float | None = None
+    phase_offset_deg: float = 0.0
 
     def clairaut_radius_mm(self, mandrel: AxisymmetricProfileMandrel) -> float:
         return float(mandrel.max_radius_mm * np.sin(np.deg2rad(self.winding_angle_deg)))
@@ -301,7 +302,7 @@ class ProfileDomePathConfig:
 
 
 class ProfileDomePathGenerator:
-    """Generate a profile winding path with geodesic dome approach and helix spans."""
+    """Generate a profile winding path with constant-angle dome spans and helix spans."""
 
     def __init__(
         self,
@@ -325,23 +326,24 @@ class ProfileDomePathGenerator:
         pass_chunks: list[np.ndarray] = []
         theta_start = self.config.start_theta_rad
         pass_number = 0
+        phase_offset_rad = np.deg2rad(self.config.phase_offset_deg)
+        helix_angle_deg = self.config.winding_angle_deg
 
-        for _circuit in range(self.config.circuits):
+        for circuit_idx in range(self.config.circuits):
+            circuit_phase_offset = circuit_idx * phase_offset_rad
+
             forward_z = np.linspace(
                 self.safe_zone.start_z_mm,
                 self.safe_zone.end_z_mm,
                 self.config.points_per_span,
             )
-            forward_theta = theta_start + _theta_increment_along_dome_geodesic(
+            forward_theta = theta_start + circuit_phase_offset + _theta_increment_along_profile(
                 self.mandrel,
                 forward_z,
-                clairaut_radius_mm=self.clairaut_radius_mm,
+                winding_angle_deg=helix_angle_deg,
+                min_radius_mm=self.turnaround_radius_mm,
             )
-            forward_angles = _dome_winding_angles_deg(
-                self.mandrel,
-                forward_z,
-                clairaut_radius_mm=self.clairaut_radius_mm,
-            )
+            forward_angles = np.full_like(forward_z, helix_angle_deg)
             _append_dome_segment(
                 z_chunks,
                 theta_chunks,
@@ -359,7 +361,7 @@ class ProfileDomePathGenerator:
                 self.config.turnaround_points,
             )
             end_turn_z = np.full(end_turn_theta.shape, self.safe_zone.end_z_mm, dtype=float)
-            end_turn_angles = np.full(end_turn_theta.shape, 90.0, dtype=float)
+            end_turn_angles = np.linspace(helix_angle_deg, 90.0, self.config.turnaround_points)
             _append_dome_segment(
                 z_chunks,
                 theta_chunks,
@@ -378,16 +380,13 @@ class ProfileDomePathGenerator:
                 self.safe_zone.start_z_mm,
                 self.config.points_per_span,
             )
-            return_theta = end_turn_theta[-1] + _theta_increment_along_dome_geodesic(
+            return_theta = end_turn_theta[-1] + _theta_increment_along_profile(
                 self.mandrel,
                 return_z,
-                clairaut_radius_mm=self.clairaut_radius_mm,
+                winding_angle_deg=helix_angle_deg,
+                min_radius_mm=self.turnaround_radius_mm,
             )
-            return_angles = _dome_winding_angles_deg(
-                self.mandrel,
-                return_z,
-                clairaut_radius_mm=self.clairaut_radius_mm,
-            )
+            return_angles = np.full_like(return_z, helix_angle_deg)
             _append_dome_segment(
                 z_chunks,
                 theta_chunks,
@@ -410,7 +409,7 @@ class ProfileDomePathGenerator:
                 self.safe_zone.start_z_mm,
                 dtype=float,
             )
-            start_turn_angles = np.full(start_turn_theta.shape, 90.0, dtype=float)
+            start_turn_angles = np.linspace(helix_angle_deg, 90.0, self.config.turnaround_points)
             _append_dome_segment(
                 z_chunks,
                 theta_chunks,
@@ -530,7 +529,8 @@ def _theta_increment_along_dome_geodesic(
         out=np.full(radius_mid.shape, np.inf, dtype=float),
         where=denominator > 1e-9,
     )
-    tan_alpha = np.minimum(tan_alpha, np.tan(np.deg2rad(89.0)))
+    max_tan = np.tan(np.deg2rad(80.0))
+    tan_alpha = np.minimum(tan_alpha, max_tan)
     dtheta_dz_magnitude = tan_alpha * meridian_scale / radius_mid
     dtheta_dz_magnitude = _fill_nonfinite_with_nearest(dtheta_dz_magnitude)
     areas = dtheta_dz_magnitude * np.abs(z_end - z_start)

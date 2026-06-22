@@ -75,6 +75,28 @@ Optional live preview dependencies:
 pip install -e .[gui]
 ```
 
+## Run
+
+Use the root launcher for day-to-day startup:
+
+```bash
+python run.py
+```
+
+Launcher modes:
+
+```bash
+python run.py gui            # open the normal GUI
+python run.py debug          # open the GUI with extra debug logging
+python run.py cli --help     # show all CLI commands
+```
+
+CLI commands can be passed through after `cli`:
+
+```bash
+python run.py cli generate --config examples/cylinder_stack.yaml
+```
+
 ## Generate a cylinder winding path
 
 ```bash
