@@ -365,6 +365,10 @@ def graph_from_winding_config(config: WindingJobConfig) -> NodeGraphState:
             node.settings.update(_normalise_config_value(asdict(config.machine)))
         elif node.type_id == "mandrel_backend":
             node.settings.update(_normalise_config_value(asdict(config.mandrel)))
+            if config.mandrel.min_wind_radius_mm is not None:
+                node.settings["min_wind_diameter_mm"] = (
+                    float(config.mandrel.min_wind_radius_mm) * 2.0
+                )
         elif node.type_id == "tow_backend":
             node.settings.update(_normalise_config_value(asdict(config.tow)))
         elif node.type_id == "layer_stack_backend":
@@ -609,6 +613,9 @@ def _backend_check_log(
     lines = ["Backend Check", "-------------"]
     lines.extend(f"{label}: {'PASS' if passed else 'FAIL'}" for label, passed in checks.items())
     backend_ready = bool(result.summary.get("backend_ready", overall_ready))
+    min_wind_radius = result.summary.get("mandrel", {}).get("min_wind_radius_mm")
+    if min_wind_radius is not None:
+        lines.append(f"Min wind radius mm: {float(min_wind_radius):.3f}")
     lines.append(f"Backend-ready: {str(backend_ready).lower()}")
     lines.append(f"Machine-ready: {str(machine_ready).lower()}")
     lines.append(f"Overall backend-ready: {str(overall_ready).lower()}")
@@ -958,6 +965,7 @@ def _float_or_default(value: Any, default: float) -> float:
 def _mandrel_mapping(mandrel: Mapping[str, Any]) -> dict[str, Any]:
     mode = str(mandrel.get("mode", "")).lower()
     mandrel_type = str(mandrel.get("type", "cylinder_with_elliptical_domes"))
+    min_wind_radius_mm = _min_wind_radius_from_mandrel_node(mandrel)
     if mode in {"profile", "custom", "dxf"} or mandrel_type in {
         "axisymmetric_profile",
         "profile",
@@ -968,6 +976,7 @@ def _mandrel_mapping(mandrel: Mapping[str, Any]) -> dict[str, Any]:
             "samples": int(mandrel.get("samples", 0) or 0),
             "length_mm": float(mandrel.get("length_mm", 1000.0)),
             "radius_mm": float(mandrel.get("radius_mm", 100.0)),
+            "min_wind_radius_mm": min_wind_radius_mm,
             "mesh_points_z": int(mandrel.get("mesh_points_z", 240)),
             "mesh_points_theta": int(mandrel.get("mesh_points_theta", 180)),
         }
@@ -976,6 +985,7 @@ def _mandrel_mapping(mandrel: Mapping[str, Any]) -> dict[str, Any]:
             "type": "cylinder",
             "length_mm": float(mandrel.get("length_mm", 1000.0)),
             "radius_mm": float(mandrel.get("radius_mm", 100.0)),
+            "min_wind_radius_mm": min_wind_radius_mm,
             "mesh_points_z": int(mandrel.get("mesh_points_z", 240)),
             "mesh_points_theta": int(mandrel.get("mesh_points_theta", 180)),
         }
@@ -988,11 +998,22 @@ def _mandrel_mapping(mandrel: Mapping[str, Any]) -> dict[str, Any]:
         "left_dome_length_mm": float(mandrel.get("left_dome_length_mm", 0.0)),
         "right_dome_length_mm": float(mandrel.get("right_dome_length_mm", 0.0)),
         "polar_opening_radius_mm": float(mandrel.get("polar_opening_radius_mm", 0.0)),
+        "min_wind_radius_mm": min_wind_radius_mm,
         "profile_path": str(mandrel.get("profile_path", "mandrels/profile.dxf")),
         "samples": int(mandrel.get("samples", 0) or 0),
         "mesh_points_z": int(mandrel.get("mesh_points_z", 240)),
         "mesh_points_theta": int(mandrel.get("mesh_points_theta", 180)),
     }
+
+
+def _min_wind_radius_from_mandrel_node(mandrel: Mapping[str, Any]) -> float | None:
+    diameter = mandrel.get("min_wind_diameter_mm")
+    if diameter not in {None, ""}:
+        return float(diameter) / 2.0
+    radius = mandrel.get("min_wind_radius_mm")
+    if radius in {None, ""}:
+        return None
+    return float(radius)
 
 
 def _pin_layout_mapping(pins: Mapping[str, Any]) -> dict[str, Any]:

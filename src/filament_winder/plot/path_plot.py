@@ -205,7 +205,7 @@ def plot_dome_motion_diagnostics(
     plots: list[Path] = []
 
     shell_types = {"geodesic_pass", "non_geodesic_pass", "wind"}
-    boss_types = {"BossTurnaroundArc"}
+    boss_types = {"BossTurnaroundArc", "DomeTurnaround"}
     transition_types = {"transition", "PinTransition", "FreeSpan", "PinContactArc"}
 
     shell_path = output_dir / "dome_shell_only_unwrapped.png"

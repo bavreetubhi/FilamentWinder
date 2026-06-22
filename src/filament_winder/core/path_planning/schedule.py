@@ -17,7 +17,9 @@ from filament_winder.core.kinematics.four_axis import (
 )
 from filament_winder.core.path_planning.geodesic import (
     ControlledAnglePathConfig,
+    GeodesicPathConfig,
     generate_controlled_angle_path,
+    generate_geodesic_path,
 )
 from filament_winder.core.path_planning.helical import (
     HelicalPathConfig,
@@ -33,6 +35,7 @@ from filament_winder.core.path_planning.profile import (
     ProfileDomePathGenerator,
     ProfileTurnaroundPathConfig,
     ProfileTurnaroundPathGenerator,
+    find_profile_safe_zone,
 )
 from filament_winder.core.validation import ValidationIssue, ValidationReport
 
@@ -465,11 +468,12 @@ def axisymmetric_surface_coverage_map(
                 np.abs(z_grid - float(pass_z[0])) <= surface_path.tow_width_mm / 2.0
             ).astype(int)
             continue
+        pass_theta_unwrapped = np.unwrap(pass_theta)
         order = np.argsort(pass_z)
         unique_z, unique_indices = np.unique(pass_z[order], return_index=True)
         if unique_z.size < 2:
             continue
-        unique_theta = pass_theta[order][unique_indices]
+        unique_theta = pass_theta_unwrapped[order][unique_indices]
         theta_expected = np.interp(z_grid[:, 0], unique_z, unique_theta)
         theta_expected_grid = theta_expected[:, np.newaxis]
         circumference_grid = 2.0 * np.pi * radius_grid
@@ -1052,29 +1056,71 @@ def _plan_axisymmetric_geodesic_layer(
     spec: WindingLayerSpec,
     theta_offset_rad: float,
 ) -> tuple[SurfacePath, WindingPatternReport, tuple[str, ...]]:
-    start_z, end_z = _axisymmetric_turnaround_z_bounds(mandrel, spec)
+    safe_radius = _axisymmetric_safe_turnaround_radius(mandrel, spec)
+    start_z, end_z, safe_start_z, safe_end_z = _axisymmetric_turnaround_z_bounds(
+        mandrel,
+        spec,
+    )
     selected_legs = _even_axisymmetric_lane_count(mandrel, spec)
     circuits = max(1, selected_legs // 2)
     phase_offset = (
         360.0 / selected_legs if spec.phase_offset_deg is None else spec.phase_offset_deg
     )
+    phase_offset_rad = math.radians(phase_offset)
+    reference_z = _axisymmetric_reference_z(mandrel, start_z, end_z)
+    forward_reference_path, _forward_reference_diagnostics = generate_geodesic_path(
+        mandrel,
+        GeodesicPathConfig(
+            initial_angle_deg=abs(spec.target_angle_deg),
+            tow_width_mm=spec.tow_width_mm,
+            start_z_mm=start_z,
+            end_z_mm=end_z,
+            start_theta_rad=0.0,
+            direction="positive",
+            turnaround_radius_mm=safe_radius,
+            reference_radius_mm=mandrel.max_radius_mm,
+            point_count=spec.point_count,
+        ),
+    )
+    return_reference_path, _return_reference_diagnostics = generate_geodesic_path(
+        mandrel,
+        GeodesicPathConfig(
+            initial_angle_deg=abs(spec.target_angle_deg),
+            tow_width_mm=spec.tow_width_mm,
+            start_z_mm=start_z,
+            end_z_mm=end_z,
+            start_theta_rad=0.0,
+            direction="negative",
+            turnaround_radius_mm=safe_radius,
+            reference_radius_mm=mandrel.max_radius_mm,
+            point_count=spec.point_count,
+        ),
+    )
+    forward_reference_theta = _path_theta_at_z(forward_reference_path, reference_z)
+    return_reference_theta = _path_theta_at_z(return_reference_path, reference_z)
     chunks = []
     warnings: list[str] = []
     motion_chunks: list[tuple[str, ...]] = []
-    current_start_theta = theta_offset_rad
+    next_forward_alignment_theta: float | None = None
     for circuit_number in range(circuits):
-        start_theta = current_start_theta
-        forward_path, forward_diagnostics = generate_controlled_angle_path(
+        forward_lane = circuit_number * 2
+        return_lane = forward_lane + 1
+        start_theta = (
+            theta_offset_rad
+            + forward_lane * phase_offset_rad
+            - forward_reference_theta
+        )
+        forward_path, forward_diagnostics = generate_geodesic_path(
             mandrel,
-            ControlledAnglePathConfig(
-                target_angle_deg=abs(spec.target_angle_deg),
+            GeodesicPathConfig(
+                initial_angle_deg=abs(spec.target_angle_deg),
                 tow_width_mm=spec.tow_width_mm,
                 start_z_mm=start_z,
                 end_z_mm=end_z,
                 start_theta_rad=start_theta,
                 direction="positive",
-                allowed_angle_error_deg=90.0,
-                high_slip_risk_deg=90.0,
+                turnaround_radius_mm=safe_radius,
+                reference_radius_mm=mandrel.max_radius_mm,
                 point_count=spec.point_count,
             ),
         )
@@ -1083,18 +1129,29 @@ def _plan_axisymmetric_geodesic_layer(
             forward_path,
             max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
         )
-        return_start_theta = float(forward_path.theta_rad[-1]) + math.radians(phase_offset)
-        return_path, return_diagnostics = generate_controlled_angle_path(
+        if next_forward_alignment_theta is not None:
+            forward_path = _align_path_start_theta(
+                mandrel,
+                forward_path,
+                next_forward_alignment_theta,
+            )
+            next_forward_alignment_theta = None
+        return_start_theta = (
+            theta_offset_rad
+            + return_lane * phase_offset_rad
+            - return_reference_theta
+        )
+        return_path, return_diagnostics = generate_geodesic_path(
             mandrel,
-            ControlledAnglePathConfig(
-                target_angle_deg=abs(spec.target_angle_deg),
+            GeodesicPathConfig(
+                initial_angle_deg=abs(spec.target_angle_deg),
                 tow_width_mm=spec.tow_width_mm,
                 start_z_mm=start_z,
                 end_z_mm=end_z,
                 start_theta_rad=return_start_theta,
                 direction="negative",
-                allowed_angle_error_deg=90.0,
-                high_slip_risk_deg=90.0,
+                turnaround_radius_mm=safe_radius,
+                reference_radius_mm=mandrel.max_radius_mm,
                 point_count=spec.point_count,
             ),
         )
@@ -1103,48 +1160,77 @@ def _plan_axisymmetric_geodesic_layer(
             return_path,
             max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
         )
-        end_turnaround = _constant_z_turnaround_arc(
+        end_turnaround = _smooth_dome_turnaround_path(
             mandrel,
-            z_mm=float(forward_path.z_mm[-1]),
-            start_theta_rad=float(forward_path.theta_rad[-1]),
-            end_theta_rad=return_start_theta,
-            tow_width_mm=spec.tow_width_mm,
-            winding_angle_deg=abs(spec.target_angle_deg),
+            previous_path=forward_path,
+            next_path=return_path,
+            safe_start_z_mm=safe_start_z,
+            safe_end_z_mm=safe_end_z,
             point_count=spec.turnaround_points,
         )
-        chunks.append(_with_pass_index(forward_path, circuit_number * 2))
+        return_path = _align_path_start_theta(
+            mandrel,
+            return_path,
+            float(end_turnaround.theta_rad[-1]),
+        )
+        forward_output = (
+            _drop_first_point(forward_path) if circuit_number > 0 else forward_path
+        )
+        chunks.append(_with_pass_index(forward_output, circuit_number * 2))
         chunks.append(_with_pass_index(_drop_first_point(end_turnaround), circuit_number * 2))
         return_path = _drop_first_point(return_path)
         chunks.append(_with_pass_index(return_path, circuit_number * 2 + 1))
-        motion_chunks.append(tuple("wind" for _ in range(forward_path.point_count)))
+        motion_chunks.append(tuple("wind" for _ in range(forward_output.point_count)))
         motion_chunks.append(
             tuple(
-                "BossTurnaroundArc"
+                "DomeTurnaround"
                 for _ in range(max(end_turnaround.point_count - 1, 0))
             )
         )
         motion_chunks.append(tuple("wind" for _ in range(return_path.point_count)))
-        next_start_theta = current_start_theta + math.radians(2.0 * phase_offset)
         if circuit_number < circuits - 1:
-            start_turnaround = _constant_z_turnaround_arc(
+            next_start_theta = (
+                theta_offset_rad
+                + (forward_lane + 2) * phase_offset_rad
+                - forward_reference_theta
+            )
+            next_forward_path, _next_forward_diagnostics = generate_geodesic_path(
                 mandrel,
-                z_mm=float(return_path.z_mm[-1]),
-                start_theta_rad=float(return_path.theta_rad[-1]),
-                end_theta_rad=next_start_theta,
-                tow_width_mm=spec.tow_width_mm,
-                winding_angle_deg=abs(spec.target_angle_deg),
+                GeodesicPathConfig(
+                    initial_angle_deg=abs(spec.target_angle_deg),
+                    tow_width_mm=spec.tow_width_mm,
+                    start_z_mm=start_z,
+                    end_z_mm=end_z,
+                    start_theta_rad=next_start_theta,
+                    direction="positive",
+                    turnaround_radius_mm=safe_radius,
+                    reference_radius_mm=mandrel.max_radius_mm,
+                    point_count=spec.point_count,
+                ),
+            )
+            next_forward_path = _densify_surface_path(
+                mandrel,
+                next_forward_path,
+                max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
+            )
+            start_turnaround = _smooth_dome_turnaround_path(
+                mandrel,
+                previous_path=return_path,
+                next_path=next_forward_path,
+                safe_start_z_mm=safe_start_z,
+                safe_end_z_mm=safe_end_z,
                 point_count=spec.turnaround_points,
             )
+            next_forward_alignment_theta = float(start_turnaround.theta_rad[-1])
             chunks.append(
                 _with_pass_index(_drop_first_point(start_turnaround), circuit_number * 2 + 1)
             )
             motion_chunks.append(
                 tuple(
-                    "BossTurnaroundArc"
+                    "DomeTurnaround"
                     for _ in range(max(start_turnaround.point_count - 1, 0))
                 )
             )
-            current_start_theta = float(start_turnaround.theta_rad[-1])
         warnings.extend(forward_diagnostics.warning_flags)
         warnings.extend(return_diagnostics.warning_flags)
     path = _concatenate_surface_paths(chunks)
@@ -1166,18 +1252,57 @@ def _plan_axisymmetric_non_geodesic_layer(
     spec: WindingLayerSpec,
     theta_offset_rad: float,
 ) -> tuple[SurfacePath, WindingPatternReport, tuple[str, ...]]:
-    start_z, end_z = _axisymmetric_turnaround_z_bounds(mandrel, spec)
+    start_z, end_z, safe_start_z, safe_end_z = _axisymmetric_turnaround_z_bounds(
+        mandrel,
+        spec,
+    )
     selected_legs = _even_axisymmetric_lane_count(mandrel, spec)
     circuits = max(1, selected_legs // 2)
     phase_offset = (
         360.0 / selected_legs if spec.phase_offset_deg is None else spec.phase_offset_deg
     )
+    phase_offset_rad = math.radians(phase_offset)
+    reference_z = _axisymmetric_reference_z(mandrel, start_z, end_z)
+    forward_reference_path, _forward_reference_diagnostics = generate_controlled_angle_path(
+        mandrel,
+        ControlledAnglePathConfig(
+            target_angle_deg=abs(spec.target_angle_deg),
+            tow_width_mm=spec.tow_width_mm,
+            start_z_mm=start_z,
+            end_z_mm=end_z,
+            start_theta_rad=0.0,
+            direction="positive",
+            reference_radius_mm=mandrel.max_radius_mm,
+            point_count=spec.point_count,
+        ),
+    )
+    return_reference_path, _return_reference_diagnostics = generate_controlled_angle_path(
+        mandrel,
+        ControlledAnglePathConfig(
+            target_angle_deg=abs(spec.target_angle_deg),
+            tow_width_mm=spec.tow_width_mm,
+            start_z_mm=start_z,
+            end_z_mm=end_z,
+            start_theta_rad=0.0,
+            direction="negative",
+            reference_radius_mm=mandrel.max_radius_mm,
+            point_count=spec.point_count,
+        ),
+    )
+    forward_reference_theta = _path_theta_at_z(forward_reference_path, reference_z)
+    return_reference_theta = _path_theta_at_z(return_reference_path, reference_z)
     chunks = []
     warnings: list[str] = []
     motion_chunks: list[tuple[str, ...]] = []
-    current_start_theta = theta_offset_rad
+    next_forward_alignment_theta: float | None = None
     for circuit_number in range(circuits):
-        start_theta = current_start_theta
+        forward_lane = circuit_number * 2
+        return_lane = forward_lane + 1
+        start_theta = (
+            theta_offset_rad
+            + forward_lane * phase_offset_rad
+            - forward_reference_theta
+        )
         forward_path, forward_diagnostics = generate_controlled_angle_path(
             mandrel,
             ControlledAnglePathConfig(
@@ -1187,6 +1312,7 @@ def _plan_axisymmetric_non_geodesic_layer(
                 end_z_mm=end_z,
                 start_theta_rad=start_theta,
                 direction="positive",
+                reference_radius_mm=mandrel.max_radius_mm,
                 point_count=spec.point_count,
             ),
         )
@@ -1195,7 +1321,18 @@ def _plan_axisymmetric_non_geodesic_layer(
             forward_path,
             max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
         )
-        return_start_theta = float(forward_path.theta_rad[-1]) + math.radians(phase_offset)
+        if next_forward_alignment_theta is not None:
+            forward_path = _align_path_start_theta(
+                mandrel,
+                forward_path,
+                next_forward_alignment_theta,
+            )
+            next_forward_alignment_theta = None
+        return_start_theta = (
+            theta_offset_rad
+            + return_lane * phase_offset_rad
+            - return_reference_theta
+        )
         return_path, return_diagnostics = generate_controlled_angle_path(
             mandrel,
             ControlledAnglePathConfig(
@@ -1205,6 +1342,7 @@ def _plan_axisymmetric_non_geodesic_layer(
                 end_z_mm=end_z,
                 start_theta_rad=return_start_theta,
                 direction="negative",
+                reference_radius_mm=mandrel.max_radius_mm,
                 point_count=spec.point_count,
             ),
         )
@@ -1213,48 +1351,76 @@ def _plan_axisymmetric_non_geodesic_layer(
             return_path,
             max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
         )
-        end_turnaround = _constant_z_turnaround_arc(
+        end_turnaround = _smooth_dome_turnaround_path(
             mandrel,
-            z_mm=float(forward_path.z_mm[-1]),
-            start_theta_rad=float(forward_path.theta_rad[-1]),
-            end_theta_rad=return_start_theta,
-            tow_width_mm=spec.tow_width_mm,
-            winding_angle_deg=abs(spec.target_angle_deg),
+            previous_path=forward_path,
+            next_path=return_path,
+            safe_start_z_mm=safe_start_z,
+            safe_end_z_mm=safe_end_z,
             point_count=spec.turnaround_points,
         )
-        chunks.append(_with_pass_index(forward_path, circuit_number * 2))
+        return_path = _align_path_start_theta(
+            mandrel,
+            return_path,
+            float(end_turnaround.theta_rad[-1]),
+        )
+        forward_output = (
+            _drop_first_point(forward_path) if circuit_number > 0 else forward_path
+        )
+        chunks.append(_with_pass_index(forward_output, circuit_number * 2))
         chunks.append(_with_pass_index(_drop_first_point(end_turnaround), circuit_number * 2))
         return_path = _drop_first_point(return_path)
         chunks.append(_with_pass_index(return_path, circuit_number * 2 + 1))
-        motion_chunks.append(tuple("wind" for _ in range(forward_path.point_count)))
+        motion_chunks.append(tuple("wind" for _ in range(forward_output.point_count)))
         motion_chunks.append(
             tuple(
-                "BossTurnaroundArc"
+                "DomeTurnaround"
                 for _ in range(max(end_turnaround.point_count - 1, 0))
             )
         )
         motion_chunks.append(tuple("wind" for _ in range(return_path.point_count)))
-        next_start_theta = current_start_theta + math.radians(2.0 * phase_offset)
         if circuit_number < circuits - 1:
-            start_turnaround = _constant_z_turnaround_arc(
+            next_start_theta = (
+                theta_offset_rad
+                + (forward_lane + 2) * phase_offset_rad
+                - forward_reference_theta
+            )
+            next_forward_path, _next_forward_diagnostics = generate_controlled_angle_path(
                 mandrel,
-                z_mm=float(return_path.z_mm[-1]),
-                start_theta_rad=float(return_path.theta_rad[-1]),
-                end_theta_rad=next_start_theta,
-                tow_width_mm=spec.tow_width_mm,
-                winding_angle_deg=abs(spec.target_angle_deg),
+                ControlledAnglePathConfig(
+                    target_angle_deg=abs(spec.target_angle_deg),
+                    tow_width_mm=spec.tow_width_mm,
+                    start_z_mm=start_z,
+                    end_z_mm=end_z,
+                    start_theta_rad=next_start_theta,
+                    direction="positive",
+                    reference_radius_mm=mandrel.max_radius_mm,
+                    point_count=spec.point_count,
+                ),
+            )
+            next_forward_path = _densify_surface_path(
+                mandrel,
+                next_forward_path,
+                max_segment_length_mm=max(spec.tow_width_mm * 2.0, 12.0),
+            )
+            start_turnaround = _smooth_dome_turnaround_path(
+                mandrel,
+                previous_path=return_path,
+                next_path=next_forward_path,
+                safe_start_z_mm=safe_start_z,
+                safe_end_z_mm=safe_end_z,
                 point_count=spec.turnaround_points,
             )
+            next_forward_alignment_theta = float(start_turnaround.theta_rad[-1])
             chunks.append(
                 _with_pass_index(_drop_first_point(start_turnaround), circuit_number * 2 + 1)
             )
             motion_chunks.append(
                 tuple(
-                    "BossTurnaroundArc"
+                    "DomeTurnaround"
                     for _ in range(max(start_turnaround.point_count - 1, 0))
                 )
             )
-            current_start_theta = float(start_turnaround.theta_rad[-1])
         warnings.extend(forward_diagnostics.warning_flags)
         warnings.extend(return_diagnostics.warning_flags)
     path = _concatenate_surface_paths(chunks)
@@ -1655,6 +1821,29 @@ def _drop_first_point(path: SurfacePath) -> SurfacePath:
     )
 
 
+def _align_path_start_theta(
+    mandrel: MandrelLike,
+    path: SurfacePath,
+    target_start_theta_rad: float,
+) -> SurfacePath:
+    theta_rad = np.asarray(path.theta_rad, dtype=float)
+    if theta_rad.size == 0:
+        return path
+    offset = target_start_theta_rad - theta_rad[0]
+    aligned_theta = theta_rad + offset
+    points = mandrel.surface_points(path.z_mm, aligned_theta)
+    return SurfacePath(
+        z_mm=path.z_mm,
+        theta_rad=aligned_theta,
+        x_mm=points[:, 0],
+        y_mm=points[:, 1],
+        winding_angle_deg=path.winding_angle_deg,
+        tow_width_mm=path.tow_width_mm,
+        pass_index=path.pass_index,
+        tow_eye_angle_deg=path.tow_eye_angle_deg,
+    )
+
+
 def _constant_z_turnaround_arc(
     mandrel: MandrelLike,
     *,
@@ -1680,6 +1869,156 @@ def _constant_z_turnaround_arc(
         pass_index=np.zeros(theta_rad.shape, dtype=int),
         tow_eye_angle_deg=np.full(theta_rad.shape, 90.0, dtype=float),
     )
+
+
+def _smooth_dome_turnaround_path(
+    mandrel: AxisymmetricProfileMandrel,
+    *,
+    previous_path: SurfacePath,
+    next_path: SurfacePath,
+    safe_start_z_mm: float,
+    safe_end_z_mm: float,
+    point_count: int,
+) -> SurfacePath:
+    count = max(17, int(point_count))
+    start_z = float(previous_path.z_mm[-1])
+    end_z = float(next_path.z_mm[0])
+    start_theta = float(previous_path.theta_rad[-1])
+    end_theta = start_theta + _unwrap_delta(start_theta, float(next_path.theta_rad[0]))
+    theta_delta = end_theta - start_theta
+    boundary_z = _turnaround_boundary_z(
+        start_z=start_z,
+        safe_start_z_mm=safe_start_z_mm,
+        safe_end_z_mm=safe_end_z_mm,
+    )
+    z_mm, theta_rad = _min_diameter_tangent_turnaround_curve(
+        previous_path,
+        next_path,
+        start_z=start_z,
+        end_z=end_z,
+        boundary_z=boundary_z,
+        start_theta=start_theta,
+        theta_delta=theta_delta,
+        point_count=count,
+        min_z=min(safe_start_z_mm, safe_end_z_mm),
+        max_z=max(safe_start_z_mm, safe_end_z_mm),
+    )
+    sample_count = int(z_mm.size)
+    points = mandrel.surface_points(z_mm, theta_rad)
+    tow_eye_angle = _local_winding_angle(
+        SurfacePath(
+            z_mm=z_mm,
+            theta_rad=theta_rad,
+            x_mm=points[:, 0],
+            y_mm=points[:, 1],
+            winding_angle_deg=previous_path.winding_angle_deg,
+            tow_width_mm=previous_path.tow_width_mm,
+            pass_index=np.zeros(sample_count, dtype=int),
+        )
+    )
+    if tow_eye_angle.size:
+        tow_eye_angle[0] = _path_b_angle(previous_path)[-1]
+        tow_eye_angle[-1] = _path_b_angle(next_path)[0]
+    return SurfacePath(
+        z_mm=z_mm,
+        theta_rad=theta_rad,
+        x_mm=points[:, 0],
+        y_mm=points[:, 1],
+        winding_angle_deg=previous_path.winding_angle_deg,
+        tow_width_mm=previous_path.tow_width_mm,
+        pass_index=np.zeros(sample_count, dtype=int),
+        tow_eye_angle_deg=tow_eye_angle,
+    )
+
+
+def _turnaround_boundary_z(
+    *,
+    start_z: float,
+    safe_start_z_mm: float,
+    safe_end_z_mm: float,
+) -> float:
+    if abs(start_z - safe_start_z_mm) <= abs(start_z - safe_end_z_mm):
+        return safe_start_z_mm
+    return safe_end_z_mm
+
+
+def _min_diameter_tangent_turnaround_curve(
+    previous_path: SurfacePath,
+    next_path: SurfacePath,
+    *,
+    start_z: float,
+    end_z: float,
+    boundary_z: float,
+    start_theta: float,
+    theta_delta: float,
+    point_count: int,
+    min_z: float,
+    max_z: float,
+) -> tuple[FloatArray, FloatArray]:
+    first_count = max(5, point_count // 2 + 1)
+    second_count = max(5, point_count - first_count + 2)
+    t_first = np.linspace(0.0, 1.0, first_count)
+    t_second = np.linspace(0.0, 1.0, second_count)
+    end_theta = start_theta + theta_delta
+    contact_theta = start_theta + theta_delta * 0.5
+    slope_start = _path_endpoint_dz_dtheta(previous_path, at_start=False)
+    slope_end = _path_endpoint_dz_dtheta(next_path, at_start=True)
+    first_theta_delta = contact_theta - start_theta
+    second_theta_delta = end_theta - contact_theta
+    m0 = slope_start * first_theta_delta
+    m1 = slope_end * second_theta_delta
+    first_z = _cubic_hermite(start_z, boundary_z, m0, 0.0, t_first)
+    second_z = _cubic_hermite(boundary_z, end_z, 0.0, m1, t_second)
+    for _ in range(12):
+        if (
+            float(np.min(first_z)) >= min_z - 1e-9
+            and float(np.max(first_z)) <= max_z + 1e-9
+            and float(np.min(second_z)) >= min_z - 1e-9
+            and float(np.max(second_z)) <= max_z + 1e-9
+        ):
+            break
+        m0 *= 0.5
+        m1 *= 0.5
+        first_z = _cubic_hermite(start_z, boundary_z, m0, 0.0, t_first)
+        second_z = _cubic_hermite(boundary_z, end_z, 0.0, m1, t_second)
+    first_theta = np.linspace(start_theta, contact_theta, first_count)
+    second_theta = np.linspace(contact_theta, end_theta, second_count)
+    z_mm = np.concatenate((first_z, second_z[1:]))
+    theta_rad = np.concatenate((first_theta, second_theta[1:]))
+    return np.clip(z_mm, min_z, max_z), theta_rad
+
+
+def _cubic_hermite(
+    start_value: float,
+    end_value: float,
+    start_tangent: float,
+    end_tangent: float,
+    t: FloatArray,
+) -> FloatArray:
+    h00 = 2.0 * t**3 - 3.0 * t**2 + 1.0
+    h10 = t**3 - 2.0 * t**2 + t
+    h01 = -2.0 * t**3 + 3.0 * t**2
+    h11 = t**3 - t**2
+    return (
+        h00 * start_value
+        + h10 * start_tangent
+        + h01 * end_value
+        + h11 * end_tangent
+    )
+
+
+def _path_endpoint_dz_dtheta(path: SurfacePath, *, at_start: bool) -> float:
+    if path.point_count < 2:
+        return 0.0
+    if at_start:
+        dz = float(path.z_mm[1] - path.z_mm[0])
+        dtheta = _unwrap_delta(float(path.theta_rad[0]), float(path.theta_rad[1]))
+    else:
+        dz = float(path.z_mm[-1] - path.z_mm[-2])
+        dtheta = _unwrap_delta(float(path.theta_rad[-2]), float(path.theta_rad[-1]))
+    if abs(dtheta) <= 1e-9:
+        return 0.0
+    return dz / dtheta
 
 
 def _densify_surface_path(
@@ -1932,20 +2271,70 @@ def _profile_turnaround_min_radius(
 def _axisymmetric_turnaround_z_bounds(
     mandrel: AxisymmetricProfileMandrel,
     spec: WindingLayerSpec,
-) -> tuple[float, float]:
-    min_radius = (
-        _profile_turnaround_min_radius(mandrel, spec)
-        if spec.turnaround_radius_mm is None
-        else spec.turnaround_radius_mm
+) -> tuple[float, float, float, float]:
+    min_radius = _axisymmetric_safe_turnaround_radius(mandrel, spec)
+    safe_zone = find_profile_safe_zone(mandrel, min_radius_mm=min_radius)
+    requested_start_z = safe_zone.start_z_mm if spec.start_z_mm is None else spec.start_z_mm
+    requested_end_z = safe_zone.end_z_mm if spec.end_z_mm is None else spec.end_z_mm
+    start_z = max(requested_start_z, safe_zone.start_z_mm)
+    end_z = min(requested_end_z, safe_zone.end_z_mm)
+    edge_ease_mm = min(
+        max(spec.tow_width_mm * 2.0, 3.0),
+        max((safe_zone.end_z_mm - safe_zone.start_z_mm) * 0.12, 0.0),
     )
-    valid = np.flatnonzero(mandrel.r_mm >= min_radius)
-    if valid.size < 2:
-        raise ValueError("turnaround radius leaves fewer than two valid profile samples")
-    start_z = float(mandrel.z_mm[valid[0]]) if spec.start_z_mm is None else spec.start_z_mm
-    end_z = float(mandrel.z_mm[valid[-1]]) if spec.end_z_mm is None else spec.end_z_mm
+    if spec.start_z_mm is None:
+        start_z += edge_ease_mm
+    if spec.end_z_mm is None:
+        end_z -= edge_ease_mm
     if end_z <= start_z:
         raise ValueError("axisymmetric winding zone has invalid z bounds")
-    return start_z, end_z
+    return start_z, end_z, safe_zone.start_z_mm, safe_zone.end_z_mm
+
+
+def _tow_edge_clearance_mm(spec: WindingLayerSpec) -> float:
+    return spec.tow_width_mm * 0.5 + spec.layer_thickness_mm * 0.5
+
+
+def _axisymmetric_safe_turnaround_radius(
+    mandrel: AxisymmetricProfileMandrel,
+    spec: WindingLayerSpec,
+) -> float:
+    min_radius = _profile_turnaround_min_radius(mandrel, spec) + _tow_edge_clearance_mm(spec)
+    if spec.winding_type != "geodesic":
+        return min_radius
+    clairaut_radius = mandrel.max_radius_mm * math.sin(math.radians(abs(spec.target_angle_deg)))
+    return max(min_radius, clairaut_radius)
+
+
+def _axisymmetric_reference_z(
+    mandrel: AxisymmetricProfileMandrel,
+    start_z: float,
+    end_z: float,
+) -> float:
+    z_values = np.asarray(mandrel.z_mm, dtype=float)
+    radius_values = np.asarray(mandrel.r_mm, dtype=float)
+    mask = (z_values >= start_z) & (z_values <= end_z)
+    if not np.any(mask):
+        return (start_z + end_z) * 0.5
+    local_z = z_values[mask]
+    local_radius = radius_values[mask]
+    max_radius = float(np.max(local_radius))
+    plateau = local_z[local_radius >= max_radius - max(1e-6, max_radius * 1e-5)]
+    if plateau.size:
+        return float((np.min(plateau) + np.max(plateau)) * 0.5)
+    return float(local_z[int(np.argmax(local_radius))])
+
+
+def _path_theta_at_z(path: SurfacePath, z_mm: float) -> float:
+    theta_unwrapped = np.unwrap(np.asarray(path.theta_rad, dtype=float))
+    order = np.argsort(path.z_mm)
+    z_sorted = np.asarray(path.z_mm[order], dtype=float)
+    theta_sorted = theta_unwrapped[order]
+    unique_z, unique_indices = np.unique(z_sorted, return_index=True)
+    if unique_z.size < 2:
+        return float(theta_sorted[0])
+    unique_theta = theta_sorted[unique_indices]
+    return float(np.interp(z_mm, unique_z, unique_theta))
 
 
 def _axisymmetric_pass_count(
@@ -1953,10 +2342,11 @@ def _axisymmetric_pass_count(
     spec: WindingLayerSpec,
 ) -> int:
     circumference = 2.0 * math.pi * max(mandrel.max_radius_mm, 1e-9)
-    coverage_passes = max(
+    lanes_per_direction = max(
         1,
         math.ceil(circumference * spec.coverage_target / spec.tow_width_mm),
     )
+    coverage_passes = lanes_per_direction * 2
     if spec.number_of_passes is not None:
         return spec.number_of_passes
     return coverage_passes

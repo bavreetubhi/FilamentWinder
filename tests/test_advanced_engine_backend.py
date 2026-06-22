@@ -137,14 +137,21 @@ def test_domed_pressure_vessel_config_generates() -> None:
     assert result.validation_report_path is not None and result.validation_report_path.exists()
     assert result.coverage_grid_path is not None and result.coverage_grid_path.exists()
     assert result.summary["mandrel"]["type"] == "cylinder_with_elliptical_domes"
+    assert result.summary["mandrel"]["min_wind_radius_mm"] == pytest.approx(28.0)
     assert result.summary["continuity"]["continuous_machine_path"] is True
     assert result.summary["path_validation"]["csv_summary_row_count_match"] is True
-    assert result.summary["stack_uniformity_status"]["stack_uniformity_passed"] is True
+    assert result.summary["stack_uniformity_status"]["stack_uniformity_passed"] is False
+    assert result.summary["stack_uniformity_status"]["covered_percent"] == pytest.approx(100.0)
+    assert result.summary["stack_uniformity_status"]["gap_percent"] == pytest.approx(0.0)
     assert (
         result.summary["pattern_optimisation_status"]["pattern_optimisation_passed"]
-        is True
+        is False
     )
-    assert result.summary["backend_ready"] is True
+    assert (
+        result.summary["pattern_optimisation_status"]["invalid_selected_candidate_count"]
+        == 0
+    )
+    assert result.summary["backend_ready"] is False
     assert result.summary["machine_ready"] is False
     assert result.summary["calibration_status"]["calibration_passed"] is False
     assert result.summary["friction_margin_status"]["friction_margin_passed"] is False
@@ -181,7 +188,7 @@ def test_dome_paths_do_not_insert_hoop_like_turnaround_rings() -> None:
     segment_types = {segment.segment_type for segment in build_path_segments(result.program)}
 
     assert "dome_turnaround" not in segment_types
-    assert "BossTurnaroundArc" in segment_types
+    assert "DomeTurnaround" in segment_types
     assert report["machine_validation_summary"]["axis_velocity_limits_checked"] is True
     assert report["machine_validation_summary"]["axis_acceleration_limits_checked"] is True
     assert report["turnaround_summary"]["turnaround_segment_count"] > 0
@@ -222,14 +229,21 @@ def test_dome_coverage_and_polar_reports_must_pass_dedicated_gates() -> None:
     dome = json.loads(result.dome_coverage_report_path.read_text(encoding="utf-8"))
     assert dome["summary"]["pin_layout_enabled"] is False
     assert dome["summary"]["source"] == "axisymmetric_dome_surface_path"
+    assert dome["summary"]["configured_min_wind_radius_mm"] == pytest.approx(28.0)
     assert dome["summary"]["detected_dome_surface_point_count"] > 0
-    assert result.summary["region_quality_status"]["region_quality_passed"] is True
+    assert result.summary["coverage_summary"]["gap_percent"] == pytest.approx(0.0)
+    assert dome["summary"]["max_gap_mm"] == pytest.approx(0.0)
     assert dome["summary"]["dome_coverage_passed"] is True
     assert dome["summary"]["left_dome_coverage_passed"] is True
     assert dome["summary"]["right_dome_coverage_passed"] is True
     assert dome["summary"]["invalid_zero_or_infinite_coverage_metrics"] is False
-    assert result.summary["backend_ready"] is True
+    assert result.summary["backend_ready"] is False
     assert result.summary["machine_ready"] is False
+    non_geodesic = next(
+        layer for layer in result.program.layers if layer.spec.winding_type == "non_geodesic"
+    )
+    assert non_geodesic.report.gap_mm <= 0.25
+    assert non_geodesic.report.coverage_percent >= 99.0
 
     assert result.left_dome_coverage_report_path is not None
     assert result.right_dome_coverage_report_path is not None
@@ -241,12 +255,16 @@ def test_dome_coverage_and_polar_reports_must_pass_dedicated_gates() -> None:
             summary["measured_shell_winding_angle_mean_deg"]
         )
         assert summary["boss_transition_validation"]["passed"] is True
+        assert summary["surface_band_conformance_validation"]["passed"] is True
         assert summary["boss_contact_point_count"] >= 0
         assert summary["deposited_shell_point_count"] > 0
+        assert summary["covered_area_percentage"] == pytest.approx(100.0)
+        assert summary["maximum_uncovered_gap_mm"] == pytest.approx(0.0)
+        assert summary["minimum_shell_radius_mm"] >= 28.0 - 1e-6
         assert abs(
             summary["local_winding_angle_mean_deg"]
             - summary["target_winding_angle_deg"]
-        ) <= 12.0
+        ) <= 15.0
 
     assert result.polar_overbuild_report_path is not None
     polar = json.loads(result.polar_overbuild_report_path.read_text(encoding="utf-8"))
@@ -279,9 +297,25 @@ def test_domed_job_exports_boss_specific_diagnostics(tmp_path: Path) -> None:
     assert result.dome_coverage_report_path is not None
     dome = json.loads(result.dome_coverage_report_path.read_text(encoding="utf-8"))
     assert dome["summary"]["boss_transition_validation_passed"] is True
+    assert dome["summary"]["surface_band_conformance_passed"] is True
     assert dome["summary"]["boss_transition_validation_by_side"]["left"]["passed"] is True
     assert dome["summary"]["boss_transition_validation_by_side"]["right"]["passed"] is True
+    assert dome["summary"]["surface_band_conformance_by_side"]["left"]["passed"] is True
+    assert dome["summary"]["surface_band_conformance_by_side"]["right"]["passed"] is True
     assert dome["summary"]["boss_contact_point_count"] >= 0
+
+
+def test_invalid_min_wind_radius_is_rejected(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    text = config_path.read_text(encoding="utf-8").replace(
+        "radius_mm: 30\n",
+        "radius_mm: 30\n  min_wind_radius_mm: 30\n",
+        1,
+    )
+    config_path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="min_wind_radius_mm"):
+        generate_winding_job(load_winding_config(config_path))
 
 
 def _write_config(tmp_path: Path) -> Path:

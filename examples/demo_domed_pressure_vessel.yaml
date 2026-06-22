@@ -24,6 +24,7 @@ mandrel:
   left_dome_length_mm: 120
   right_dome_length_mm: 120
   polar_opening_radius_mm: 25
+  min_wind_radius_mm: 28
   mesh_points_z: 360
   mesh_points_theta: 360
 

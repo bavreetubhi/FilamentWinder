@@ -4441,3 +4441,504 @@ ValueError: drop link between an output socket and an input socket
 2026-06-22 00:08:34,475 INFO filament_winder.gui: Button clicked: Edit Node Setting
 2026-06-22 00:08:34,475 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
 2026-06-22 00:08:34,475 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:55:45,471 INFO filament_winder.gui: Application startup
+2026-06-22 00:55:46,047 INFO filament_winder.gui: Workflow tab opened
+2026-06-22 00:56:10,230 INFO filament_winder.gui: Button clicked: Toggle Cylinder Winding
+2026-06-22 00:56:10,230 INFO filament_winder.gui: Action started: Toggle Cylinder Winding selected_nodes=0
+2026-06-22 00:56:12,138 INFO filament_winder.gui: Action completed: Toggle Cylinder Winding
+2026-06-22 00:56:13,686 INFO filament_winder.gui: Button clicked: Toggle Boss Contact
+2026-06-22 00:56:13,686 INFO filament_winder.gui: Action started: Toggle Boss Contact selected_nodes=0
+2026-06-22 00:56:15,322 INFO filament_winder.gui: Action completed: Toggle Boss Contact
+2026-06-22 00:56:16,386 INFO filament_winder.gui: Button clicked: Toggle Dome Shell
+2026-06-22 00:56:16,386 INFO filament_winder.gui: Action started: Toggle Dome Shell selected_nodes=0
+2026-06-22 00:56:17,193 INFO filament_winder.gui: Action completed: Toggle Dome Shell
+2026-06-22 00:56:24,229 INFO filament_winder.gui: Button clicked: Toggle Transitions
+2026-06-22 00:56:24,229 INFO filament_winder.gui: Action started: Toggle Transitions selected_nodes=0
+2026-06-22 00:56:24,765 INFO filament_winder.gui: Action completed: Toggle Transitions
+2026-06-22 00:56:26,538 INFO filament_winder.gui: Button clicked: Toggle Transitions
+2026-06-22 00:56:26,538 INFO filament_winder.gui: Action started: Toggle Transitions selected_nodes=0
+2026-06-22 00:56:27,070 INFO filament_winder.gui: Action completed: Toggle Transitions
+2026-06-22 00:56:32,921 INFO filament_winder.gui: Button clicked: Toggle Boss Contact
+2026-06-22 00:56:32,921 INFO filament_winder.gui: Action started: Toggle Boss Contact selected_nodes=0
+2026-06-22 00:56:33,722 INFO filament_winder.gui: Action completed: Toggle Boss Contact
+2026-06-22 00:56:57,666 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:56:57,666 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:56:57,668 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:56:57,726 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:56:57,727 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:56:57,727 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:56:59,036 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:56:59,037 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:56:59,037 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:57:05,246 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:57:05,246 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:57:05,246 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:57:05,326 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:57:05,326 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:57:05,326 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:57:06,676 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:57:06,676 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:57:06,677 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:57:13,167 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:57:13,167 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:57:13,167 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:57:13,310 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:57:13,310 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:57:13,310 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:57:21,754 INFO filament_winder.gui: Button clicked: Toggle Dome Shell
+2026-06-22 00:57:21,754 INFO filament_winder.gui: Action started: Toggle Dome Shell selected_nodes=0
+2026-06-22 00:57:23,337 INFO filament_winder.gui: Action completed: Toggle Dome Shell
+2026-06-22 00:57:33,966 INFO filament_winder.gui: Button clicked: Toggle Cylinder Winding
+2026-06-22 00:57:33,966 INFO filament_winder.gui: Action started: Toggle Cylinder Winding selected_nodes=0
+2026-06-22 00:57:35,939 INFO filament_winder.gui: Action completed: Toggle Cylinder Winding
+2026-06-22 00:57:40,304 INFO filament_winder.gui: Button clicked: Toggle Dome Shell
+2026-06-22 00:57:40,305 INFO filament_winder.gui: Action started: Toggle Dome Shell selected_nodes=0
+2026-06-22 00:57:41,572 INFO filament_winder.gui: Action completed: Toggle Dome Shell
+2026-06-22 00:57:54,757 INFO filament_winder.gui: Button clicked: Toggle Tow Path
+2026-06-22 00:57:54,757 INFO filament_winder.gui: Action started: Toggle Tow Path selected_nodes=0
+2026-06-22 00:57:55,424 INFO filament_winder.gui: Action completed: Toggle Tow Path
+2026-06-22 00:58:01,846 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:01,846 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:01,847 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:01,975 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:01,975 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:01,975 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:02,620 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:02,620 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:02,621 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:03,396 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:03,396 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:03,396 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:05,166 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:05,166 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:05,167 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:06,767 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:06,767 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:06,767 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:06,855 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:06,855 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:06,855 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:06,982 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:06,983 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:06,983 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:07,102 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:07,102 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:07,102 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:26,215 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:26,215 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:26,215 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:26,374 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:26,374 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:26,374 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:26,517 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:26,518 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:26,518 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:26,606 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:26,606 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:26,606 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:27,364 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:27,364 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:27,365 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:27,385 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:27,385 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:27,385 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:27,494 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:27,494 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:27,494 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:32,926 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:32,926 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:32,927 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:33,077 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:33,077 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:33,079 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:33,230 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:33,230 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:33,230 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:33,477 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:33,478 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:33,478 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:36,182 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:36,182 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:36,182 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:36,366 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:36,367 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:36,367 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:36,934 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:36,934 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:36,935 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:37,102 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:37,102 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:37,103 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:37,246 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:37,246 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:37,246 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:37,366 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:58:37,366 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:58:37,367 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:58:50,266 INFO filament_winder.gui: Button clicked: Toggle Transitions
+2026-06-22 00:58:50,266 INFO filament_winder.gui: Action started: Toggle Transitions selected_nodes=0
+2026-06-22 00:58:50,817 INFO filament_winder.gui: Action completed: Toggle Transitions
+2026-06-22 00:58:53,673 INFO filament_winder.gui: Button clicked: Toggle Tow Path
+2026-06-22 00:58:53,673 INFO filament_winder.gui: Action started: Toggle Tow Path selected_nodes=0
+2026-06-22 00:58:54,504 INFO filament_winder.gui: Action completed: Toggle Tow Path
+2026-06-22 00:58:54,869 INFO filament_winder.gui: Button clicked: Toggle Tow Band
+2026-06-22 00:58:54,869 INFO filament_winder.gui: Action started: Toggle Tow Band selected_nodes=0
+2026-06-22 00:58:55,874 INFO filament_winder.gui: Action completed: Toggle Tow Band
+2026-06-22 00:58:58,700 INFO filament_winder.gui: Button clicked: Toggle Dome Shell
+2026-06-22 00:58:58,700 INFO filament_winder.gui: Action started: Toggle Dome Shell selected_nodes=0
+2026-06-22 00:58:59,859 INFO filament_winder.gui: Action completed: Toggle Dome Shell
+2026-06-22 00:59:24,190 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:59:24,190 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:59:24,190 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:59:27,398 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:59:27,398 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:59:27,398 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:59:30,090 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:59:30,090 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:59:30,090 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:59:38,946 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:59:38,946 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:59:38,946 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:59:39,023 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:59:39,023 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:59:39,023 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 00:59:42,765 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 00:59:42,765 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 00:59:42,767 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:00:24,794 INFO filament_winder.gui: Button clicked: Toggle Tow Path
+2026-06-22 01:00:24,794 INFO filament_winder.gui: Action started: Toggle Tow Path selected_nodes=0
+2026-06-22 01:00:25,691 INFO filament_winder.gui: Action completed: Toggle Tow Path
+2026-06-22 01:00:26,099 INFO filament_winder.gui: Button clicked: Toggle Tow Band
+2026-06-22 01:00:26,099 INFO filament_winder.gui: Action started: Toggle Tow Band selected_nodes=0
+2026-06-22 01:00:27,684 INFO filament_winder.gui: Action completed: Toggle Tow Band
+2026-06-22 01:00:28,681 INFO filament_winder.gui: Button clicked: Toggle Mandrel
+2026-06-22 01:00:28,681 INFO filament_winder.gui: Action started: Toggle Mandrel selected_nodes=0
+2026-06-22 01:00:30,369 INFO filament_winder.gui: Action completed: Toggle Mandrel
+2026-06-22 01:00:44,470 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:00:44,470 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:00:44,470 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:00:44,590 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:00:44,590 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:00:44,590 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:01:03,551 INFO filament_winder.gui: Node selection changed: nodes=1 links=0
+2026-06-22 01:01:04,271 INFO filament_winder.gui: Node selection changed: nodes=1 links=0
+2026-06-22 01:01:05,247 INFO filament_winder.gui: Node selection changed: nodes=1 links=0
+2026-06-22 01:01:07,667 INFO filament_winder.gui: Link creation started: layer_stack_backend_9130fd98b3.layer_stack (output)
+2026-06-22 01:01:10,099 ERROR filament_winder.gui: Link creation failed: drop link on a compatible socket
+Traceback (most recent call last):
+  File "C:\Users\User\Documents\filament Winder\src\filament_winder\app\gui.py", line 1868, in _finish_socket_drag
+    raise ValueError("drop link on a compatible socket")
+ValueError: drop link on a compatible socket
+
+2026-06-22 01:01:18,417 INFO filament_winder.gui: Node selection changed: nodes=1 links=0
+2026-06-22 01:01:20,469 INFO filament_winder.gui: Node selection changed: nodes=1 links=0
+2026-06-22 01:01:22,422 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:01:22,422 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=1
+2026-06-22 01:01:22,422 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:01:35,532 INFO filament_winder.gui: Button clicked: Update Preview
+2026-06-22 01:01:35,532 INFO filament_winder.gui: Action started: Update Preview selected_nodes=1
+2026-06-22 01:01:37,929 INFO filament_winder.gui: Action completed: Update Preview
+2026-06-22 01:01:42,560 INFO filament_winder.gui: Button clicked: Update Everything
+2026-06-22 01:01:42,561 INFO filament_winder.gui: Action started: Update Everything selected_nodes=1
+2026-06-22 01:01:42,561 INFO filament_winder.gui: Backend generate start
+2026-06-22 01:01:42,679 INFO filament_winder.gui: Action completed: Update Everything
+2026-06-22 01:28:11,965 INFO filament_winder.gui: Application startup
+2026-06-22 01:28:12,395 INFO filament_winder.gui: Workflow tab opened
+2026-06-22 01:28:25,352 INFO filament_winder.gui: Button clicked: Toggle Cylinder Winding
+2026-06-22 01:28:25,352 INFO filament_winder.gui: Action started: Toggle Cylinder Winding selected_nodes=0
+2026-06-22 01:28:27,220 INFO filament_winder.gui: Action completed: Toggle Cylinder Winding
+2026-06-22 01:28:49,915 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:28:49,915 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:28:49,916 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:28:54,151 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:28:54,151 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:28:54,151 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:29:07,193 INFO filament_winder.gui: Button clicked: Toggle Mandrel
+2026-06-22 01:29:07,193 INFO filament_winder.gui: Action started: Toggle Mandrel selected_nodes=0
+2026-06-22 01:29:09,610 INFO filament_winder.gui: Action completed: Toggle Mandrel
+2026-06-22 01:29:11,283 INFO filament_winder.gui: Button clicked: Toggle Mandrel
+2026-06-22 01:29:11,283 INFO filament_winder.gui: Action started: Toggle Mandrel selected_nodes=0
+2026-06-22 01:29:13,772 INFO filament_winder.gui: Action completed: Toggle Mandrel
+2026-06-22 01:29:15,312 INFO filament_winder.gui: Button clicked: Toggle Tow Path
+2026-06-22 01:29:15,312 INFO filament_winder.gui: Action started: Toggle Tow Path selected_nodes=0
+2026-06-22 01:29:17,201 INFO filament_winder.gui: Action completed: Toggle Tow Path
+2026-06-22 01:30:03,865 INFO filament_winder.gui: Button clicked: Update Everything
+2026-06-22 01:30:03,865 INFO filament_winder.gui: Action started: Update Everything selected_nodes=0
+2026-06-22 01:30:03,865 INFO filament_winder.gui: Backend generate start
+2026-06-22 01:30:03,974 INFO filament_winder.gui: Action completed: Update Everything
+2026-06-22 01:31:30,721 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:31:30,721 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:31:30,723 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:31:33,590 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:31:33,590 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:31:33,591 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:31:33,592 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:31:33,592 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:31:33,592 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:32:10,720 INFO filament_winder.gui: Node selection changed: nodes=1 links=0
+2026-06-22 01:32:40,151 INFO filament_winder.gui: Node selection changed: nodes=0 links=0
+2026-06-22 01:32:43,988 INFO filament_winder.gui: Node selection changed: nodes=1 links=0
+2026-06-22 01:32:50,452 INFO filament_winder.gui: Node selection changed: nodes=1 links=0
+2026-06-22 01:33:38,788 INFO filament_winder.gui: Node selection changed: nodes=0 links=0
+2026-06-22 01:34:06,887 INFO filament_winder.gui: Application startup
+2026-06-22 01:34:07,359 INFO filament_winder.gui: Workflow tab opened
+2026-06-22 01:34:19,121 INFO filament_winder.gui: Button clicked: Toggle Tow Path
+2026-06-22 01:34:19,121 INFO filament_winder.gui: Action started: Toggle Tow Path selected_nodes=0
+2026-06-22 01:34:20,752 INFO filament_winder.gui: Action completed: Toggle Tow Path
+2026-06-22 01:34:21,736 INFO filament_winder.gui: Button clicked: Toggle Cylinder Winding
+2026-06-22 01:34:21,736 INFO filament_winder.gui: Action started: Toggle Cylinder Winding selected_nodes=0
+2026-06-22 01:34:22,959 INFO filament_winder.gui: Action completed: Toggle Cylinder Winding
+2026-06-22 01:35:13,324 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:35:13,325 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:35:13,325 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:35:16,259 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:35:16,259 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:35:16,260 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:35:16,409 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:35:16,409 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:35:16,409 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:35:19,374 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:35:19,375 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:35:19,375 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:35:21,730 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:35:21,730 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:35:21,732 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:35:23,935 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:35:23,935 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:35:23,936 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:35:41,712 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:35:41,713 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:35:41,713 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:35:43,946 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 01:35:43,946 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 01:35:43,948 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 01:36:52,539 INFO filament_winder.gui: Button clicked: Refresh Reports
+2026-06-22 01:36:52,539 INFO filament_winder.gui: Action started: Refresh Reports selected_nodes=0
+2026-06-22 01:36:52,780 INFO filament_winder.gui: Button clicked: Open Plot
+2026-06-22 01:36:52,781 INFO filament_winder.gui: Action started: Open Plot selected_nodes=0
+2026-06-22 01:36:52,791 INFO filament_winder.gui: Action completed: Open Plot
+2026-06-22 01:36:52,791 INFO filament_winder.gui: Action completed: Refresh Reports
+2026-06-22 01:36:53,479 INFO filament_winder.gui: Button clicked: Open Report
+2026-06-22 01:36:53,481 INFO filament_winder.gui: Action started: Open Report selected_nodes=0
+2026-06-22 01:36:53,482 INFO filament_winder.gui: Action completed: Open Report
+2026-06-22 01:37:04,953 INFO filament_winder.gui: Node selection changed: nodes=1 links=0
+2026-06-22 01:37:06,968 INFO filament_winder.gui: Button clicked: Run Selected
+2026-06-22 01:37:06,968 INFO filament_winder.gui: Action started: Run Selected selected_nodes=1
+2026-06-22 01:37:06,969 INFO filament_winder.gui: Backend backend_check start
+2026-06-22 01:37:07,092 INFO filament_winder.gui: Action completed: Run Selected
+2026-06-22 01:37:39,757 INFO filament_winder.gui: Button clicked: Open Report
+2026-06-22 01:37:39,758 INFO filament_winder.gui: Action started: Open Report selected_nodes=1
+2026-06-22 01:37:39,758 INFO filament_winder.gui: Action completed: Open Report
+2026-06-22 01:37:39,759 INFO filament_winder.gui: Button clicked: Open Report
+2026-06-22 01:37:39,759 INFO filament_winder.gui: Action started: Open Report selected_nodes=1
+2026-06-22 01:37:39,759 INFO filament_winder.gui: Action completed: Open Report
+2026-06-22 01:37:39,759 INFO filament_winder.gui: Button clicked: Open Plot
+2026-06-22 01:37:39,759 INFO filament_winder.gui: Action started: Open Plot selected_nodes=1
+2026-06-22 01:37:39,769 INFO filament_winder.gui: Action completed: Open Plot
+2026-06-22 01:37:39,769 INFO filament_winder.gui: Button clicked: Open Plot
+2026-06-22 01:37:39,769 INFO filament_winder.gui: Action started: Open Plot selected_nodes=1
+2026-06-22 01:37:39,769 INFO filament_winder.gui: Action completed: Open Plot
+2026-06-22 01:37:39,770 INFO filament_winder.gui: Button clicked: Open Plot
+2026-06-22 01:37:39,770 INFO filament_winder.gui: Action started: Open Plot selected_nodes=1
+2026-06-22 01:37:39,779 INFO filament_winder.gui: Action completed: Open Plot
+2026-06-22 01:37:39,891 INFO filament_winder.gui: Backend backend_check complete
+2026-06-22 01:38:18,897 INFO filament_winder.gui: Node selection changed: nodes=0 links=0
+2026-06-22 01:38:24,105 INFO filament_winder.gui: Button clicked: Update Preview
+2026-06-22 01:38:24,105 INFO filament_winder.gui: Action started: Update Preview selected_nodes=0
+2026-06-22 01:38:25,210 INFO filament_winder.gui: Action completed: Update Preview
+2026-06-22 01:38:37,902 INFO filament_winder.gui: Node selection changed: nodes=0 links=1
+2026-06-22 01:38:37,921 INFO filament_winder.gui: Node selection changed: nodes=1 links=1
+2026-06-22 01:38:37,954 INFO filament_winder.gui: Node selection changed: nodes=1 links=0
+2026-06-22 01:38:38,000 INFO filament_winder.gui: Node selection changed: nodes=1 links=1
+2026-06-22 01:38:38,030 INFO filament_winder.gui: Node selection changed: nodes=1 links=1
+2026-06-22 01:38:38,061 INFO filament_winder.gui: Node selection changed: nodes=1 links=1
+2026-06-22 01:38:38,092 INFO filament_winder.gui: Node selection changed: nodes=1 links=1
+2026-06-22 01:38:38,123 INFO filament_winder.gui: Node selection changed: nodes=1 links=1
+2026-06-22 01:38:38,154 INFO filament_winder.gui: Node selection changed: nodes=1 links=2
+2026-06-22 01:51:46,468 INFO filament_winder.gui: Application startup
+2026-06-22 01:51:46,903 INFO filament_winder.gui: Workflow tab opened
+2026-06-22 01:54:26,059 INFO filament_winder.gui: Application startup
+2026-06-22 01:54:26,487 INFO filament_winder.gui: Workflow tab opened
+2026-06-22 01:54:35,939 INFO filament_winder.gui: Button clicked: Toggle Cylinder Winding
+2026-06-22 01:54:35,939 INFO filament_winder.gui: Action started: Toggle Cylinder Winding selected_nodes=0
+2026-06-22 01:54:38,177 INFO filament_winder.gui: Action completed: Toggle Cylinder Winding
+2026-06-22 02:03:10,179 INFO filament_winder.gui: Application startup
+2026-06-22 02:03:10,597 INFO filament_winder.gui: Workflow tab opened
+2026-06-22 02:03:26,514 INFO filament_winder.gui: Button clicked: Toggle Cylinder Winding
+2026-06-22 02:03:26,514 INFO filament_winder.gui: Action started: Toggle Cylinder Winding selected_nodes=0
+2026-06-22 02:03:28,509 INFO filament_winder.gui: Action completed: Toggle Cylinder Winding
+2026-06-22 02:03:38,548 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:03:38,548 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:03:38,548 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:03:41,349 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:03:41,349 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:03:41,349 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:03:41,452 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:03:41,452 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:03:41,452 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:03:44,883 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:03:44,883 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:03:44,883 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:04:26,157 INFO filament_winder.gui: Button clicked: Update Everything
+2026-06-22 02:04:26,157 INFO filament_winder.gui: Action started: Update Everything selected_nodes=0
+2026-06-22 02:04:26,158 INFO filament_winder.gui: Backend generate start
+2026-06-22 02:04:26,269 INFO filament_winder.gui: Action completed: Update Everything
+2026-06-22 02:04:58,930 INFO filament_winder.gui: Backend generate complete
+2026-06-22 02:04:59,126 INFO filament_winder.gui: Button clicked: Open Plot
+2026-06-22 02:04:59,126 INFO filament_winder.gui: Action started: Open Plot selected_nodes=0
+2026-06-22 02:04:59,136 INFO filament_winder.gui: Action completed: Open Plot
+2026-06-22 02:31:58,242 INFO filament_winder.gui: Application startup
+2026-06-22 02:31:58,805 INFO filament_winder.gui: Workflow tab opened
+2026-06-22 02:32:13,956 INFO filament_winder.gui: Button clicked: Toggle Cylinder Winding
+2026-06-22 02:32:13,956 INFO filament_winder.gui: Action started: Toggle Cylinder Winding selected_nodes=0
+2026-06-22 02:32:18,147 INFO filament_winder.gui: Action completed: Toggle Cylinder Winding
+2026-06-22 02:32:46,958 INFO filament_winder.gui: Node selection changed: nodes=1 links=0
+2026-06-22 02:32:53,633 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:32:53,634 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=1
+2026-06-22 02:32:53,634 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:33:01,888 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:33:01,888 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=1
+2026-06-22 02:33:01,889 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:37:20,999 INFO filament_winder.gui: Node selection changed: nodes=0 links=0
+2026-06-22 02:37:24,443 INFO filament_winder.gui: Application startup
+2026-06-22 02:37:24,855 INFO filament_winder.gui: Workflow tab opened
+2026-06-22 02:37:53,481 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:37:53,481 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:37:53,482 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:38:00,790 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:38:00,790 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:38:00,791 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:38:00,791 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:38:00,791 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:38:00,792 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:38:00,800 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:38:00,800 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:38:00,800 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:38:02,903 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:38:02,903 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:38:02,904 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:38:10,218 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:38:10,218 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:38:10,218 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:38:13,802 INFO filament_winder.gui: Button clicked: Toggle Tow Path
+2026-06-22 02:38:13,802 INFO filament_winder.gui: Action started: Toggle Tow Path selected_nodes=0
+2026-06-22 02:38:16,689 INFO filament_winder.gui: Action completed: Toggle Tow Path
+2026-06-22 02:38:18,213 INFO filament_winder.gui: Button clicked: Toggle Tow Band
+2026-06-22 02:38:18,213 INFO filament_winder.gui: Action started: Toggle Tow Band selected_nodes=0
+2026-06-22 02:38:19,033 INFO filament_winder.gui: Action completed: Toggle Tow Band
+2026-06-22 02:38:22,205 INFO filament_winder.gui: Button clicked: Toggle Tow Path
+2026-06-22 02:38:22,205 INFO filament_winder.gui: Action started: Toggle Tow Path selected_nodes=0
+2026-06-22 02:38:24,414 INFO filament_winder.gui: Action completed: Toggle Tow Path
+2026-06-22 02:38:46,441 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:38:46,441 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:38:46,441 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:38:50,456 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:38:50,456 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:38:50,458 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:38:50,458 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:38:50,458 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:38:50,459 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:38:54,317 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:38:54,317 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:38:54,318 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:38:55,899 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:38:55,899 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:38:55,899 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:38:56,277 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:38:56,277 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:38:56,278 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:38:57,277 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:38:57,279 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:38:57,279 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:39:04,809 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:39:04,809 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:39:04,810 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:51:31,231 INFO filament_winder.gui: Application startup
+2026-06-22 02:51:31,637 INFO filament_winder.gui: Workflow tab opened
+2026-06-22 02:51:49,739 INFO filament_winder.gui: Button clicked: Toggle Tow Band
+2026-06-22 02:51:49,739 INFO filament_winder.gui: Action started: Toggle Tow Band selected_nodes=0
+2026-06-22 02:51:51,985 INFO filament_winder.gui: Action completed: Toggle Tow Band
+2026-06-22 02:51:52,680 INFO filament_winder.gui: Button clicked: Toggle Cylinder Winding
+2026-06-22 02:51:52,680 INFO filament_winder.gui: Action started: Toggle Cylinder Winding selected_nodes=0
+2026-06-22 02:51:54,256 INFO filament_winder.gui: Action completed: Toggle Cylinder Winding
+2026-06-22 02:57:15,027 INFO filament_winder.gui: Application startup
+2026-06-22 02:57:15,439 INFO filament_winder.gui: Workflow tab opened
+2026-06-22 02:57:47,282 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:57:47,282 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:57:47,283 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:57:54,083 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 02:57:54,083 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 02:57:54,083 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 02:57:57,277 INFO filament_winder.gui: Button clicked: Toggle Mandrel
+2026-06-22 02:57:57,277 INFO filament_winder.gui: Action started: Toggle Mandrel selected_nodes=0
+2026-06-22 02:58:01,261 INFO filament_winder.gui: Action completed: Toggle Mandrel
+2026-06-22 02:58:03,829 INFO filament_winder.gui: Button clicked: Toggle Cylinder Winding
+2026-06-22 02:58:03,829 INFO filament_winder.gui: Action started: Toggle Cylinder Winding selected_nodes=0
+2026-06-22 02:58:08,100 INFO filament_winder.gui: Action completed: Toggle Cylinder Winding
+2026-06-22 02:58:23,671 INFO filament_winder.gui: Button clicked: Toggle Tow Band
+2026-06-22 02:58:23,671 INFO filament_winder.gui: Action started: Toggle Tow Band selected_nodes=0
+2026-06-22 02:58:26,444 INFO filament_winder.gui: Action completed: Toggle Tow Band
+2026-06-22 03:03:14,141 INFO filament_winder.gui: Application startup
+2026-06-22 03:03:14,612 INFO filament_winder.gui: Workflow tab opened
+2026-06-22 03:03:20,258 INFO filament_winder.gui: Button clicked: Toggle Cylinder Winding
+2026-06-22 03:03:20,258 INFO filament_winder.gui: Action started: Toggle Cylinder Winding selected_nodes=0
+2026-06-22 03:03:21,914 INFO filament_winder.gui: Action completed: Toggle Cylinder Winding
+2026-06-22 03:03:22,636 INFO filament_winder.gui: Button clicked: Toggle Tow Path
+2026-06-22 03:03:22,636 INFO filament_winder.gui: Action started: Toggle Tow Path selected_nodes=0
+2026-06-22 03:03:23,596 INFO filament_winder.gui: Action completed: Toggle Tow Path
+2026-06-22 03:03:24,430 INFO filament_winder.gui: Button clicked: Toggle Tow Band
+2026-06-22 03:03:24,431 INFO filament_winder.gui: Action started: Toggle Tow Band selected_nodes=0
+2026-06-22 03:03:25,140 INFO filament_winder.gui: Action completed: Toggle Tow Band
+2026-06-22 03:03:27,982 INFO filament_winder.gui: Button clicked: Toggle Tow Path
+2026-06-22 03:03:27,982 INFO filament_winder.gui: Action started: Toggle Tow Path selected_nodes=0
+2026-06-22 03:03:29,439 INFO filament_winder.gui: Action completed: Toggle Tow Path
+2026-06-22 03:03:47,995 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:03:47,995 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:03:47,995 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:03:51,231 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:03:51,231 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:03:51,231 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:04:07,076 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:04:07,076 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:04:07,077 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:04:10,183 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:04:10,184 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:04:10,184 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:04:10,185 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:04:10,185 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:04:10,185 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:04:10,186 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:04:10,186 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:04:10,186 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:04:10,186 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:04:10,186 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:04:10,187 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:04:24,982 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:04:24,982 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:04:24,982 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:04:25,052 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:04:25,052 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:04:25,052 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:04:28,045 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:04:28,045 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:04:28,046 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:26:27,916 INFO filament_winder.gui: Application startup
+2026-06-22 03:26:28,330 INFO filament_winder.gui: Workflow tab opened
+2026-06-22 03:27:12,577 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:27:12,577 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:27:12,578 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:27:15,239 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:27:15,239 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:27:15,240 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:27:15,240 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:27:15,240 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:27:15,241 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:27:25,255 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:27:25,255 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:27:25,255 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:27:28,005 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:27:28,005 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:27:28,005 INFO filament_winder.gui: Action completed: Edit Node Setting
+2026-06-22 03:27:28,005 INFO filament_winder.gui: Button clicked: Edit Node Setting
+2026-06-22 03:27:28,005 INFO filament_winder.gui: Action started: Edit Node Setting selected_nodes=0
+2026-06-22 03:27:28,005 INFO filament_winder.gui: Action completed: Edit Node Setting

@@ -32,6 +32,7 @@ from filament_winder.app.project_binding import (
     project_from_preview_config,
 )
 from filament_winder.cli import main
+from filament_winder.core.tow import generate_surface_tow_band
 
 
 def _write_profile_dxf(path) -> None:
@@ -120,6 +121,41 @@ def test_profile_dome_preview_scene_builds_profile_mesh_and_path(tmp_path) -> No
     assert preview.display_path_points_mm.shape == (47, 3)
     assert preview.turnaround_radius_mm > 0.0
     assert preview.motion_table.b_deg.max() == 90.0
+
+
+def test_profile_dome_surface_tow_band_stays_on_profile_surface(tmp_path) -> None:
+    dxf_path = tmp_path / "profile.dxf"
+    _write_profile_dxf(dxf_path)
+
+    preview = build_profile_dome_preview_scene(
+        ProfileDomePreviewConfig(
+            profile_path=dxf_path,
+            tow_width_mm=3.0,
+            winding_angle_deg=35.0,
+            points_per_span=20,
+            turnaround_points=5,
+            mesh_theta_segments=12,
+            mesh_z_segments=4,
+        )
+    )
+    shell_mask = np.abs(np.gradient(preview.path.z_mm)) > 1e-6
+    shell_indices = np.flatnonzero(shell_mask)
+    shell_path = preview.path.__class__(
+        z_mm=preview.path.z_mm[shell_indices],
+        theta_rad=preview.path.theta_rad[shell_indices],
+        x_mm=preview.path.x_mm[shell_indices],
+        y_mm=preview.path.y_mm[shell_indices],
+        winding_angle_deg=preview.path.winding_angle_deg,
+        tow_width_mm=preview.path.tow_width_mm,
+        pass_index=preview.path.pass_index[shell_indices],
+        tow_eye_angle_deg=preview.path.tow_eye_angle_deg[shell_indices],
+    )
+    tow_band = generate_surface_tow_band(preview.profile, shell_path)
+
+    left_radius = np.hypot(tow_band.left_points_mm[:, 0], tow_band.left_points_mm[:, 1])
+    right_radius = np.hypot(tow_band.right_points_mm[:, 0], tow_band.right_points_mm[:, 1])
+    assert np.allclose(left_radius, preview.profile.radius_at(tow_band.left_z_mm), atol=1e-6)
+    assert np.allclose(right_radius, preview.profile.radius_at(tow_band.right_z_mm), atol=1e-6)
 
 
 def test_profile_nosecone_preview_uses_min_radius_turnaround(tmp_path) -> None:

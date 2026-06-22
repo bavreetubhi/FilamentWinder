@@ -3,8 +3,13 @@ from __future__ import annotations
 import csv
 
 import numpy as np
+import pytest
 
-from filament_winder.core.geometry import AxisymmetricProfileMandrel, CylinderMandrel
+from filament_winder.core.geometry import (
+    AxisymmetricProfileMandrel,
+    CylinderMandrel,
+    cylinder_with_domes_profile,
+)
 from filament_winder.core.path_planning import (
     WindingLayerSpec,
     WindingSchedule,
@@ -182,6 +187,108 @@ def test_profile_axisymmetric_schedule_reports_axisymmetric_layer() -> None:
     assert program.reports[0].winding_type == "axisymmetric"
     assert program.layers[0].path.point_count > 16
     assert program.motion_table.b_deg[0] == 30.0
+
+
+def test_axisymmetric_dome_turnaround_touches_min_diameter_tangentially() -> None:
+    profile = cylinder_with_domes_profile(
+        cylinder_length_mm=120.0,
+        cylinder_radius_mm=30.0,
+        left_dome_length_mm=35.0,
+        right_dome_length_mm=35.0,
+        polar_opening_radius_mm=4.0,
+        samples_per_region=40,
+    )
+    schedule = WindingSchedule(
+        layers=(
+            WindingLayerSpec(
+                name="non-geodesic",
+                winding_type="non_geodesic",
+                target_angle_deg=45.0,
+                tow_width_mm=6.0,
+                layer_thickness_mm=2.0,
+                point_count=36,
+                turnaround_points=18,
+                turnaround_radius_mm=8.0,
+                number_of_passes=4,
+            ),
+        )
+    )
+
+    program = plan_winding_schedule(profile, schedule)
+    path = program.layers[0].path
+    motion_type = np.asarray(program.layers[0].metadata.motion_type)
+    min_centerline_radius = 8.0 + 6.0 * 0.5 + 2.0 * 0.5
+
+    assert "DomeTurnaround" in set(motion_type)
+    assert "BossTurnaroundArc" not in set(motion_type)
+    assert float(np.min(profile.radius_at(path.z_mm))) >= min_centerline_radius - 1e-6
+    for start, stop in _contiguous_true_spans(motion_type == "DomeTurnaround"):
+        span_z = path.z_mm[start:stop]
+        span_radius = profile.radius_at(span_z)
+        boundary_index = int(np.argmin(span_radius))
+        assert float(span_radius[boundary_index]) == pytest.approx(
+            min_centerline_radius,
+            abs=1e-6,
+        )
+        assert 0 < boundary_index < span_z.size - 1
+        assert span_radius[boundary_index - 1] > span_radius[boundary_index]
+        assert span_radius[boundary_index + 1] > span_radius[boundary_index]
+
+    points = path.points_mm
+    segment = np.diff(points, axis=0)
+    length = np.linalg.norm(segment, axis=1)
+    segment = segment[length > 1e-9] / length[length > 1e-9, None]
+    tangent_turn = np.rad2deg(
+        np.arccos(np.clip(np.sum(segment[1:] * segment[:-1], axis=1), -1.0, 1.0))
+    )
+    assert float(np.max(tangent_turn)) < 35.0
+
+
+def test_axisymmetric_geodesic_dome_span_follows_clairaut_from_cylinder_radius() -> None:
+    profile = cylinder_with_domes_profile(
+        cylinder_length_mm=120.0,
+        cylinder_radius_mm=30.0,
+        left_dome_length_mm=35.0,
+        right_dome_length_mm=35.0,
+        polar_opening_radius_mm=4.0,
+        samples_per_region=40,
+    )
+    target_angle = 45.0
+    schedule = WindingSchedule(
+        layers=(
+            WindingLayerSpec(
+                name="geodesic",
+                winding_type="geodesic",
+                target_angle_deg=target_angle,
+                tow_width_mm=6.0,
+                point_count=48,
+                turnaround_points=20,
+                turnaround_radius_mm=8.0,
+                number_of_passes=2,
+            ),
+        )
+    )
+
+    program = plan_winding_schedule(profile, schedule)
+    layer = program.layers[0]
+    wind = np.asarray(layer.metadata.motion_type) == "wind"
+    radius = profile.radius_at(layer.path.z_mm[wind])
+    local_angle = layer.path.tow_eye_angle_deg[wind]
+    clairaut = radius * np.sin(np.deg2rad(local_angle))
+    expected = profile.max_radius_mm * np.sin(np.deg2rad(target_angle))
+
+    assert np.ptp(clairaut) < 1e-6
+    assert float(np.mean(clairaut)) == pytest.approx(expected)
+    assert float(np.min(radius)) >= expected - 1e-6
+    assert float(np.max(layer.metadata.local_winding_angle_deg)) > 85.0
+
+
+def _contiguous_true_spans(mask: np.ndarray) -> tuple[tuple[int, int], ...]:
+    indices = np.flatnonzero(mask)
+    if indices.size == 0:
+        return ()
+    groups = np.split(indices, np.flatnonzero(np.diff(indices) > 1) + 1)
+    return tuple((int(group[0]), int(group[-1]) + 1) for group in groups)
 
 
 def test_winding_program_csv_exports_machine_and_layer_metadata(tmp_path) -> None:

@@ -35,6 +35,7 @@ from filament_winder.core.path_planning import (
     export_pattern_rejection_report_json,
     export_selected_pattern_json,
     export_thickness_distribution_csv,
+    find_profile_safe_zone,
     generate_controlled_angle_path,
     generate_geodesic_path,
     plan_winding_schedule,
@@ -44,6 +45,7 @@ from filament_winder.core.path_planning.geodesic import (
     ControlledAnglePathConfig,
     GeodesicPathConfig,
 )
+from filament_winder.core.tow import generate_surface_tow_band
 from filament_winder.io import (
     GCodeOptions,
     export_coverage_grid_npz,
@@ -155,6 +157,7 @@ def validate_winding_job_config(config: WindingJobConfig) -> tuple[str, ...]:
         raise ValueError("mandrel.length_mm must be positive")
     if _mandrel_radius_mm(config) <= 0.0:
         raise ValueError("mandrel.radius_mm must be positive")
+    _validate_min_wind_radius(config)
     if config.tow.width_mm <= 0.0:
         raise ValueError("tow.width_mm must be positive")
     if config.tow.thickness_mm < 0.0:
@@ -230,6 +233,43 @@ def _validate_pin_layout_config(config: WindingJobConfig) -> None:
         raise ValueError(
             "pin_layout.pin_radius_mm must be >= configured tow/pin min_bend_radius_mm"
         )
+
+
+def _validate_min_wind_radius(config: WindingJobConfig) -> None:
+    min_wind_radius = config.mandrel.min_wind_radius_mm
+    if min_wind_radius is None:
+        return
+    if not np.isfinite(min_wind_radius):
+        raise ValueError("mandrel.min_wind_radius_mm must be finite when provided")
+    boss_radius = float(config.mandrel.polar_opening_radius_mm)
+    cylinder_radius = float(_mandrel_radius_mm(config))
+    if min_wind_radius < boss_radius - 1e-9:
+        raise ValueError(
+            "mandrel.min_wind_radius_mm cannot be smaller than polar_opening_radius_mm"
+        )
+    if min_wind_radius >= cylinder_radius - 1e-9:
+        raise ValueError(
+            "mandrel.min_wind_radius_mm must be smaller than the cylinder/equatorial radius"
+        )
+    if min_wind_radius > cylinder_radius - max(cylinder_radius * 0.02, 1.0):
+        raise ValueError(
+            "mandrel.min_wind_radius_mm is too close to the cylinder radius "
+            "to form a valid dome path"
+        )
+    if (
+        config.mandrel.type in {"axisymmetric_profile", "profile"}
+        and config.mandrel.profile_path is not None
+    ):
+        profile = import_dxf_zr_profile(
+            config.mandrel.profile_path,
+            samples=config.mandrel.samples,
+        )
+        safe_zone = find_profile_safe_zone(profile, min_radius_mm=min_wind_radius)
+        if safe_zone.length_mm <= max(config.tow.width_mm * 2.0, 5.0):
+            raise ValueError(
+                "mandrel.min_wind_radius_mm leaves too little valid dome span "
+                "on the profile"
+            )
 
 
 def generate_winding_job(
@@ -1174,7 +1214,7 @@ def _score_pin_route_candidate(
         metadata=layer.metadata,
         reports=(layer.report,),
     )
-    dome_report = _pin_dome_coverage_report(config, candidate_program)
+    dome_report = _pin_dome_coverage_report(config, mandrel, candidate_program)
     left_dome = dome_report["by_side"]["left"]["summary"]
     right_dome = dome_report["by_side"]["right"]["summary"]
     dome_gap_penalty = max(
@@ -1563,11 +1603,19 @@ def _pattern_request_for_layer(
         if layer.tow_thickness_mm is not None
         else config.laminate_targets.target_layer_thickness_mm
     )
+    cylinder_first_layer = isinstance(mandrel, CylinderMandrel) and layer.type in {
+        "helical",
+        "geodesic",
+        "non_geodesic",
+    }
     share = (
         layer.coverage_target / max(stack_pair_count, 1)
         if coverage_share is None
         else layer.coverage_target * coverage_share
     )
+    target_coverage = max(0.1, share)
+    if cylinder_first_layer:
+        target_coverage = max(target_coverage, min(layer.coverage_target, 0.95))
     return PatternSearchRequest(
         layer_id=f"{index:02d}-{_safe_id(layer.name)}",
         layer_name=layer.name,
@@ -1578,7 +1626,7 @@ def _pattern_request_for_layer(
         trajectory_length_mm=trajectory_length,
         roving_width_mm=tow_width,
         roving_thickness_mm=tow_thickness,
-        target_coverage=max(0.1, share),
+        target_coverage=target_coverage,
         target_layer_thickness_mm=target_thickness,
         target_number_of_closed_layers=config.laminate_targets.target_number_of_closed_layers,
         feedrate_mm_min=layer.feedrate_mm_min or _nominal_feedrate(config),
@@ -1591,7 +1639,7 @@ def _pattern_request_for_layer(
         thickness_model="polynomial_smoothed_polar_approximation",
         max_coverage_estimate=max(
             0.15,
-            share * 1.25,
+            target_coverage * (1.45 if cylinder_first_layer else 1.25),
         ),
         max_winding_time_min=config.quality_limits.max_estimated_winding_time_min * max(
             0.5,
@@ -1599,6 +1647,12 @@ def _pattern_request_for_layer(
         ),
         max_thickness_variation_percent=config.quality_limits.max_thickness_variation_percent,
         max_polar_buildup_mm=config.quality_limits.max_polar_buildup_mm,
+        prefer_full_cylinder_coverage=cylinder_first_layer,
+        undercoverage_weight=2.2 if cylinder_first_layer else 1.0,
+        overlap_weight=0.55 if cylinder_first_layer else 1.0,
+        thickness_weight=0.35 if cylinder_first_layer else 1.0,
+        polar_buildup_weight=0.25 if cylinder_first_layer else 1.0,
+        time_weight=0.7 if cylinder_first_layer else 1.0,
     )
 
 
@@ -1829,10 +1883,24 @@ def _schedule_from_config(
         selected_passes = (
             None if selected_pattern is None else selected_pattern.number_of_windings
         )
+        minimum_coverage_passes = _minimum_layer_coverage_passes(
+            config,
+            layer,
+            tow_width_mm=tow_width,
+        )
+        resolved_passes = selected_passes or _passes(layer.passes)
+        if resolved_passes is not None and selected_pattern is not None:
+            resolved_passes = max(resolved_passes, minimum_coverage_passes)
+        if (
+            resolved_passes is not None
+            and layer.type in {"geodesic", "non_geodesic", "polar"}
+            and resolved_passes % 2
+        ):
+            resolved_passes += 1
         selected_phase = (
             None
-            if selected_pattern is None
-            else 360.0 / max(selected_pattern.number_of_windings, 1)
+            if selected_pattern is None or resolved_passes is None
+            else 360.0 / max(resolved_passes, 1)
         )
         layers.append(
             WindingLayerSpec(
@@ -1846,7 +1914,7 @@ def _schedule_from_config(
                 direction=direction,  # type: ignore[arg-type]
                 point_count=layer.points,
                 enabled=layer.enabled,
-                number_of_passes=selected_passes or _passes(layer.passes),
+                number_of_passes=resolved_passes,
                 start_z_mm=_layer_z_bounds(config, layer)[0],
                 end_z_mm=_layer_z_bounds(config, layer)[1],
                 feedrate_mm_min=layer.feedrate_mm_min,
@@ -1854,6 +1922,7 @@ def _schedule_from_config(
                 colour=layer.colour,
                 notes=layer.notes,
                 phase_offset_deg=selected_phase or layer.phase_offset_deg,
+                turnaround_radius_mm=_resolved_turnaround_radius(config, layer),
                 hoop_mode=config.hoop_winding.mode,
                 hoop_nominal_angle_deg=config.hoop_winding.nominal_angle_deg,
                 hoop_min_angle_offset_deg=(
@@ -1868,6 +1937,35 @@ def _schedule_from_config(
         radial_clearance_mm=config.machine.clearance_mm,
         nominal_feedrate_mm_min=_nominal_feedrate(config),
     )
+
+
+def _minimum_layer_coverage_passes(
+    config: WindingJobConfig,
+    layer: LayerConfig,
+    *,
+    tow_width_mm: float,
+) -> int:
+    if layer.passes not in {None, "auto"}:
+        return 1
+    if layer.type in {"hoop", "continuous_hoop_traverse", "local_reinforcement_band"}:
+        return 1
+    radius = max(_mandrel_radius_mm(config), 1e-9)
+    circumference = 2.0 * math.pi * radius
+    lanes_per_direction = max(
+        1,
+        math.ceil(circumference * layer.coverage_target / tow_width_mm),
+    )
+    if layer.type in {"geodesic", "non_geodesic"}:
+        return lanes_per_direction * 2
+    return lanes_per_direction
+
+
+def _resolved_turnaround_radius(config: WindingJobConfig, layer: LayerConfig) -> float | None:
+    if layer.turnaround_radius_mm is not None:
+        return layer.turnaround_radius_mm
+    if layer.type in {"geodesic", "non_geodesic", "dome", "nosecone", "axisymmetric", "polar"}:
+        return config.mandrel.min_wind_radius_mm
+    return None
 
 
 def _build_summary(
@@ -1975,6 +2073,8 @@ def _build_summary(
             "type": config.mandrel.type,
             "length_mm": _mandrel_length(mandrel),
             "radius_mm": _mandrel_radius(mandrel),
+            "polar_opening_radius_mm": config.mandrel.polar_opening_radius_mm,
+            "min_wind_radius_mm": config.mandrel.min_wind_radius_mm,
         },
         "tow": {
             "tow_id": config.tow.tow_id,
@@ -2240,6 +2340,11 @@ def _build_validation_report(
     )
     return {
         "project": config.project.name,
+        "mandrel": {
+            "type": config.mandrel.type,
+            "polar_opening_radius_mm": config.mandrel.polar_opening_radius_mm,
+            "min_wind_radius_mm": config.mandrel.min_wind_radius_mm,
+        },
         "path_continuity": continuity,
         "transition_summary": transition_summary,
         "machine_validation_summary": machine_validation["summary"],
@@ -3133,6 +3238,10 @@ def _pin_dome_coverage_report(
         bool(report["summary"].get("boss_transition_validation", {}).get("passed", True))
         for report in side_reports.values()
     )
+    surface_band_passed = all(
+        bool(report["summary"].get("surface_band_conformance_validation", {}).get("passed", True))
+        for report in side_reports.values()
+    )
     passed = all(
         bool(report["summary"]["dome_coverage_passed"])
         for report in side_reports.values()
@@ -3177,10 +3286,16 @@ def _pin_dome_coverage_report(
             "max_gap_mm": max_gap,
             "max_overlap_mm": max_overlap,
             "coverage_tolerance_mm": config.pin_layout.coverage_tolerance_mm,
+            "configured_min_wind_radius_mm": config.mandrel.min_wind_radius_mm,
             "ring_like_path_detected": ring_like,
             "boss_transition_validation_passed": boss_transition_passed,
+            "surface_band_conformance_passed": surface_band_passed,
             "boss_transition_validation_by_side": {
                 side: report["summary"].get("boss_transition_validation", {})
+                for side, report in side_reports.items()
+            },
+            "surface_band_conformance_by_side": {
+                side: report["summary"].get("surface_band_conformance_validation", {})
                 for side, report in side_reports.items()
             },
             "source": (
@@ -3237,7 +3352,7 @@ def _single_dome_coverage_report(
         segment_values,
         ("geodesic_pass", "non_geodesic_pass"),
     )
-    boss_contact_mask = segment_values == "BossTurnaroundArc"
+    boss_contact_mask = np.isin(segment_values, ("BossTurnaroundArc", "DomeTurnaround"))
     deposited_shell_mask = dome_shell_mask & (pin_dome_mask | shell_segment_mask)
     boss_shell_mask = dome_shell_mask & boss_contact_mask
     mask = deposited_shell_mask
@@ -3331,10 +3446,23 @@ def _single_dome_coverage_report(
         if mandrel is not None
         else {"passed": True, "reason": "mandrel_unavailable"}
     )
+    surface_band_validation = (
+        _surface_band_conformance_validation(
+            mandrel,
+            program,
+            side=side,
+            segment_types=segment_values,
+        )
+        if mandrel is not None
+        else {"passed": True, "reason": "mandrel_unavailable"}
+    )
     ring_report = _dome_ring_like_report(program, side)
     excessive_wrap_regions = _excessive_dome_wrap_regions(coverage, meridian_bins)
     gap_limit = max(config.pin_layout.coverage_tolerance_mm, tow_width * 2.0)
     overbuild_limit = max(2.5, config.quality_limits.max_stack_overlap_percent / 20.0)
+    enforce_boss_transition = not np.any(
+        np.isin(segment_values, ("PinContactArc", "PinTransition"))
+    )
     passed = (
         covered_percent >= 85.0
         and covered_percent > 0.0
@@ -3348,7 +3476,8 @@ def _single_dome_coverage_report(
             12.0,
         )
         and not ring_report["ring_like_path_detected"]
-        and boss_transition_validation["passed"]
+        and (boss_transition_validation["passed"] or not enforce_boss_transition)
+        and surface_band_validation["passed"]
     )
     cells, angle_cells, thickness_cells = _dome_report_cells(
         side,
@@ -3367,6 +3496,10 @@ def _single_dome_coverage_report(
             "covered_area_percentage": covered_percent,
             "maximum_uncovered_gap_mm": maximum_gap,
             "detected_dome_surface_point_count": detected_surface_points,
+            "configured_min_wind_radius_mm": config.mandrel.min_wind_radius_mm,
+            "minimum_shell_radius_mm": (
+                float(np.min(selected_radius)) if selected_radius.size else 0.0
+            ),
             "boss_turnaround_point_count": boss_turnaround_points,
             "boss_contact_point_count": boss_contact_points,
             "deposited_shell_point_count": deposited_shell_points,
@@ -3388,6 +3521,7 @@ def _single_dome_coverage_report(
             "ring_like_path_detected": ring_report["ring_like_path_detected"],
             "ring_like_reasons": ring_report["reasons"],
             "boss_transition_validation": boss_transition_validation,
+            "surface_band_conformance_validation": surface_band_validation,
             "repair_suggestions": _dome_coverage_repair_suggestions(
                 passed=passed,
                 ring_like=ring_report["ring_like_path_detected"],
@@ -3487,6 +3621,10 @@ def _empty_single_dome_report(
                 "passed": False,
                 "reason": "no_dome_surface_span_points",
             },
+            "surface_band_conformance_validation": {
+                "passed": False,
+                "reason": "no_dome_surface_span_points",
+            },
             "repair_suggestions": _dome_coverage_repair_suggestions(
                 passed=False,
                 ring_like=False,
@@ -3566,6 +3704,59 @@ def _boss_transition_validation(
         "max_tangent_normal_deviation_deg": max_deviation,
         "min_tangent_surface_angle_deg": min_surface_angle,
         "tolerance_deg": tolerance,
+    }
+
+
+def _surface_band_conformance_validation(
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel,
+    program: PlannedWindingProgram,
+    *,
+    side: str,
+    segment_types: np.ndarray,
+) -> dict[str, Any]:
+    z_values = np.asarray(program.path.z_mm, dtype=float)
+    radius_values = np.asarray(program.path.surface_radius_mm, dtype=float)
+    midpoint = (float(np.min(z_values)) + float(np.max(z_values))) / 2.0
+    side_mask = z_values <= midpoint if side == "left" else z_values >= midpoint
+    boss_radius = float(np.percentile(radius_values, 20)) if radius_values.size else 0.0
+    mask = side_mask & (radius_values <= max(boss_radius, 1e-9) * 1.2) & np.isin(
+        segment_types,
+        ("geodesic_pass", "non_geodesic_pass"),
+    )
+    indices = np.flatnonzero(mask)
+    if indices.size < 2:
+        return {"passed": True, "sample_count": int(indices.size), "max_band_surface_error_mm": 0.0}
+    groups = np.split(indices, np.flatnonzero(np.diff(indices) > 1) + 1)
+    max_error = 0.0
+    sample_count = 0
+    for group in groups:
+        if group.size < 2:
+            continue
+        chunk = SurfacePath(
+            z_mm=np.asarray(program.path.z_mm[group], dtype=float),
+            theta_rad=np.asarray(program.path.theta_rad[group], dtype=float),
+            x_mm=np.asarray(program.path.x_mm[group], dtype=float),
+            y_mm=np.asarray(program.path.y_mm[group], dtype=float),
+            winding_angle_deg=float(program.path.winding_angle_deg),
+            tow_width_mm=float(program.path.tow_width_mm),
+            pass_index=np.asarray(program.path.pass_index[group], dtype=int),
+            tow_eye_angle_deg=(
+                None
+                if program.path.tow_eye_angle_deg is None
+                else np.asarray(program.path.tow_eye_angle_deg[group], dtype=float)
+            ),
+        )
+        tow_band = generate_surface_tow_band(mandrel, chunk)
+        left_radius = np.hypot(tow_band.left_points_mm[:, 0], tow_band.left_points_mm[:, 1])
+        right_radius = np.hypot(tow_band.right_points_mm[:, 0], tow_band.right_points_mm[:, 1])
+        left_error = np.abs(left_radius - mandrel.radius_at(tow_band.left_z_mm))
+        right_error = np.abs(right_radius - mandrel.radius_at(tow_band.right_z_mm))
+        max_error = max(max_error, float(np.max(left_error)), float(np.max(right_error)))
+        sample_count += int(group.size)
+    return {
+        "passed": max_error <= 1e-6,
+        "sample_count": sample_count,
+        "max_band_surface_error_mm": max_error,
     }
 
 
@@ -5122,7 +5313,12 @@ def _warning_slip_risk_deg(warning: str) -> float:
 
 
 def _turnaround_summary(segments: tuple[Any, ...]) -> dict[str, int]:
-    turnaround_types = {"dome_turnaround", "BossTurnaroundArc", "PinContactArc"}
+    turnaround_types = {
+        "dome_turnaround",
+        "BossTurnaroundArc",
+        "DomeTurnaround",
+        "PinContactArc",
+    }
     count = sum(1 for segment in segments if segment.segment_type in turnaround_types)
     points = sum(
         segment.point_count

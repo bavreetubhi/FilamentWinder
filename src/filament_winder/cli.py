@@ -1093,6 +1093,9 @@ def _run_backend_check(args: argparse.Namespace) -> int:
     print("-------------")
     for label, passed in checks.items():
         print(f"{label}: {'PASS' if passed else 'FAIL'}")
+    mandrel_summary = summary.get("mandrel")
+    if isinstance(mandrel_summary, dict) and mandrel_summary.get("min_wind_radius_mm") is not None:
+        print(f"Min wind radius mm: {float(mandrel_summary['min_wind_radius_mm']):.3f}")
     print(f"Backend-ready: {str(bool(summary.get('backend_ready', overall))).lower()}")
     print(f"Machine-ready: {str(bool(summary.get('machine_ready'))).lower()}")
     print(f"Overall backend-ready: {str(overall).lower()}")

@@ -174,9 +174,10 @@ def _score_candidate(
     estimated_coverage: float,
 ) -> float:
     coverage_error = abs(estimated_coverage - request.target_coverage_fraction)
+    undercoverage = max(request.target_coverage_fraction - estimated_coverage, 0.0)
     angle_error = abs(_angle_preference(request) - angle_deg) / 90.0
     pass_penalty = passes / max(1, request.max_passes) * 0.01
-    return coverage_error * 100.0 + angle_error + pass_penalty
+    return coverage_error * 100.0 + undercoverage * 250.0 + angle_error + pass_penalty
 
 
 def _angle_preference(request: CylinderPatternOptimizationRequest) -> float:

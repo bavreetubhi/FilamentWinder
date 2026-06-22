@@ -133,7 +133,14 @@ def _make_segment(
         tow_state="on",
         process_state=(
             "transition"
-            if motion_type in {"transition", "PinTransition", "FreeSpan", "BossTurnaroundArc"}
+            if motion_type
+            in {
+                "transition",
+                "PinTransition",
+                "FreeSpan",
+                "BossTurnaroundArc",
+                "DomeTurnaround",
+            }
             else "winding"
         ),
         warnings=_segment_warnings(program, start_index, end_index),
@@ -176,6 +183,7 @@ def _segment_type(
         "PinTransition",
         "FreeSpan",
         "BossTurnaroundArc",
+        "DomeTurnaround",
     }:
         return motion_type
     if motion_type == "transition":

@@ -151,6 +151,15 @@ def test_gui_button_connections_use_safe_action_wrapper() -> None:
     assert "button.clicked.connect(" in source
 
 
+def test_backend_worker_ignores_duplicate_runs_and_notes_use_plain_text_editor() -> None:
+    source = inspect.getsource(_PreviewWindow)
+
+    assert "if self._backend_busy:" in source
+    assert "another backend job is already running" in source
+    assert 'if key == "notes":' in source
+    assert "QPlainTextEdit()" in source
+
+
 def test_node_graph_accepts_valid_socket_link_and_marks_downstream_stale() -> None:
     registry = default_node_registry()
     graph = NodeGraphState()
@@ -248,8 +257,22 @@ def test_graph_to_config_mapping_builds_backend_config() -> None:
         "polar_10deg",
     ]
     assert [layer.type for layer in config.layers] == ["hoop", "geodesic", "polar"]
+    assert config.mandrel.min_wind_radius_mm == 28.0
+    assert mapping["mandrel"]["min_wind_radius_mm"] == 28.0
     assert mapping["pattern_selection"]["method"] == "textbook_integer_closure"
     assert mapping["output"]["gcode"] is True
+
+
+def test_mandrel_node_min_wind_diameter_maps_to_backend_radius() -> None:
+    graph = default_backend_winding_graph()
+    mandrel = next(node for node in graph.nodes.values() if node.type_id == "mandrel_backend")
+    mandrel.settings["min_wind_diameter_mm"] = 72.0
+
+    config = BackendService().build_project_from_graph(graph)
+    mapping = graph_to_config_mapping(graph)
+
+    assert config.mandrel.min_wind_radius_mm == 36.0
+    assert mapping["mandrel"]["min_wind_radius_mm"] == 36.0
 
 
 def test_connected_layer_nodes_define_stack_ply_order_and_layer_settings() -> None:
@@ -317,6 +340,10 @@ def test_import_config_creates_graph_and_export_graph_to_config(tmp_path: Path) 
     assert path.exists()
     assert restored.project.name == "demo_domed_pressure_vessel"
     assert restored.mandrel.type == "cylinder_with_elliptical_domes"
+    imported_mandrel = next(
+        node for node in graph.nodes.values() if node.type_id == "mandrel_backend"
+    )
+    assert imported_mandrel.settings["min_wind_diameter_mm"] == 56.0
     assert len(restored.layers) == 3
 
 
@@ -672,6 +699,15 @@ def test_inspector_edit_marks_downstream_nodes_stale() -> None:
 
     assert graph.nodes[tow.id].status == "stale"
     assert graph.nodes[pattern.id].status == "stale"
+
+
+def test_global_tow_width_change_updates_backend_viewport_sources() -> None:
+    source = inspect.getsource(_PreviewWindow._on_global_tow_width_changed)
+
+    assert '"tow_backend"' in source
+    assert '"effective_width_mm"' in source
+    assert '"tow_width_mm"' in source
+    assert "_schedule_node_setting_render()" in source
 
 
 def test_project_save_load_preserves_node_view_transform(tmp_path: Path) -> None:

@@ -1,0 +1,51 @@
+project:
+  name: single_helical_layer_test
+  units: mm
+
+machine:
+  axis_order: [A, X, Z, B]
+  mandrel_orientation: horizontal
+  controller: grbl_compatible
+  clearance_mm: 20
+
+mandrel:
+  type: cylinder
+  length_mm: 1000
+  radius_mm: 101.6
+  mesh_points_z: 240
+  mesh_points_theta: 240
+
+tow:
+  tow_id: carbon_tow
+  name: carbon_tow
+  width_mm: 6.0
+  thickness_mm: 0.25
+
+layers:
+  - name: helical_plus_45_only
+    enabled: true
+    type: helical
+    winding_angle_deg: 45
+    direction: forward
+    passes: auto
+    coverage_target: 1.0
+    feedrate_mm_min: 500
+    start_z_mm: 0
+    end_z_mm: 1000
+    colour: "#cc4444"
+    points: 240
+
+output:
+  directory: exports/single_helical_layer_test
+  csv: true
+  summary_json: true
+  gcode: false
+
+plot:
+  enabled: true
+  show: false
+  save: true
+  formats: [png]
+  modes: [unwrapped, three_d, debug_passes]
+  include_2d_unwrapped: true
+  include_3d_path: true

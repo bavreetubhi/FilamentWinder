@@ -74,11 +74,13 @@ from filament_winder.core.geometry import (
 )
 from filament_winder.core.path_planning import (
     CylinderPatternOptimizationRequest,
+    SurfacePath,
     WindingLayerSpec,
     WindingSchedule,
     optimize_cylinder_pattern,
     plan_winding_schedule,
 )
+from filament_winder.core.tow import generate_surface_tow_band
 from filament_winder.io import (
     GCodeOptions,
     export_gcode,
@@ -389,6 +391,31 @@ class _PreviewWindow:
         self.show_tow_band.toggled.connect(
             lambda _checked: self.run_safe_action("Toggle Tow Band", self._render_scene)
         )
+        self.show_mandrel_body = qt_widgets.QCheckBox("Mandrel")
+        self.show_mandrel_body.setChecked(True)
+        self.show_mandrel_body.toggled.connect(
+            lambda _checked: self.run_safe_action("Toggle Mandrel", self._render_scene)
+        )
+        self.show_dome_shell = qt_widgets.QCheckBox("Dome Shell")
+        self.show_dome_shell.setChecked(True)
+        self.show_dome_shell.toggled.connect(
+            lambda _checked: self.run_safe_action("Toggle Dome Shell", self._render_scene)
+        )
+        self.show_cylinder_winding = qt_widgets.QCheckBox("Cylinder Winding")
+        self.show_cylinder_winding.setChecked(True)
+        self.show_cylinder_winding.toggled.connect(
+            lambda _checked: self.run_safe_action("Toggle Cylinder Winding", self._render_scene)
+        )
+        self.show_boss_contact = qt_widgets.QCheckBox("Boss/Contact")
+        self.show_boss_contact.setChecked(True)
+        self.show_boss_contact.toggled.connect(
+            lambda _checked: self.run_safe_action("Toggle Boss Contact", self._render_scene)
+        )
+        self.show_transition_moves = qt_widgets.QCheckBox("Transitions")
+        self.show_transition_moves.setChecked(False)
+        self.show_transition_moves.toggled.connect(
+            lambda _checked: self.run_safe_action("Toggle Transitions", self._render_scene)
+        )
         self.show_coverage = qt_widgets.QCheckBox("Coverage")
         self.show_coverage.setEnabled(False)
         self.show_coverage.setToolTip("Coverage-map display is shown from analysis nodes.")
@@ -410,8 +437,13 @@ class _PreviewWindow:
         toolbar.addWidget(backend_csv)
         toolbar.addWidget(backend_gcode)
         toolbar.addSpacing(12)
+        toolbar.addWidget(self.show_mandrel_body)
         toolbar.addWidget(self.show_tow_path)
         toolbar.addWidget(self.show_tow_band)
+        toolbar.addWidget(self.show_dome_shell)
+        toolbar.addWidget(self.show_cylinder_winding)
+        toolbar.addWidget(self.show_boss_contact)
+        toolbar.addWidget(self.show_transition_moves)
         toolbar.addWidget(self.show_coverage)
         toolbar.addWidget(self.show_machine_view)
         toolbar.addStretch(1)
@@ -583,6 +615,8 @@ class _PreviewWindow:
         self.length = self._double_spin(config.length_mm, 1.0, 10000.0, 10.0)
         self.radius = self._double_spin(config.radius_mm, 1.0, 2000.0, 1.0)
         self.tow_width = self._double_spin(config.tow_width_mm, 0.0, 200.0, 0.5)
+        self._last_global_tow_width_mm = float(config.tow_width_mm)
+        self.tow_width.valueChanged.connect(self._on_global_tow_width_changed)
         self.angle = self._double_spin(config.winding_angle_deg, 1.0, 89.0, 1.0)
         self.points = self._int_spin(config.points_per_pass, 2, 10000, 10)
         self.passes = self._int_spin(config.passes, 1, 200, 1)
@@ -2252,6 +2286,7 @@ class _PreviewWindow:
                 "left_dome_length_mm",
                 "right_dome_length_mm",
                 "polar_opening_radius_mm",
+                "min_wind_diameter_mm",
             ),
             "tow_backend": (
                 "name",
@@ -2323,6 +2358,7 @@ class _PreviewWindow:
             "cylinder_length_mm",
             "cylinder_radius_mm",
             "polar_opening_radius_mm",
+            "min_wind_diameter_mm",
             "feedrate_mm_min",
             "method",
             "output_directory",
@@ -3200,6 +3236,22 @@ class _PreviewWindow:
             )
             return editor
         if isinstance(value, str):
+            if key == "notes":
+                editor = self._qt_widgets.QPlainTextEdit()
+                editor.setPlainText(value)
+                editor.setMaximumHeight(92 if compact else 140)
+                editor.setTabChangesFocus(True)
+                editor.textChanged.connect(
+                    lambda setting_key=key, control=editor: self.run_safe_action(
+                        "Edit Node Setting",
+                        lambda: self._update_node_setting(
+                            node_id,
+                            setting_key,
+                            control.toPlainText(),
+                        ),
+                    )
+                )
+                return editor
             options = self._setting_options(key, value)
             if options:
                 editor = self._qt_widgets.QComboBox()
@@ -3412,6 +3464,27 @@ class _PreviewWindow:
             return False
         return not hasattr(self, "show_tow_band") or self.show_tow_band.isChecked()
 
+    def _viewport_show_mandrel_body(self) -> bool:
+        return not hasattr(self, "show_mandrel_body") or self.show_mandrel_body.isChecked()
+
+    def _viewport_show_dome_shell(self) -> bool:
+        return not hasattr(self, "show_dome_shell") or self.show_dome_shell.isChecked()
+
+    def _viewport_show_cylinder_winding(self) -> bool:
+        return (
+            not hasattr(self, "show_cylinder_winding")
+            or self.show_cylinder_winding.isChecked()
+        )
+
+    def _viewport_show_boss_contact(self) -> bool:
+        return not hasattr(self, "show_boss_contact") or self.show_boss_contact.isChecked()
+
+    def _viewport_show_transition_moves(self) -> bool:
+        return (
+            not hasattr(self, "show_transition_moves")
+            or self.show_transition_moves.isChecked()
+        )
+
     def _display_layer_points(
         self,
         layer: Any,
@@ -3429,50 +3502,138 @@ class _PreviewWindow:
 
     def _display_tow_band_mesh(
         self,
+        mandrel: Any,
         layer: Any,
         *,
         mandrel_length_mm: float,
         center_z_mm: float | None = None,
         display_offset_mm: float = 0.9,
+        motion_types: set[str] | None = None,
     ) -> tuple[Any, Any]:
-        path_points = np.asarray(layer.path.points_mm, dtype=float)
-        if path_points.shape[0] < 2:
-            display_points = orient_points_for_horizontal_view(
-                path_points,
+        meshes = self._display_tow_band_meshes(
+            mandrel,
+            layer,
+            mandrel_length_mm=mandrel_length_mm,
+            center_z_mm=center_z_mm,
+            display_offset_mm=display_offset_mm,
+            motion_types=motion_types,
+        )
+        if not meshes:
+            return np.zeros((0, 3), dtype=float), np.zeros((0, 3), dtype=int)
+        vertices = []
+        faces = []
+        vertex_offset = 0
+        for mesh_vertices, mesh_faces in meshes:
+            vertices.append(mesh_vertices)
+            faces.append(mesh_faces + vertex_offset)
+            vertex_offset += mesh_vertices.shape[0]
+        return np.vstack(vertices), np.vstack(faces)
+
+    def _display_tow_band_meshes(
+        self,
+        mandrel: Any,
+        layer: Any,
+        *,
+        mandrel_length_mm: float,
+        center_z_mm: float | None = None,
+        display_offset_mm: float = 0.9,
+        motion_types: set[str] | None = None,
+    ) -> list[tuple[Any, Any]]:
+        meshes: list[tuple[Any, Any]] = []
+        for chunk in self._surface_path_chunks(layer, motion_types=motion_types):
+            tow_band = generate_surface_tow_band(mandrel, chunk)
+            vertices = orient_points_for_horizontal_view(
+                tow_band.vertices_mm,
                 length_mm=mandrel_length_mm,
                 center_z_mm=center_z_mm,
             )
-            return display_points, np.zeros((0, 3), dtype=int)
-        tangent = np.gradient(path_points, axis=0)
-        tangent_norm = np.linalg.norm(tangent, axis=1)
-        tangent_norm[tangent_norm <= 1e-9] = 1.0
-        tangent = tangent / tangent_norm[:, None]
-        surface_normal = self._path_surface_normals(layer)
-        side = np.cross(surface_normal, tangent)
-        side_norm = np.linalg.norm(side, axis=1)
-        fallback = side_norm <= 1e-9
-        side_norm[fallback] = 1.0
-        side = side / side_norm[:, None]
-        side[fallback] = np.asarray([0.0, 1.0, 0.0])
-        half_width = max(float(layer.spec.tow_width_mm) * 0.5, 0.25)
-        centerline = path_points + surface_normal * display_offset_mm
-        vertices_mandrel = np.empty((centerline.shape[0] * 2, 3), dtype=float)
-        vertices_mandrel[0::2] = centerline - side * half_width
-        vertices_mandrel[1::2] = centerline + side * half_width
-        vertices = orient_points_for_horizontal_view(
-            vertices_mandrel,
-            length_mm=mandrel_length_mm,
-            center_z_mm=center_z_mm,
+            vertices = offset_display_surface(vertices, offset_mm=display_offset_mm)
+            faces = self._quads_to_triangles_local(tow_band.quad_indices)
+            if faces.size > 0:
+                meshes.append((vertices, faces))
+        return meshes
+
+    def _surface_path_chunks(
+        self,
+        layer: Any,
+        *,
+        motion_types: set[str] | None = None,
+    ) -> list[SurfacePath]:
+        points = layer.path.point_count
+        if points < 2:
+            return []
+        labels = tuple(getattr(layer.metadata, "motion_type", ()))
+        if not labels:
+            labels = tuple("wind" for _ in range(points))
+        include = np.asarray(
+            [
+                True if motion_types is None else label in motion_types
+                for label in labels
+            ],
+            dtype=bool,
         )
-        faces = []
-        for index in range(centerline.shape[0] - 1):
-            left0 = index * 2
-            right0 = left0 + 1
-            left1 = left0 + 2
-            right1 = left0 + 3
-            faces.append((left0, left1, right0))
-            faces.append((right0, left1, right1))
-        return vertices, np.asarray(faces, dtype=int)
+        indices = np.flatnonzero(include)
+        if indices.size == 0:
+            return []
+        groups = np.split(indices, np.flatnonzero(np.diff(indices) > 1) + 1)
+        chunks: list[SurfacePath] = []
+        for group in groups:
+            if group.size < 2:
+                continue
+            chunks.append(
+                SurfacePath(
+                    z_mm=np.asarray(layer.path.z_mm[group], dtype=float),
+                    theta_rad=np.asarray(layer.path.theta_rad[group], dtype=float),
+                    x_mm=np.asarray(layer.path.x_mm[group], dtype=float),
+                    y_mm=np.asarray(layer.path.y_mm[group], dtype=float),
+                    winding_angle_deg=float(layer.path.winding_angle_deg),
+                    tow_width_mm=float(layer.path.tow_width_mm),
+                    pass_index=np.asarray(layer.path.pass_index[group], dtype=int),
+                    tow_eye_angle_deg=(
+                        None
+                        if layer.path.tow_eye_angle_deg is None
+                        else np.asarray(layer.path.tow_eye_angle_deg[group], dtype=float)
+                    ),
+                )
+            )
+        return chunks
+
+    def _path_chunks_from_mask(self, path: SurfacePath, mask: Any) -> list[SurfacePath]:
+        include = np.asarray(mask, dtype=bool)
+        indices = np.flatnonzero(include)
+        if indices.size == 0:
+            return []
+        groups = np.split(indices, np.flatnonzero(np.diff(indices) > 1) + 1)
+        chunks: list[SurfacePath] = []
+        for group in groups:
+            if group.size < 2:
+                continue
+            chunks.append(
+                SurfacePath(
+                    z_mm=np.asarray(path.z_mm[group], dtype=float),
+                    theta_rad=np.asarray(path.theta_rad[group], dtype=float),
+                    x_mm=np.asarray(path.x_mm[group], dtype=float),
+                    y_mm=np.asarray(path.y_mm[group], dtype=float),
+                    winding_angle_deg=float(path.winding_angle_deg),
+                    tow_width_mm=float(path.tow_width_mm),
+                    pass_index=np.asarray(path.pass_index[group], dtype=int),
+                    tow_eye_angle_deg=(
+                        None
+                        if path.tow_eye_angle_deg is None
+                        else np.asarray(path.tow_eye_angle_deg[group], dtype=float)
+                    ),
+                )
+            )
+        return chunks
+
+    def _quads_to_triangles_local(self, quads: Any) -> Any:
+        quads_array = np.asarray(quads, dtype=int)
+        if quads_array.size == 0:
+            return np.zeros((0, 3), dtype=int)
+        faces = np.empty((quads_array.shape[0] * 2, 3), dtype=int)
+        faces[0::2] = quads_array[:, [0, 1, 2]]
+        faces[1::2] = quads_array[:, [0, 2, 3]]
+        return faces
 
     def _path_surface_normals(self, layer: Any) -> Any:
         points = np.asarray(layer.path.points_mm, dtype=float)
@@ -3503,6 +3664,174 @@ class _PreviewWindow:
         normal_norm = np.linalg.norm(normals, axis=1)
         normal_norm[normal_norm <= 1e-9] = 1.0
         return normals / normal_norm[:, None]
+
+    def _display_path_chunks(
+        self,
+        layer: Any,
+        *,
+        mandrel_length_mm: float,
+        center_z_mm: float | None = None,
+        display_offset_mm: float = 0.75,
+        motion_types: set[str] | None = None,
+    ) -> list[Any]:
+        return [
+            offset_display_surface(
+                orient_points_for_horizontal_view(
+                    chunk.points_mm,
+                    length_mm=mandrel_length_mm,
+                    center_z_mm=center_z_mm,
+                ),
+                offset_mm=display_offset_mm,
+            )
+            for chunk in self._surface_path_chunks(layer, motion_types=motion_types)
+        ]
+
+    def _layer_visual_bucket(self, layer: Any) -> str:
+        winding_type = str(layer.spec.winding_type)
+        if winding_type in {"hoop", "helical", "local_reinforcement_band"}:
+            return "cylinder"
+        if winding_type == "transition":
+            return "transition"
+        return "dome"
+
+    def _draw_program_visuals(
+        self,
+        scene: Any,
+        mandrel: Any,
+        program: Any,
+        *,
+        center_z_mm: float | None = None,
+    ) -> None:
+        colors = {
+            "cylinder_band": (0.20, 0.72, 0.95, 0.46),
+            "dome_band": (0.98, 0.58, 0.18, 0.46),
+            "cylinder_path": (0.30, 0.85, 1.0, 0.85),
+            "dome_path": (1.0, 0.72, 0.30, 0.85),
+            "boss": (0.92, 0.34, 0.60, 0.95),
+            "transition": (0.85, 0.85, 0.88, 0.65),
+        }
+        wind_motion = {
+            "wind",
+            "SurfaceSpan",
+            "CylinderHelixSpan",
+            "DomeSurfaceSpan",
+            "DomeTurnaround",
+        }
+        boss_motion = {"BossTurnaroundArc", "DomeTurnaround", "PinContactArc"}
+        transition_motion = {"transition", "PinTransition", "FreeSpan"}
+        for layer in program.layers:
+            bucket = self._layer_visual_bucket(layer)
+            if self._viewport_show_tow_path():
+                if bucket == "cylinder" and self._viewport_show_cylinder_winding():
+                    for points in self._display_path_chunks(
+                        layer,
+                        mandrel_length_mm=mandrel.length_mm,
+                        center_z_mm=center_z_mm,
+                        motion_types=wind_motion,
+                    ):
+                        self._visuals.append(
+                            scene.visuals.Line(
+                                pos=points,
+                                color=colors["cylinder_path"],
+                                width=1.8,
+                                parent=self.view.scene,
+                            )
+                        )
+                        self._visuals[-1].set_gl_state("opaque", depth_test=True)
+                elif bucket == "dome" and self._viewport_show_dome_shell():
+                    for points in self._display_path_chunks(
+                        layer,
+                        mandrel_length_mm=mandrel.length_mm,
+                        center_z_mm=center_z_mm,
+                        motion_types=wind_motion,
+                    ):
+                        self._visuals.append(
+                            scene.visuals.Line(
+                                pos=points,
+                                color=colors["dome_path"],
+                                width=1.6,
+                                parent=self.view.scene,
+                            )
+                        )
+                        self._visuals[-1].set_gl_state("opaque", depth_test=True)
+                if self._viewport_show_boss_contact():
+                    for points in self._display_path_chunks(
+                        layer,
+                        mandrel_length_mm=mandrel.length_mm,
+                        center_z_mm=center_z_mm,
+                        motion_types=boss_motion,
+                    ):
+                        self._visuals.append(
+                            scene.visuals.Line(
+                                pos=points,
+                                color=colors["boss"],
+                                width=2.2,
+                                parent=self.view.scene,
+                            )
+                        )
+                        self._visuals[-1].set_gl_state("opaque", depth_test=True)
+                if bucket == "transition" and self._viewport_show_transition_moves():
+                    for points in self._display_path_chunks(
+                        layer,
+                        mandrel_length_mm=mandrel.length_mm,
+                        center_z_mm=center_z_mm,
+                        motion_types=transition_motion,
+                    ):
+                        self._visuals.append(
+                            scene.visuals.Line(
+                                pos=points,
+                                color=colors["transition"],
+                                width=1.4,
+                                parent=self.view.scene,
+                            )
+                        )
+                        self._visuals[-1].set_gl_state("translucent", depth_test=True)
+            if not self._viewport_show_tow_band():
+                continue
+            if bucket == "cylinder" and self._viewport_show_cylinder_winding():
+                for vertices, faces in self._display_tow_band_meshes(
+                    mandrel,
+                    layer,
+                    mandrel_length_mm=mandrel.length_mm,
+                    center_z_mm=center_z_mm,
+                    motion_types=wind_motion,
+                ):
+                    self._visuals.append(
+                        scene.visuals.Mesh(
+                            vertices=vertices,
+                            faces=faces,
+                            color=colors["cylinder_band"],
+                            shading="smooth",
+                            parent=self.view.scene,
+                        )
+                    )
+                    self._visuals[-1].set_gl_state(
+                        "translucent",
+                        depth_test=True,
+                        cull_face=False,
+                    )
+            elif bucket == "dome" and self._viewport_show_dome_shell():
+                for vertices, faces in self._display_tow_band_meshes(
+                    mandrel,
+                    layer,
+                    mandrel_length_mm=mandrel.length_mm,
+                    center_z_mm=center_z_mm,
+                    motion_types=wind_motion,
+                ):
+                    self._visuals.append(
+                        scene.visuals.Mesh(
+                            vertices=vertices,
+                            faces=faces,
+                            color=colors["dome_band"],
+                            shading="smooth",
+                            parent=self.view.scene,
+                        )
+                    )
+                    self._visuals[-1].set_gl_state(
+                        "translucent",
+                        depth_test=True,
+                        cull_face=False,
+                    )
 
     def _apply_node_inspector(self) -> None:
         selected = self._selected_node_ids()
@@ -3962,6 +4291,18 @@ class _PreviewWindow:
         self._start_backend_service_worker("export_gcode")
 
     def _start_backend_service_worker(self, operation: str) -> None:
+        if self._backend_busy:
+            self._logger.info(
+                "Backend %s ignored because a backend job is already running",
+                operation,
+            )
+            self._append_gui_log(
+                "Backend",
+                "skipped",
+                f"{operation}: another backend job is already running",
+            )
+            self._set_node_status("A backend update is already running.")
+            return
         self._sync_node_graph_from_scene()
         graph_data = self._node_graph.to_dict()
         registry = self._node_registry
@@ -4041,6 +4382,10 @@ class _PreviewWindow:
         if self._closing:
             return
         self._node_graph = NodeGraphState.from_dict(graph_data, self._node_registry)
+        self._logger.info("Backend %s complete", operation)
+        self._append_gui_log("Backend", "complete", operation)
+        self._finish_task_progress("Complete")
+        self._set_backend_busy(False, f"Complete: {operation.replace('_', ' ')}")
         if isinstance(payload, BackendCheckResult):
             self._last_backend_check = payload
             self._apply_backend_check_result(payload)
@@ -4060,10 +4405,6 @@ class _PreviewWindow:
             self._mark_backend_nodes_passed(f"{operation} complete")
             self._set_node_status(f"{operation.replace('_', ' ').title()} complete")
         self._redraw_node_graph()
-        self._logger.info("Backend %s complete", operation)
-        self._append_gui_log("Backend", "complete", operation)
-        self._finish_task_progress("Complete")
-        self._set_backend_busy(False, f"Complete: {operation.replace('_', ' ')}")
 
     def _on_backend_service_worker_failed(
         self,
@@ -4854,6 +5195,37 @@ class _PreviewWindow:
     def _on_layer_table_changed(self, *_args: Any) -> None:
         self._render_scene()
 
+    def _on_global_tow_width_changed(self, value: float) -> None:
+        previous = float(getattr(self, "_last_global_tow_width_mm", value))
+        new_width = float(value)
+        self._last_global_tow_width_mm = new_width
+        if not hasattr(self, "_node_graph"):
+            return
+        changed = False
+        for node in self._node_graph.nodes.values():
+            if node.type_id == "tow_backend":
+                if node.settings.get("width_mm") != new_width:
+                    node.settings["width_mm"] = new_width
+                    changed = True
+                if (
+                    not bool(node.settings.get("calibrated_effective_width", False))
+                    and node.settings.get("effective_width_mm") != new_width
+                ):
+                    node.settings["effective_width_mm"] = new_width
+                    changed = True
+            if node.type_id in {
+                "layer_backend",
+                "hoop_layer",
+                "geodesic_layer",
+                "non_geodesic_layer",
+            }:
+                current = node.settings.get("tow_width_mm")
+                if current in {None, ""} or abs(float(current) - previous) < 1e-9:
+                    node.settings["tow_width_mm"] = new_width
+                    changed = True
+        if changed:
+            self._schedule_node_setting_render()
+
     def _is_profile_dome_mode(self) -> bool:
         return self.mode.currentText() == "Profile Dome"
 
@@ -5012,56 +5384,19 @@ class _PreviewWindow:
             mesh_vertices,
             length_mm=mandrel.length_mm,
         )
-        self._visuals.append(
-            scene.visuals.Mesh(
-                vertices=display_mandrel,
-                faces=mesh_faces,
-                color=(0.42, 0.49, 0.55, 1.0),
-                shading="smooth",
-                parent=self.view.scene,
+        if self._viewport_show_mandrel_body():
+            self._visuals.append(
+                scene.visuals.Mesh(
+                    vertices=display_mandrel,
+                    faces=mesh_faces,
+                    color=(0.32, 0.38, 0.44, 0.96),
+                    shading="smooth",
+                    parent=self.view.scene,
+                )
             )
-        )
-        self._visuals[-1].set_gl_state("opaque", depth_test=True, cull_face=False)
+            self._visuals[-1].set_gl_state("opaque", depth_test=True, cull_face=False)
         self._render_pin_layout_visuals(config, mandrel)
-        colors = (
-            (0.10, 0.58, 1.0, 1.0),
-            (1.0, 0.52, 0.12, 1.0),
-            (0.30, 0.82, 0.44, 1.0),
-            (0.86, 0.36, 0.95, 1.0),
-        )
-        if self._viewport_show_tow_path():
-            for index, layer in enumerate(program.layers):
-                points = self._display_layer_points(layer, mandrel_length_mm=mandrel.length_mm)
-                if points.shape[0] < 2:
-                    continue
-                self._visuals.append(
-                    scene.visuals.Line(
-                        pos=points,
-                        color=colors[index % len(colors)],
-                        width=2.0,
-                        parent=self.view.scene,
-                    )
-                )
-                self._visuals[-1].set_gl_state("opaque", depth_test=True)
-        if self._viewport_show_tow_band():
-            for index, layer in enumerate(program.layers):
-                vertices, faces = self._display_tow_band_mesh(
-                    layer,
-                    mandrel_length_mm=mandrel.length_mm,
-                )
-                if faces.size == 0:
-                    continue
-                color = colors[index % len(colors)]
-                self._visuals.append(
-                    scene.visuals.Mesh(
-                        vertices=vertices,
-                        faces=faces,
-                        color=(color[0], color[1], color[2], 0.38),
-                        shading="flat",
-                        parent=self.view.scene,
-                    )
-                )
-                self._visuals[-1].set_gl_state("translucent", depth_test=True, cull_face=False)
+        self._draw_program_visuals(scene, mandrel, program)
         scale = max(mandrel.length_mm, radius_mm * 6.0)
         self.view.camera.distance = scale * 1.4
         self.view.camera.center = (0.0, 0.0, 0.0)
@@ -5134,7 +5469,11 @@ class _PreviewWindow:
                     end_z_mm=layer.end_z_mm,
                     feedrate_mm_min=layer.feedrate_mm_min,
                     transition_points=20,
-                    turnaround_radius_mm=layer.turnaround_radius_mm,
+                    turnaround_radius_mm=(
+                        layer.turnaround_radius_mm
+                        if layer.turnaround_radius_mm is not None
+                        else config.mandrel.min_wind_radius_mm
+                    ),
                     phase_offset_deg=layer.phase_offset_deg,
                     colour=layer.colour,
                 )
@@ -5183,58 +5522,23 @@ class _PreviewWindow:
             mesh_vertices,
             length_mm=mandrel.length_mm,
         )
-        self._visuals.append(
-            scene.visuals.Mesh(
-                vertices=display_mandrel,
-                faces=mesh_faces,
-                color=(0.42, 0.49, 0.55, 1.0),
-                shading="smooth",
-                parent=self.view.scene,
+        if self._viewport_show_mandrel_body():
+            self._visuals.append(
+                scene.visuals.Mesh(
+                    vertices=display_mandrel,
+                    faces=mesh_faces,
+                    color=(0.32, 0.38, 0.44, 0.96),
+                    shading="smooth",
+                    parent=self.view.scene,
+                )
             )
+            self._visuals[-1].set_gl_state("opaque", depth_test=True, cull_face=False)
+        self._draw_program_visuals(
+            scene,
+            mandrel,
+            program,
+            center_z_mm=0.5 * mandrel.length_mm,
         )
-        self._visuals[-1].set_gl_state("opaque", depth_test=True, cull_face=False)
-        colors = (
-            (0.10, 0.58, 1.0, 1.0),
-            (1.0, 0.52, 0.12, 1.0),
-            (0.30, 0.82, 0.44, 1.0),
-            (0.86, 0.36, 0.95, 1.0),
-        )
-        if self._viewport_show_tow_path():
-            for index, layer in enumerate(program.layers):
-                points = self._display_layer_points(
-                    layer,
-                    mandrel_length_mm=mandrel.length_mm,
-                    center_z_mm=0.5 * mandrel.length_mm,
-                )
-                self._visuals.append(
-                    scene.visuals.Line(
-                        pos=points,
-                        color=colors[index % len(colors)],
-                        width=2.0,
-                        parent=self.view.scene,
-                    )
-                )
-                self._visuals[-1].set_gl_state("opaque", depth_test=True)
-        if self._viewport_show_tow_band():
-            for index, layer in enumerate(program.layers):
-                vertices, faces = self._display_tow_band_mesh(
-                    layer,
-                    mandrel_length_mm=mandrel.length_mm,
-                    center_z_mm=0.5 * mandrel.length_mm,
-                )
-                if faces.size == 0:
-                    continue
-                color = colors[index % len(colors)]
-                self._visuals.append(
-                    scene.visuals.Mesh(
-                        vertices=vertices,
-                        faces=faces,
-                        color=(color[0], color[1], color[2], 0.38),
-                        shading="flat",
-                        parent=self.view.scene,
-                    )
-                )
-                self._visuals[-1].set_gl_state("translucent", depth_test=True, cull_face=False)
         scale = max(mandrel.length_mm, mandrel.radius_mm * 6.0)
         self.view.camera.distance = scale * 1.4
         self.view.camera.center = (0.0, 0.0, 0.0)
@@ -5300,46 +5604,23 @@ class _PreviewWindow:
             visual.parent = None
         self._visuals.clear()
 
-        self._visuals.append(
-            scene.visuals.Mesh(
-                vertices=preview.display_mandrel_vertices_mm,
-                faces=preview.mandrel_faces,
-                color=(0.42, 0.49, 0.55, 1.0),
-                shading="smooth",
-                parent=self.view.scene,
+        if self._viewport_show_mandrel_body():
+            self._visuals.append(
+                scene.visuals.Mesh(
+                    vertices=preview.display_mandrel_vertices_mm,
+                    faces=preview.mandrel_faces,
+                    color=(0.32, 0.38, 0.44, 0.96),
+                    shading="smooth",
+                    parent=self.view.scene,
+                )
             )
+            self._visuals[-1].set_gl_state("opaque", depth_test=True, cull_face=False)
+        self._draw_program_visuals(
+            scene,
+            preview.mandrel,
+            preview.program,
+            center_z_mm=_display_center_z_mm(preview.mandrel),
         )
-        self._visuals[-1].set_gl_state("opaque", depth_test=True, cull_face=False)
-
-        colors = (
-            (0.10, 0.58, 1.0, 1.0),
-            (1.0, 0.52, 0.12, 1.0),
-            (0.30, 0.82, 0.44, 1.0),
-            (0.86, 0.36, 0.95, 1.0),
-        )
-        if self._viewport_show_tow_path():
-            for index, points in enumerate(preview.display_layer_path_points_mm):
-                if points.shape[0] < 2:
-                    continue
-                self._visuals.append(
-                    scene.visuals.Line(
-                        pos=points,
-                        color=colors[index % len(colors)],
-                        width=2.0,
-                        parent=self.view.scene,
-                    )
-                )
-                self._visuals[-1].set_gl_state("opaque", depth_test=True)
-            for points in preview.display_transition_path_points_mm:
-                self._visuals.append(
-                    scene.visuals.Line(
-                        pos=points,
-                        color=(0.90, 0.90, 0.90, 0.75),
-                        width=1.5,
-                        parent=self.view.scene,
-                    )
-                )
-                self._visuals[-1].set_gl_state("translucent", depth_test=True)
 
         radius_mm = _preview_radius_mm(preview.mandrel)
         scale = max(preview.mandrel.length_mm, radius_mm * 6.0)
@@ -5378,26 +5659,81 @@ class _PreviewWindow:
             visual.parent = None
         self._visuals.clear()
 
-        self._visuals.append(
-            scene.visuals.Mesh(
-                vertices=preview.display_profile_vertices_mm,
-                faces=preview.profile_faces,
-                color=(0.42, 0.49, 0.55, 1.0),
-                shading="smooth",
-                parent=self.view.scene,
-            )
-        )
-        self._visuals[-1].set_gl_state("opaque", depth_test=True, cull_face=False)
-        if self._viewport_show_tow_path():
+        if self._viewport_show_mandrel_body():
             self._visuals.append(
-                scene.visuals.Line(
-                    pos=preview.display_path_points_mm,
-                    color=(0.10, 0.58, 1.0, 1.0),
-                    width=2.5,
+                scene.visuals.Mesh(
+                    vertices=preview.display_profile_vertices_mm,
+                    faces=preview.profile_faces,
+                    color=(0.32, 0.38, 0.44, 0.96),
+                    shading="smooth",
                     parent=self.view.scene,
                 )
             )
-            self._visuals[-1].set_gl_state("opaque", depth_test=True)
+            self._visuals[-1].set_gl_state("opaque", depth_test=True, cull_face=False)
+        z_gradient = np.abs(np.gradient(np.asarray(preview.path.z_mm, dtype=float)))
+        shell_mask = z_gradient > 1e-6
+        if self._viewport_show_tow_band():
+            for chunk in self._path_chunks_from_mask(preview.path, shell_mask):
+                tow_band = generate_surface_tow_band(preview.profile, chunk)
+                vertices = offset_display_surface(
+                    orient_points_for_horizontal_view(
+                        tow_band.vertices_mm,
+                        length_mm=preview.profile.length_mm,
+                        center_z_mm=_display_center_z_mm(preview.profile),
+                    ),
+                    offset_mm=0.9,
+                )
+                faces = self._quads_to_triangles_local(tow_band.quad_indices)
+                if faces.size == 0:
+                    continue
+                self._visuals.append(
+                    scene.visuals.Mesh(
+                        vertices=vertices,
+                        faces=faces,
+                        color=(0.98, 0.58, 0.18, 0.48),
+                        shading="smooth",
+                        parent=self.view.scene,
+                    )
+                )
+                self._visuals[-1].set_gl_state("translucent", depth_test=True, cull_face=False)
+        if self._viewport_show_tow_path():
+            for chunk in self._path_chunks_from_mask(preview.path, shell_mask):
+                display_points = offset_display_surface(
+                    orient_points_for_horizontal_view(
+                        chunk.points_mm,
+                        length_mm=preview.profile.length_mm,
+                        center_z_mm=_display_center_z_mm(preview.profile),
+                    ),
+                    offset_mm=0.75,
+                )
+                self._visuals.append(
+                    scene.visuals.Line(
+                        pos=display_points,
+                        color=(1.0, 0.72, 0.30, 0.85),
+                        width=1.8,
+                        parent=self.view.scene,
+                    )
+                )
+                self._visuals[-1].set_gl_state("opaque", depth_test=True)
+            if self._viewport_show_boss_contact():
+                for chunk in self._path_chunks_from_mask(preview.path, ~shell_mask):
+                    display_points = offset_display_surface(
+                        orient_points_for_horizontal_view(
+                            chunk.points_mm,
+                            length_mm=preview.profile.length_mm,
+                            center_z_mm=_display_center_z_mm(preview.profile),
+                        ),
+                        offset_mm=0.75,
+                    )
+                    self._visuals.append(
+                        scene.visuals.Line(
+                            pos=display_points,
+                            color=(0.92, 0.34, 0.60, 0.95),
+                            width=2.2,
+                            parent=self.view.scene,
+                        )
+                    )
+                    self._visuals[-1].set_gl_state("opaque", depth_test=True)
 
         scale = max(preview.profile.length_mm, preview.profile.max_radius_mm * 6.0)
         self.view.camera.distance = scale * 1.4
@@ -5920,6 +6256,12 @@ def _preview_radius_mm(mandrel: Any) -> float:
     return float(mandrel.radius_mm)
 
 
+def _display_center_z_mm(mandrel: Any) -> float:
+    if hasattr(mandrel, "start_z_mm") and hasattr(mandrel, "end_z_mm"):
+        return 0.5 * (float(mandrel.start_z_mm) + float(mandrel.end_z_mm))
+    return float(mandrel.length_mm) * 0.5
+
+
 def _node_status_color(status: str) -> str:
     colors = {
         "not_run": "#7d8790",
@@ -5986,6 +6328,11 @@ def _safe_output_prefix(name: str) -> str:
 
 
 def _setting_label(name: str) -> str:
+    labels = {
+        "min_wind_diameter_mm": "Min wind diam mm",
+    }
+    if name in labels:
+        return labels[name]
     return name.replace("_", " ").strip().capitalize()
 
 
@@ -6084,12 +6431,24 @@ def _modern_stylesheet() -> str:
         background: #2b6cb0;
         border-color: #3b82c4;
     }
-    QLineEdit, QPlainTextEdit, QListWidget, QDoubleSpinBox, QSpinBox, QComboBox {
+    QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QTableWidget,
+    QDoubleSpinBox, QSpinBox, QComboBox {
         background: #0f141a;
         border: 1px solid #33404d;
         border-radius: 4px;
         padding: 4px;
         selection-background-color: #2b6cb0;
+    }
+    QTableWidget {
+        gridline-color: #253342;
+        alternate-background-color: #131a21;
+    }
+    QHeaderView::section {
+        background: #1a2430;
+        border: 1px solid #2b3947;
+        padding: 4px 6px;
+        color: #d7e0e8;
+        font-weight: 600;
     }
     QWidget#inlineNodeSettings {
         background: #101820;
@@ -6103,6 +6462,7 @@ def _modern_stylesheet() -> str:
         padding: 2px 0;
     }
     QLineEdit#inlineNodeSettingEditor,
+    QPlainTextEdit#inlineNodeSettingEditor,
     QDoubleSpinBox#inlineNodeSettingEditor,
     QSpinBox#inlineNodeSettingEditor,
     QComboBox#inlineNodeSettingEditor {
@@ -6114,6 +6474,7 @@ def _modern_stylesheet() -> str:
         font-size: 10px;
     }
     QLineEdit#inlineNodeSettingEditor:focus,
+    QPlainTextEdit#inlineNodeSettingEditor:focus,
     QDoubleSpinBox#inlineNodeSettingEditor:focus,
     QSpinBox#inlineNodeSettingEditor:focus,
     QComboBox#inlineNodeSettingEditor:focus {

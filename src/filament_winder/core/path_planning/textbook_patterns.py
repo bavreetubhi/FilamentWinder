@@ -174,6 +174,12 @@ class PatternSearchRequest:
     max_winding_time_min: float = 600.0
     max_thickness_variation_percent: float = 75.0
     max_polar_buildup_mm: float = 0.75
+    prefer_full_cylinder_coverage: bool = False
+    undercoverage_weight: float = 1.0
+    overlap_weight: float = 1.0
+    thickness_weight: float = 1.0
+    polar_buildup_weight: float = 1.0
+    time_weight: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,6 +483,7 @@ def _make_candidate(
         windings=nd,
         required_nd=required_nd,
         winding_time_min=winding_time_min,
+        request=request,
     )
     return WindingPatternCandidate(
         pattern_id=f"{request.layer_id}-{pattern_type}-{pattern_index:04d}",
@@ -590,20 +597,42 @@ def _candidate_score(
     windings: int,
     required_nd: int,
     winding_time_min: float,
+    request: PatternSearchRequest,
 ) -> float:
-    coverage_error = abs(coverage_estimate - target_coverage)
+    if not request.prefer_full_cylinder_coverage:
+        coverage_error = abs(coverage_estimate - target_coverage)
+        overlap_penalty = max(coverage_estimate - target_coverage, 0.0)
+        winding_penalty = abs(windings - required_nd) / max(required_nd, 1)
+        excessive_time_penalty = max(winding_time_min - 60.0, 0.0)
+        return (
+            closure_error * 250.0
+            + coverage_error * 160.0
+            + overlap_penalty * 320.0
+            + thickness_summary.thickness_variation_percent * 0.2
+            + thickness_summary.polar_buildup_mm * 80.0
+            + winding_penalty * 15.0
+            + winding_time_min * 0.25
+            + excessive_time_penalty * 0.75
+        )
+    undercoverage_penalty = max(target_coverage - coverage_estimate, 0.0)
     overlap_penalty = max(coverage_estimate - target_coverage, 0.0)
+    coverage_error = undercoverage_penalty + overlap_penalty * 0.35
     winding_penalty = abs(windings - required_nd) / max(required_nd, 1)
     excessive_time_penalty = max(winding_time_min - 60.0, 0.0)
+    undercoverage_penalty *= 2.4
+    overlap_penalty *= 0.45
     return (
         closure_error * 250.0
-        + coverage_error * 160.0
-        + overlap_penalty * 320.0
-        + thickness_summary.thickness_variation_percent * 0.2
-        + thickness_summary.polar_buildup_mm * 80.0
+        + coverage_error * 150.0 * max(request.undercoverage_weight, 0.05)
+        + undercoverage_penalty * 340.0 * max(request.undercoverage_weight, 0.05)
+        + overlap_penalty * 120.0 * max(request.overlap_weight, 0.05)
+        + thickness_summary.thickness_variation_percent
+        * 0.2
+        * max(request.thickness_weight, 0.0)
+        + thickness_summary.polar_buildup_mm * 80.0 * max(request.polar_buildup_weight, 0.0)
         + winding_penalty * 15.0
-        + winding_time_min * 0.25
-        + excessive_time_penalty * 0.75
+        + winding_time_min * 0.25 * max(request.time_weight, 0.0)
+        + excessive_time_penalty * 0.75 * max(request.time_weight, 0.0)
     )
 
 

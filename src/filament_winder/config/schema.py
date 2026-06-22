@@ -41,6 +41,7 @@ class MandrelConfig:
     left_dome_length_mm: float = 0.0
     right_dome_length_mm: float = 0.0
     polar_opening_radius_mm: float = 0.0
+    min_wind_radius_mm: float | None = None
     profile_path: Path | None = None
     samples: int | None = None
     mesh_points_z: int = 240
@@ -303,6 +304,7 @@ def _mandrel_config(raw: object) -> MandrelConfig:
         left_dome_length_mm=float(data.get("left_dome_length_mm", 0.0)),
         right_dome_length_mm=float(data.get("right_dome_length_mm", 0.0)),
         polar_opening_radius_mm=float(data.get("polar_opening_radius_mm", 0.0)),
+        min_wind_radius_mm=_optional_float(data.get("min_wind_radius_mm")),
         profile_path=(
             None
             if data.get("profile_path") in {None, ""}

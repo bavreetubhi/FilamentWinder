@@ -20,6 +20,7 @@ from filament_winder.core.path_planning import (
     select_winding_pattern,
 )
 from filament_winder.services import generate_winding_job
+from filament_winder.services.winding_job import _pattern_request_for_layer
 
 
 def test_leading_pattern_integer_condition() -> None:
@@ -141,6 +142,32 @@ def test_pattern_score_penalises_high_overlap_and_time() -> None:
     assert low_overlap.selected is not None
     assert high_overlap.selected is not None
     assert high_overlap.selected.score > low_overlap.selected.score
+
+
+def test_cylinder_helical_layers_bias_pattern_search_toward_cylinder_coverage(
+    tmp_path: Path,
+) -> None:
+    config = load_winding_config(_write_textbook_config(tmp_path))
+    mandrel = CylinderMandrel(
+        length_mm=config.mandrel.length_mm,
+        radius_mm=config.mandrel.radius_mm,
+    )
+    layer = next(item for item in config.layers if item.type == "helical")
+
+    request = _pattern_request_for_layer(
+        config,
+        mandrel,
+        layer,
+        1,
+        stack_pair_count=1,
+        coverage_share=1.0,
+    )
+
+    assert request.target_coverage >= 0.95
+    assert request.prefer_full_cylinder_coverage is True
+    assert request.undercoverage_weight > request.overlap_weight
+    assert request.thickness_weight < 1.0
+    assert request.polar_buildup_weight < 1.0
 
 
 def test_geodesic_angle_changes_on_dome() -> None:

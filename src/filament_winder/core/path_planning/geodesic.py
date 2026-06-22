@@ -22,6 +22,7 @@ class GeodesicPathConfig:
     start_theta_rad: float = 0.0
     direction: Direction = "positive"
     turnaround_radius_mm: float | None = None
+    reference_radius_mm: float | None = None
     point_count: int = 400
 
 
@@ -36,6 +37,7 @@ class ControlledAnglePathConfig:
     allowed_angle_error_deg: float = 5.0
     high_slip_risk_deg: float = 15.0
     smoothing_strength: float = 1.0
+    reference_radius_mm: float | None = None
     point_count: int = 400
 
 
@@ -61,8 +63,14 @@ def generate_geodesic_path(
         radius = radius[valid]
     if z_mm.size < 2:
         raise ValueError("geodesic path has fewer than two valid points")
-    start_radius = float(radius[0])
-    constant = start_radius * np.sin(np.deg2rad(abs(config.initial_angle_deg)))
+    reference_radius = (
+        float(radius[0])
+        if config.reference_radius_mm is None
+        else float(config.reference_radius_mm)
+    )
+    if not np.isfinite(reference_radius) or reference_radius <= 0.0:
+        raise ValueError("reference_radius_mm must be positive when provided")
+    constant = reference_radius * np.sin(np.deg2rad(abs(config.initial_angle_deg)))
     sin_alpha = np.clip(constant / np.maximum(radius, 1e-9), -0.999999, 0.999999)
     alpha = np.arcsin(sin_alpha)
     theta_rad = _integrate_theta(
@@ -100,7 +108,14 @@ def generate_controlled_angle_path(
     z_mm = _z_samples(config.start_z_mm, config.end_z_mm, config.point_count, config.direction)
     radius = mandrel.radius_at(z_mm)
     target = np.full(z_mm.shape, np.deg2rad(abs(config.target_angle_deg)), dtype=float)
-    start_constant = float(radius[0]) * np.sin(target[0])
+    reference_radius = (
+        float(radius[0])
+        if config.reference_radius_mm is None
+        else float(config.reference_radius_mm)
+    )
+    if not np.isfinite(reference_radius) or reference_radius <= 0.0:
+        raise ValueError("reference_radius_mm must be positive when provided")
+    start_constant = reference_radius * np.sin(target[0])
     geodesic_angle = np.arcsin(
         np.clip(start_constant / np.maximum(radius, 1e-9), -0.999999, 0.999999)
     )

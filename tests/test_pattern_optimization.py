@@ -27,11 +27,12 @@ def test_optimize_cylinder_pattern_finds_near_full_coverage_closed_candidate() -
 
     best = result.best
 
-    assert best.passes == 49
-    assert best.turns_per_pass == 3
-    assert best.phase_offset_deg == pytest.approx(360.0 / 49.0)
-    assert best.estimated_coverage_percent == pytest.approx(99.843324, rel=1e-6)
-    assert abs(best.estimated_gap_overlap_mm) < 0.02
+    assert best.passes == 15
+    assert best.turns_per_pass == 11
+    assert best.phase_offset_deg == pytest.approx(360.0 / best.passes)
+    assert best.estimated_coverage_percent >= 100.0
+    assert best.estimated_gap_overlap_mm <= 0.0
+    assert abs(best.estimated_gap_overlap_mm) < 0.01
 
 
 def test_optimize_cylinder_pattern_returns_ranked_candidates() -> None:
