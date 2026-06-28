@@ -1580,7 +1580,7 @@ def _pattern_request_for_layer(
     stack_pair_count: int = 1,
     coverage_share: float | None = None,
 ) -> PatternSearchRequest:
-    start_z, end_z = _layer_z_bounds(config, layer)
+    start_z, end_z = _layer_z_bounds(config, layer, mandrel)
     tow_width = (
         layer.tow_width_mm
         if layer.tow_width_mm is not None
@@ -5452,6 +5452,7 @@ def _build_mandrel(config: WindingJobConfig) -> CylinderMandrel | AxisymmetricPr
         right_dome_length_mm=config.mandrel.right_dome_length_mm,
         polar_opening_radius_mm=config.mandrel.polar_opening_radius_mm,
         samples_per_region=max(16, config.mandrel.mesh_points_z // 3),
+        dome_shape=config.mandrel.dome_shape,
         name=config.project.name,
     )
 
@@ -5516,23 +5517,54 @@ def _mandrel_radius(mandrel: CylinderMandrel | AxisymmetricProfileMandrel) -> fl
     return mandrel.max_radius_mm
 
 
-def _layer_z_bounds(config: WindingJobConfig, layer: LayerConfig) -> tuple[float, float]:
-    total_length = _mandrel_length_mm(config)
-    if config.mandrel.type == "cylinder":
-        default_start, default_end = 0.0, total_length
-    elif layer.region == "cylinder_only":
-        default_start = config.mandrel.left_dome_length_mm
-        cylinder_length = config.mandrel.cylinder_length_mm or config.mandrel.length_mm
-        default_end = default_start + cylinder_length
-    elif layer.region == "left_dome_only":
-        default_start, default_end = 0.0, config.mandrel.left_dome_length_mm
-    elif layer.region == "right_dome_only":
-        default_start = config.mandrel.left_dome_length_mm + (
-            config.mandrel.cylinder_length_mm or config.mandrel.length_mm
-        )
-        default_end = total_length
+def _layer_z_bounds(
+    config: WindingJobConfig,
+    layer: LayerConfig,
+    mandrel: CylinderMandrel | AxisymmetricProfileMandrel | None = None,
+) -> tuple[float, float]:
+    if isinstance(mandrel, AxisymmetricProfileMandrel):
+        # Use actual mandrel dimensions (important when dome_shape overrides
+        # config lengths, e.g. isotensoid)
+        m_start = float(mandrel.start_z_mm)
+        m_end = float(mandrel.end_z_mm)
+        total_length = m_end - m_start
+        if layer.region == "cylinder_only":
+            eps = 1e-3
+            cyl = np.where(mandrel.r_mm >= mandrel.max_radius_mm - eps)[0]
+            if len(cyl) > 0:
+                default_start = float(mandrel.z_mm[cyl[0]])
+                default_end = float(mandrel.z_mm[cyl[-1]])
+            else:
+                default_start, default_end = m_start, m_end
+        elif layer.region == "left_dome_only":
+            eps = 1e-3
+            cyl = np.where(mandrel.r_mm >= mandrel.max_radius_mm - eps)[0]
+            default_start = m_start
+            default_end = float(mandrel.z_mm[cyl[0]]) if len(cyl) > 0 else m_end
+        elif layer.region == "right_dome_only":
+            eps = 1e-3
+            cyl = np.where(mandrel.r_mm >= mandrel.max_radius_mm - eps)[0]
+            default_start = float(mandrel.z_mm[cyl[-1]]) if len(cyl) > 0 else m_start
+            default_end = m_end
+        else:
+            default_start, default_end = m_start, m_end
     else:
-        default_start, default_end = 0.0, total_length
+        total_length = _mandrel_length_mm(config)
+        if config.mandrel.type == "cylinder":
+            default_start, default_end = 0.0, total_length
+        elif layer.region == "cylinder_only":
+            default_start = config.mandrel.left_dome_length_mm
+            cylinder_length = config.mandrel.cylinder_length_mm or config.mandrel.length_mm
+            default_end = default_start + cylinder_length
+        elif layer.region == "left_dome_only":
+            default_start, default_end = 0.0, config.mandrel.left_dome_length_mm
+        elif layer.region == "right_dome_only":
+            default_start = config.mandrel.left_dome_length_mm + (
+                config.mandrel.cylinder_length_mm or config.mandrel.length_mm
+            )
+            default_end = total_length
+        else:
+            default_start, default_end = 0.0, total_length
     start_z = default_start if layer.start_z_mm is None else layer.start_z_mm
     end_z = default_end if layer.end_z_mm is None else layer.end_z_mm
     return start_z, end_z

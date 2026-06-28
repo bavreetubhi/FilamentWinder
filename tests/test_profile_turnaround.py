@@ -24,6 +24,13 @@ def _profile_with_poles() -> AxisymmetricProfileMandrel:
     )
 
 
+def _profile_with_boss_openings() -> AxisymmetricProfileMandrel:
+    return AxisymmetricProfileMandrel(
+        z_mm=np.asarray([0.0, 20.0, 80.0, 100.0]),
+        r_mm=np.asarray([4.0, 20.0, 20.0, 4.0]),
+    )
+
+
 def test_find_profile_safe_zone_interpolates_pole_avoidance_boundaries() -> None:
     safe_zone = find_profile_safe_zone(_profile_with_poles(), min_radius_mm=5.0)
 
@@ -84,6 +91,28 @@ def test_profile_dome_path_uses_geodesic_turnaround_and_variable_tow_angle() -> 
     assert np.min(motion.b_deg) == pytest.approx(30.0, abs=0.1)
     assert np.max(motion.b_deg) == pytest.approx(90.0)
     assert path.final_rotation_deg < 1000.0
+
+
+def test_profile_dome_auto_turnaround_uses_textbook_clairaut_radius() -> None:
+    profile = _profile_with_boss_openings()
+    config = ProfileDomePathConfig(
+        winding_angle_deg=35.0,
+        tow_width_mm=3.0,
+        points_per_span=30,
+        turnaround_points=5,
+    )
+
+    generator = ProfileDomePathGenerator(profile, config)
+    path = generator.generate()
+    radius = profile.radius_at(path.z_mm)
+    clairaut = radius * np.sin(np.deg2rad(path.tow_eye_angle_deg))
+    expected_radius = 20.0 * np.sin(np.deg2rad(35.0))
+
+    assert generator.clairaut_radius_mm == pytest.approx(expected_radius)
+    assert generator.turnaround_radius_mm == pytest.approx(expected_radius)
+    assert np.min(radius) == pytest.approx(expected_radius)
+    assert path.winding_angle_deg == pytest.approx(35.0)
+    assert np.ptp(clairaut) < 1e-6
 
 
 def test_profile_turnaround_cli_exports_csv_and_gcode(tmp_path: Path) -> None:

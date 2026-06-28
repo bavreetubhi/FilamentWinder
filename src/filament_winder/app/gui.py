@@ -357,7 +357,7 @@ class _PreviewWindow:
 
         self.widget.setCentralWidget(central)
         if initial_mode == "profile-dome":
-            self.mode.setCurrentText("Profile Dome")
+            self.mode.setCurrentText("Textbook Dome")
         self._render_scene()
 
     def _build_viewport_panel(self, canvas_widget: Any) -> Any:
@@ -671,7 +671,7 @@ class _PreviewWindow:
         form = qt_widgets.QFormLayout()
 
         self.mode = qt_widgets.QComboBox()
-        self.mode.addItems(["Cylinder", "Profile Dome"])
+        self.mode.addItems(["Cylinder", "Textbook Dome"])
         self.mode.currentTextChanged.connect(self._on_mode_changed)
 
         self.length = self._double_spin(config.length_mm, 1.0, 10000.0, 10.0)
@@ -823,15 +823,16 @@ class _PreviewWindow:
         self.layer_table.itemChanged.connect(self._on_layer_table_changed)
         layer_layout.addWidget(self.layer_table)
 
-        profile_group = qt_widgets.QGroupBox("Axisymmetric Profile")
+        profile_group = qt_widgets.QGroupBox("Textbook Dome")
         self._profile_group = profile_group
         profile_layout = qt_widgets.QVBoxLayout(profile_group)
+        profile_layout.addWidget(
+            qt_widgets.QLabel("Textbook geodesic dome winding only.")
+        )
         profile_form = qt_widgets.QFormLayout()
         self.profile_path = qt_widgets.QLineEdit(str(self._profile_config.profile_path))
         self.profile_path_mode = qt_widgets.QComboBox()
-        self.profile_path_mode.addItems(
-            ["Dome (geodesic)", "Nosecone", "Axisymmetric"]
-        )
+        self.profile_path_mode.addItem("Dome (textbook geodesic)")
         self.profile_path_mode.setCurrentText(
             _profile_path_mode_label(self._profile_config.path_mode)
         )
@@ -5459,7 +5460,7 @@ class _PreviewWindow:
             self._schedule_node_setting_render()
 
     def _is_profile_dome_mode(self) -> bool:
-        return self.mode.currentText() == "Profile Dome"
+        return self.mode.currentText() == "Textbook Dome"
 
     def _is_pattern_planner_enabled(self) -> bool:
         return bool(self.use_pattern_planner.isChecked())
@@ -5872,15 +5873,9 @@ class _PreviewWindow:
         except (OSError, ValueError) as exc:
             self.status.setText(f"Invalid profile dome pattern inputs: {exc}")
             return
-        suffix = (
-            "\nHoop layer is ignored for axisymmetric profile schedules."
-            if self.include_hoop_layer.isChecked()
-            else ""
-        )
         self._draw_pattern_preview(
             preview,
-            mode_label=f"profile {self._current_profile_config().path_mode} pattern",
-            suffix=suffix,
+            mode_label="profile dome pattern",
         )
 
     def _draw_pattern_preview(
@@ -6128,7 +6123,7 @@ class _PreviewWindow:
             enabled=pattern_enabled_from_project(project),
         )
         self.mode.setCurrentText(
-            "Profile Dome" if preview_mode_from_project(project) == "profile-dome" else "Cylinder"
+            "Textbook Dome" if preview_mode_from_project(project) == "profile-dome" else "Cylinder"
         )
         self._apply_node_graph_from_project(project.graph)
         self._render_scene()
@@ -6697,19 +6692,10 @@ def _socket_kind_color(kind: str) -> str:
 
 
 def _profile_path_mode_label(path_mode: ProfilePathMode) -> str:
-    labels = {
-        "dome": "Dome (geodesic)",
-        "nosecone": "Nosecone",
-        "axisymmetric": "Axisymmetric",
-    }
-    return labels[path_mode]
+    return "Dome (textbook geodesic)"
 
 
 def _profile_path_mode_from_label(label: str) -> ProfilePathMode:
-    if label.startswith("Nosecone"):
-        return "nosecone"
-    if label.startswith("Axisymmetric"):
-        return "axisymmetric"
     return "dome"
 
 

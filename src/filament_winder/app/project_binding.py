@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import cast
 
 from filament_winder.app.preview import (
     CylinderPreviewConfig,
@@ -194,9 +193,7 @@ def export_paths_from_project(project: WindingProject) -> PreviewExportPaths:
     )
 
 
-def _project_profile_path_mode(raw_value: str) -> ProfilePathMode:
-    if raw_value in {"dome", "nosecone", "axisymmetric"}:
-        return cast(ProfilePathMode, raw_value)
+def _project_profile_path_mode(_raw_value: str) -> ProfilePathMode:
     return "dome"
 
 

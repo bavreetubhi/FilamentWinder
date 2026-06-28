@@ -469,12 +469,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Optional resampled profile count for --profile-dome",
     )
-    preview.add_argument(
-        "--profile-path-mode",
-        choices=("dome", "nosecone", "axisymmetric"),
-        default="dome",
-        help="Axisymmetric profile path mode for --profile-dome",
-    )
     preview.add_argument("--length", type=float, default=1000.0, help="Mandrel length in mm")
     preview.add_argument("--radius", type=float, default=100.0, help="Mandrel radius in mm")
     preview.add_argument("--tow-width", type=float, default=6.0, help="Tow width in mm")
@@ -501,12 +495,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--turnaround-radius",
         type=float,
         help="Optional profile-dome turnaround radius in mm",
-    )
-    preview.add_argument(
-        "--min-radius",
-        type=float,
-        default=5.0,
-        help="Minimum profile radius for nosecone/axisymmetric turnaround modes",
     )
     preview.add_argument(
         "--turnaround-points",
@@ -1325,11 +1313,6 @@ def _run_profile_dome(args: argparse.Namespace) -> int:
         return 1
     try:
         circuits = max(1, args.circuits)
-        phase_offset = (
-            args.phase_offset
-            if args.phase_offset is not None
-            else (360.0 / circuits if circuits > 1 else 0.0)
-        )
         config = ProfileDomePathConfig(
             winding_angle_deg=args.angle,
             tow_width_mm=args.tow_width,
@@ -1338,7 +1321,6 @@ def _run_profile_dome(args: argparse.Namespace) -> int:
             turnaround_angle_deg=args.turnaround_angle,
             circuits=circuits,
             turnaround_radius_mm=args.turnaround_radius,
-            phase_offset_deg=phase_offset,
         )
         generator = ProfileDomePathGenerator(profile, config)
         surface_path = generator.generate()
@@ -1359,7 +1341,7 @@ def _run_profile_dome(args: argparse.Namespace) -> int:
         )
     print(
         "Dome winding zone: "
-        f"z={generator.safe_zone.start_z_mm:.6f}..{generator.safe_zone.end_z_mm:.6f} mm, "
+        f"z={generator.dome_start_z:.6f}..{generator.dome_end_z:.6f} mm, "
         f"turnaround_radius={generator.turnaround_radius_mm:.6f} mm, "
         f"geodesic_radius={generator.clairaut_radius_mm:.6f} mm"
     )
@@ -1446,11 +1428,9 @@ def _run_preview(args: argparse.Namespace) -> int:
             profile_config = ProfileDomePreviewConfig(
                 profile_path=args.profile,
                 samples=args.profile_samples,
-                path_mode=args.profile_path_mode,
                 tow_width_mm=args.tow_width,
                 winding_angle_deg=args.angle,
                 points_per_span=args.points,
-                min_radius_mm=args.min_radius,
                 turnaround_points=args.turnaround_points,
                 turnaround_angle_deg=args.turnaround_angle,
                 circuits=args.circuits,

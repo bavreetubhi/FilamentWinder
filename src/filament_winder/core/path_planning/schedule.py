@@ -1051,17 +1051,20 @@ def _plan_profile_dome_layer(
         circuits=total_passes,
         start_theta_rad=theta_offset_rad + math.radians(spec.start_offset_deg),
         turnaround_radius_mm=spec.turnaround_radius_mm,
-        phase_offset_deg=360.0 / total_passes if total_passes > 1 else 0.0,
+        start_z_mm=spec.start_z_mm,
+        end_z_mm=spec.end_z_mm,
     )
     generator = ProfileDomePathGenerator(mandrel, config)
     path = generator.generate()
-    path = _apply_direction(mandrel, path, spec.direction, abs(spec.target_angle_deg))
+    actual_angle = generator.actual_winding_angle_deg
+    path = _apply_direction(mandrel, path, spec.direction, actual_angle)
     tow_spacing = circumference / circuits
     gap_mm = max(tow_spacing - spec.tow_width_mm, 0.0)
     overlap_mm = max(spec.tow_width_mm - tow_spacing, 0.0)
+    dome_length = abs(generator.dome_end_z - generator.dome_start_z)
     warnings = _pattern_warnings(
         target_angle=abs(spec.target_angle_deg),
-        actual_angle=abs(spec.target_angle_deg),
+        actual_angle=actual_angle,
         gap_mm=gap_mm,
         overlap_mm=overlap_mm,
         max_angle_error=spec.max_angle_error_deg,
@@ -1071,8 +1074,8 @@ def _plan_profile_dome_layer(
         layer_name=spec.name,
         winding_type=spec.winding_type,
         target_angle_deg=spec.target_angle_deg,
-        actual_angle_deg=_signed_angle(spec.direction, abs(spec.target_angle_deg)),
-        angle_error_deg=0.0,
+        actual_angle_deg=_signed_angle(spec.direction, actual_angle),
+        angle_error_deg=abs(spec.target_angle_deg) - actual_angle,
         circuits=circuits,
         starts=circuits,
         angular_shift_deg=360.0 / circuits,
@@ -1081,7 +1084,7 @@ def _plan_profile_dome_layer(
         gap_mm=gap_mm,
         overlap_mm=overlap_mm,
         layer_completion_z_mm=float(path.z_mm[-1]),
-        pattern_repeat_length_mm=generator.safe_zone.length_mm,
+        pattern_repeat_length_mm=dome_length,
         closes=True,
         acceptable=not warnings,
         warnings=warnings,

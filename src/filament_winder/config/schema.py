@@ -46,6 +46,7 @@ class MandrelConfig:
     samples: int | None = None
     mesh_points_z: int = 240
     mesh_points_theta: int = 180
+    dome_shape: str = "spherical"
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,6 +314,7 @@ def _mandrel_config(raw: object) -> MandrelConfig:
         samples=None if data.get("samples") in {None, "", 0} else int(data.get("samples", 0)),
         mesh_points_z=int(data.get("mesh_points_z", 240)),
         mesh_points_theta=int(data.get("mesh_points_theta", 180)),
+        dome_shape=str(data.get("dome_shape", "spherical")),
     )
 
 

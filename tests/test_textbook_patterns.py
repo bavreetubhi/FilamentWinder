@@ -178,6 +178,7 @@ def test_geodesic_angle_changes_on_dome() -> None:
         right_dome_length_mm=40.0,
         polar_opening_radius_mm=8.0,
         samples_per_region=36,
+        dome_shape="spherical",
     )
     path, _diagnostics = generate_geodesic_path(
         mandrel,

@@ -158,91 +158,6 @@ def test_profile_dome_surface_tow_band_stays_on_profile_surface(tmp_path) -> Non
     assert np.allclose(right_radius, preview.profile.radius_at(tow_band.right_z_mm), atol=1e-6)
 
 
-def test_profile_nosecone_preview_uses_min_radius_turnaround(tmp_path) -> None:
-    dxf_path = tmp_path / "profile.dxf"
-    _write_profile_dxf(dxf_path)
-
-    preview = build_profile_dome_preview_scene(
-        ProfileDomePreviewConfig(
-            profile_path=dxf_path,
-            path_mode="nosecone",
-            tow_width_mm=3.0,
-            winding_angle_deg=35.0,
-            points_per_span=20,
-            min_radius_mm=5.0,
-            turnaround_points=5,
-            mesh_theta_segments=12,
-            mesh_z_segments=4,
-        )
-    )
-
-    assert preview.config.path_mode == "nosecone"
-    assert preview.turnaround_radius_mm == 5.0
-    assert np.min(preview.profile.radius_at(preview.path.z_mm)) >= 5.0 - 1e-9
-    assert np.allclose(preview.motion_table.b_deg, 35.0)
-
-
-def test_profile_axisymmetric_preview_handles_complex_profile(tmp_path) -> None:
-    dxf_path = tmp_path / "complex_profile.dxf"
-    dxf_path.write_text(
-        "\n".join(
-            [
-                "0",
-                "SECTION",
-                "2",
-                "ENTITIES",
-                "0",
-                "LWPOLYLINE",
-                "90",
-                "5",
-                "10",
-                "0",
-                "20",
-                "12",
-                "10",
-                "30",
-                "20",
-                "24",
-                "10",
-                "70",
-                "20",
-                "18",
-                "10",
-                "110",
-                "20",
-                "28",
-                "10",
-                "150",
-                "20",
-                "22",
-                "0",
-                "ENDSEC",
-                "0",
-                "EOF",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    preview = build_profile_dome_preview_scene(
-        ProfileDomePreviewConfig(
-            profile_path=dxf_path,
-            path_mode="axisymmetric",
-            tow_width_mm=3.0,
-            winding_angle_deg=30.0,
-            points_per_span=30,
-            min_radius_mm=5.0,
-            mesh_theta_segments=12,
-            mesh_z_segments=4,
-        )
-    )
-
-    assert preview.config.path_mode == "axisymmetric"
-    assert preview.path.point_count == 30
-    assert preview.path.final_rotation_deg > 0.0
-    assert preview.display_profile_vertices_mm.shape == (60, 3)
-
-
 def test_cylinder_pattern_preview_builds_layer_program() -> None:
     preview = build_cylinder_pattern_preview_scene(
         CylinderPreviewConfig(
@@ -294,30 +209,6 @@ def test_profile_dome_pattern_preview_builds_geodesic_layer_program(tmp_path) ->
     assert preview.program.reports[0].winding_type == "dome"
     assert preview.program.reports[0].circuits == 4
     assert preview.display_layer_path_points_mm[0].shape[1] == 3
-
-
-def test_profile_nosecone_pattern_preview_reports_nosecone_layer(tmp_path) -> None:
-    dxf_path = tmp_path / "profile.dxf"
-    _write_profile_dxf(dxf_path)
-
-    preview = build_profile_dome_pattern_preview_scene(
-        ProfileDomePreviewConfig(
-            profile_path=dxf_path,
-            path_mode="nosecone",
-            tow_width_mm=20.0,
-            winding_angle_deg=35.0,
-            points_per_span=10,
-            min_radius_mm=5.0,
-            turnaround_points=4,
-            mesh_theta_segments=12,
-            mesh_z_segments=4,
-        ),
-        PatternPlannerConfig(coverage_target=0.5, balanced_pm_layers=False),
-    )
-
-    assert len(preview.program.layers) == 1
-    assert preview.program.reports[0].winding_type == "nosecone"
-    assert preview.program.metadata.winding_type[0] == "nosecone"
 
 
 def test_horizontal_view_orientation_maps_engineering_z_to_display_x() -> None:
@@ -414,18 +305,13 @@ def test_preview_cli_can_launch_profile_dome_mode(monkeypatch, tmp_path) -> None
             "35",
             "--points",
             "25",
-            "--profile-path-mode",
-            "nosecone",
-            "--min-radius",
-            "7",
         ]
     )
 
     assert result == 0
     assert captured["initial_mode"] == "profile-dome"
     assert captured["profile_config"].profile_path == dxf_path
-    assert captured["profile_config"].path_mode == "nosecone"
-    assert captured["profile_config"].min_radius_mm == 7.0
+    assert captured["profile_config"].path_mode == "dome"
     assert captured["profile_config"].points_per_span == 25
     assert captured["debug_gui"] is False
 
@@ -520,10 +406,8 @@ def test_preview_project_binding_round_trips_profile_and_pattern_state() -> None
             points_per_pass=123,
         ),
         profile_config=ProfileDomePreviewConfig(
-            profile_path="mandrels/nosecone.dxf",
-            path_mode="nosecone",
+            profile_path="mandrels/profile.dxf",
             samples=200,
-            min_radius_mm=7.5,
             turnaround_radius_mm=8.0,
             turnaround_points=9,
             turnaround_angle_deg=270.0,
@@ -542,10 +426,9 @@ def test_preview_project_binding_round_trips_profile_and_pattern_state() -> None
     profile = profile_config_from_project(project)
     pattern = pattern_config_from_project(project)
 
-    assert profile.profile_path.name == "nosecone.dxf"
-    assert profile.path_mode == "nosecone"
+    assert profile.profile_path.name == "profile.dxf"
+    assert profile.path_mode == "dome"
     assert profile.samples == 200
-    assert profile.min_radius_mm == 7.5
     assert profile.turnaround_radius_mm == 8.0
     assert profile.turnaround_points == 9
     assert profile.turnaround_angle_deg == 270.0
@@ -621,76 +504,6 @@ def test_profile_dome_preview_export_writes_csv_and_gcode(tmp_path) -> None:
         assert path.stat().st_size > 0
 
 
-def test_profile_nosecone_preview_export_writes_csv_and_gcode(tmp_path) -> None:
-    dxf_path = tmp_path / "profile.dxf"
-    _write_profile_dxf(dxf_path)
-    paths = PreviewExportPaths(
-        csv_path=str(tmp_path / "profile_nosecone.csv"),
-        gcode_path=str(tmp_path / "profile_nosecone.gcode"),
-    )
-
-    result = export_profile_dome_preview_files(
-        ProfileDomePreviewConfig(
-            profile_path=dxf_path,
-            path_mode="nosecone",
-            tow_width_mm=3.0,
-            winding_angle_deg=35.0,
-            points_per_span=20,
-            min_radius_mm=5.0,
-            turnaround_points=5,
-        ),
-        paths,
-        feedrate_mm_min=650.0,
-        csv=True,
-        gcode=True,
-    )
-
-    assert len(result.written_paths) == 2
-    for path in result.written_paths:
-        assert path.exists()
-        assert path.stat().st_size > 0
-
-
-def test_cylinder_pattern_preview_export_writes_program_outputs(tmp_path) -> None:
-    paths = PreviewExportPaths(
-        csv_path=str(tmp_path / "pattern.csv"),
-        gcode_path=str(tmp_path / "pattern.gcode"),
-        coverage_csv_path=str(tmp_path / "pattern_coverage.csv"),
-        coverage_summary_csv_path=str(tmp_path / "pattern_summary.csv"),
-    )
-
-    result = export_cylinder_pattern_preview_files(
-        CylinderPreviewConfig(
-            length_mm=80.0,
-            radius_mm=10.0,
-            tow_width_mm=20.0,
-            winding_angle_deg=45.0,
-            points_per_pass=10,
-            coverage_z_samples=8,
-            coverage_theta_samples=12,
-        ),
-        PatternPlannerConfig(
-            coverage_target=0.5,
-            include_hoop_layer=True,
-            balanced_pm_layers=False,
-            max_angle_error_deg=20.0,
-        ),
-        paths,
-        feedrate_mm_min=650.0,
-        csv=True,
-        gcode=True,
-        coverage_csv=True,
-        coverage_summary_csv=True,
-    )
-
-    assert len(result.written_paths) == 4
-    for path in result.written_paths:
-        assert path.exists()
-        assert path.stat().st_size > 0
-    assert result.csv_path is not None
-    assert "layer_name" in result.csv_path.read_text(encoding="utf-8")
-
-
 def test_profile_dome_pattern_preview_export_writes_program_outputs(tmp_path) -> None:
     dxf_path = tmp_path / "profile.dxf"
     _write_profile_dxf(dxf_path)
@@ -718,36 +531,3 @@ def test_profile_dome_pattern_preview_export_writes_program_outputs(tmp_path) ->
     for path in result.written_paths:
         assert path.exists()
         assert path.stat().st_size > 0
-
-
-def test_profile_axisymmetric_pattern_preview_export_writes_program_outputs(tmp_path) -> None:
-    dxf_path = tmp_path / "profile.dxf"
-    _write_profile_dxf(dxf_path)
-    paths = PreviewExportPaths(
-        csv_path=str(tmp_path / "axisymmetric_pattern.csv"),
-        gcode_path=str(tmp_path / "axisymmetric_pattern.gcode"),
-    )
-
-    result = export_profile_dome_pattern_preview_files(
-        ProfileDomePreviewConfig(
-            profile_path=dxf_path,
-            path_mode="axisymmetric",
-            tow_width_mm=20.0,
-            winding_angle_deg=35.0,
-            points_per_span=10,
-            min_radius_mm=5.0,
-            turnaround_points=4,
-        ),
-        PatternPlannerConfig(coverage_target=0.5, balanced_pm_layers=False),
-        paths,
-        feedrate_mm_min=650.0,
-        csv=True,
-        gcode=True,
-    )
-
-    assert len(result.written_paths) == 2
-    for path in result.written_paths:
-        assert path.exists()
-        assert path.stat().st_size > 0
-    assert result.csv_path is not None
-    assert "axisymmetric" in result.csv_path.read_text(encoding="utf-8")

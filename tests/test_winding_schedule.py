@@ -260,6 +260,7 @@ def test_axisymmetric_dome_turnaround_wraps_min_diameter_tangentially() -> None:
         right_dome_length_mm=35.0,
         polar_opening_radius_mm=4.0,
         samples_per_region=40,
+        dome_shape="spherical",
     )
     schedule = WindingSchedule(
         layers=(

@@ -48,8 +48,7 @@ This repo contains the Version 0.1 foundation from the project plan:
   minimum.
 - Dome-aware profile winding paths that use a geodesic turnaround radius and
   transition into the requested helix angle on the max-radius section.
-- Nosecone and general axisymmetric profile modes with minimum-radius safe
-  turnarounds for tapered or complex Z-R profiles.
+- Textbook dome profile winding with Clairaut-based geodesic turnarounds.
 - Variable tow-eye angle output for dome paths.
 - Layer-level winding schedules with pattern reports, transition moves,
   per-point layer/circuit metadata, feed targets, and winding-program CSV export.
@@ -179,12 +178,6 @@ Launch the GUI directly in DXF profile mode with the smoother 2000 mm by
 filament-winder preview --profile-dome --profile mandrels/2000mm_8in_od_elliptical_dome_profile.dxf --tow-width 3 --angle 35 --points 500
 ```
 
-For nosecone-style or general axisymmetric profiles, start with:
-
-```bash
-filament-winder preview --profile-dome --profile mandrels/2000mm_8in_od_elliptical_dome_profile.dxf --profile-path-mode nosecone --min-radius 5 --tow-width 3 --angle 35
-```
-
 The preview draws the mandrel horizontally. Camera controls:
 
 - Left-drag: full orbit around the part
@@ -204,25 +197,18 @@ between settings and the 3D viewport can be dragged to resize the workspace.
 
 The Preview Mode selector switches between the cylinder view and a DXF-backed
 Profile Dome view. In Profile Dome mode, choose an ASCII DXF Z-R profile and
-select the profile path type:
+use the textbook geodesic dome winding path.
 
-- `Dome (geodesic)`: Clairaut/geodesic dome winding with variable `B`.
-- `Nosecone`: fixed-angle profile turnaround to a configured minimum radius.
-- `Axisymmetric`: profile helix when possible, with safe turnaround fallback
-  for profiles that include poles or small-radius ends.
-
-Set the tow width, winding angle, points/span, min/turn radius, turnaround
-settings, and circuits, then click Inspect DXF Import to verify the profile or
-Update Preview to render the path. Profile exports write CSV and G-code;
-coverage and OBJ exports remain cylinder-only unless cylinder pattern coverage
-is selected.
+Set the tow width, winding angle, points/span, turnaround settings, and
+circuits, then click Inspect DXF Import to verify the profile or Update
+Preview to render the path. Profile exports write CSV and G-code; coverage and
+OBJ exports remain cylinder-only unless cylinder pattern coverage is selected.
 
 The Pattern Planner panel turns the preview from a single path into a full layer
 program. Enable **Use full pattern** to generate:
 
 - cylinder hoop, `+helical`, and `-helical` schedules with closure reports
-- DXF profile schedules for geodesic dome, nosecone, or general axisymmetric
-  path modes
+- DXF profile schedules for textbook geodesic dome winding
 - per-layer colored preview paths and visible transition moves
 - winding-program CSV with layer/circuit metadata, local radius, local angle,
   A/X/Z/B, feedrate, curvature, and slip-risk columns

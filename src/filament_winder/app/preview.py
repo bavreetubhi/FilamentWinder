@@ -19,15 +19,10 @@ from filament_winder.core.path_planning import (
     PlannedWindingProgram,
     ProfileDomePathConfig,
     ProfileDomePathGenerator,
-    ProfileHelicalPathConfig,
-    ProfileHelicalPathGenerator,
-    ProfileTurnaroundPathConfig,
-    ProfileTurnaroundPathGenerator,
     SurfacePath,
     WindingLayerSpec,
     WindingSchedule,
     estimate_cylinder_pattern_closure,
-    find_profile_safe_zone,
     plan_winding_schedule,
 )
 from filament_winder.core.tow import TowBand, generate_cylinder_tow_band
@@ -35,7 +30,7 @@ from filament_winder.io import import_dxf_zr_profile
 
 FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int_]
-ProfilePathMode = Literal["dome", "nosecone", "axisymmetric"]
+ProfilePathMode = Literal["dome"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,7 +253,6 @@ def _build_profile_path(
             turnaround_angle_deg=config.turnaround_angle_deg,
             circuits=config.circuits,
             turnaround_radius_mm=config.turnaround_radius_mm,
-            phase_offset_deg=360.0 / config.circuits if config.circuits > 1 else 0.0,
         )
         dome_generator = ProfileDomePathGenerator(profile, dome_config)
         path = dome_generator.generate()
@@ -267,68 +261,8 @@ def _build_profile_path(
             radial_clearance_mm=config.radial_clearance_mm,
             geodesic_radius_mm=dome_generator.clairaut_radius_mm,
             turnaround_radius_mm=dome_generator.turnaround_radius_mm,
-            safe_start_z_mm=dome_generator.safe_zone.start_z_mm,
-            safe_end_z_mm=dome_generator.safe_zone.end_z_mm,
-        )
-
-    if config.path_mode == "nosecone":
-        min_radius = _profile_min_radius_for_turnaround(config)
-        nosecone_config = ProfileTurnaroundPathConfig(
-            winding_angle_deg=config.winding_angle_deg,
-            tow_width_mm=config.tow_width_mm,
-            points_per_span=config.points_per_span,
-            turnaround_points=config.turnaround_points,
-            min_radius_mm=min_radius,
-            turnaround_angle_deg=config.turnaround_angle_deg,
-            circuits=config.circuits,
-        )
-        nosecone_generator = ProfileTurnaroundPathGenerator(profile, nosecone_config)
-        path = nosecone_generator.generate()
-        return _profile_path_build(
-            path,
-            radial_clearance_mm=config.radial_clearance_mm,
-            geodesic_radius_mm=0.0,
-            turnaround_radius_mm=nosecone_generator.safe_zone.min_radius_mm,
-            safe_start_z_mm=nosecone_generator.safe_zone.start_z_mm,
-            safe_end_z_mm=nosecone_generator.safe_zone.end_z_mm,
-        )
-
-    if config.path_mode == "axisymmetric":
-        min_radius = _profile_min_radius_for_turnaround(config)
-        try:
-            path = ProfileHelicalPathGenerator(
-                profile,
-                ProfileHelicalPathConfig(
-                    winding_angle_deg=config.winding_angle_deg,
-                    tow_width_mm=config.tow_width_mm,
-                    point_count=config.points_per_span,
-                    min_radius_mm=min_radius,
-                ),
-            ).generate()
-            safe_zone = find_profile_safe_zone(profile, min_radius_mm=min_radius)
-        except ValueError:
-            axisymmetric_config = ProfileTurnaroundPathConfig(
-                winding_angle_deg=config.winding_angle_deg,
-                tow_width_mm=config.tow_width_mm,
-                points_per_span=config.points_per_span,
-                turnaround_points=config.turnaround_points,
-                min_radius_mm=min_radius,
-                turnaround_angle_deg=config.turnaround_angle_deg,
-                circuits=config.circuits,
-            )
-            axisymmetric_generator = ProfileTurnaroundPathGenerator(
-                profile,
-                axisymmetric_config,
-            )
-            path = axisymmetric_generator.generate()
-            safe_zone = axisymmetric_generator.safe_zone
-        return _profile_path_build(
-            path,
-            radial_clearance_mm=config.radial_clearance_mm,
-            geodesic_radius_mm=0.0,
-            turnaround_radius_mm=safe_zone.min_radius_mm,
-            safe_start_z_mm=safe_zone.start_z_mm,
-            safe_end_z_mm=safe_zone.end_z_mm,
+            safe_start_z_mm=dome_generator.dome_start_z,
+            safe_end_z_mm=dome_generator.dome_end_z,
         )
 
     raise ValueError(f"unsupported profile path mode: {config.path_mode}")
@@ -355,12 +289,6 @@ def _profile_path_build(
         safe_start_z_mm=safe_start_z_mm,
         safe_end_z_mm=safe_end_z_mm,
     )
-
-
-def _profile_min_radius_for_turnaround(config: ProfileDomePreviewConfig) -> float:
-    if config.turnaround_radius_mm is not None and config.turnaround_radius_mm > 0.0:
-        return config.turnaround_radius_mm
-    return config.min_radius_mm
 
 
 def build_cylinder_pattern_preview_scene(
@@ -604,7 +532,7 @@ def _profile_layer_spec(
     pattern_config: PatternPlannerConfig,
     name: str,
     direction: Literal["positive", "negative"],
-    winding_type: Literal["dome", "nosecone", "axisymmetric"],
+    winding_type: Literal["dome"],
 ) -> WindingLayerSpec:
     return WindingLayerSpec(
         name=name,
@@ -615,11 +543,7 @@ def _profile_layer_spec(
         direction=direction,
         point_count=config.points_per_span,
         max_angle_error_deg=pattern_config.max_angle_error_deg,
-        turnaround_radius_mm=(
-            config.turnaround_radius_mm
-            if config.path_mode == "dome"
-            else _profile_min_radius_for_turnaround(config)
-        ),
+        turnaround_radius_mm=config.turnaround_radius_mm,
         turnaround_points=config.turnaround_points,
         turnaround_angle_deg=config.turnaround_angle_deg,
     )
@@ -627,20 +551,12 @@ def _profile_layer_spec(
 
 def _pattern_winding_type_for_profile_mode(
     path_mode: ProfilePathMode,
-) -> Literal["dome", "nosecone", "axisymmetric"]:
-    if path_mode == "dome":
-        return "dome"
-    if path_mode == "nosecone":
-        return "nosecone"
-    return "axisymmetric"
+) -> Literal["dome"]:
+    return "dome"
 
 
 def _pattern_layer_prefix_for_profile_mode(path_mode: ProfilePathMode) -> str:
-    if path_mode == "dome":
-        return "dome"
-    if path_mode == "nosecone":
-        return "nosecone"
-    return "axisymmetric"
+    return "dome"
 
 
 def _display_layer_paths(
